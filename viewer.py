@@ -70,9 +70,7 @@ def show_hover_map(
 			facecolors="none",
 			edgecolors="red",
 			linewidth=1.2,
-			label="detected spikes"
 		)
-		ax_map.legend(loc="upper right")
 
 	# marker for actual pixel
 	marker = ax_map.scatter([0], [0], s=80, marker="s", facecolors="none", edgecolors="white", linewidths=2)
