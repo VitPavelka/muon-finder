@@ -5,6 +5,7 @@ from typing import Dict, Tuple, List, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.widgets import TextBox, Button
 
 from muon_pipeline import SpikeSegment
 
@@ -23,30 +24,64 @@ def show_hover_map(
 		plot_top_hat: bool = True,
 		plot_corrected_spectra: bool = True,
 		corrected_spectra: Optional[np.ndarray] = None,
+		map_central_mass: float = 0.95,
+		highlight_detected_pixels: bool = True,
 ) -> None:
 	H, W, N = spectra.shape
 
-	fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(12, 5))
+	fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(13, 6))
 	fig.canvas.manager.set_window_title("Muon finder - hover viewer")
 
-	im = ax_map.imshow(score_map, origin="upper", aspect="auto")
+	v = score_map.astype(float)
+	v = v[np.isfinite(v)]
+	if v.size and 0.0 < map_central_mass < 1.0:
+		tail = 0.5 * (1.0 - float(map_central_mass))
+		vmin = float(np.quantile(v, tail))
+		vmax = float(np.quantile(v, 1.0 - tail))
+		if not np.isfinite(vmin) or not np.isfinite(vmax):
+			vmin = None
+			vmax = None
+	else:
+		vmin = None
+		vmax = None
+
+	im = ax_map.imshow(score_map, origin="upper", aspect="auto", vmin=vmin, vmax=vmax, cmap="viridis")
 	ax_map.set_title("score map (hover)")
-	ax_map.set_xlabel("x")
-	ax_map.set_ylabel("y")
-	fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
+	ax_map.set_xlabel("x (pixel)")
+	ax_map.set_ylabel("y (pixel)")
+	cbar = fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
+	cbar.set_label("z (score intensity)")
 
 	# candidates' overlay (visually)
 	ys, xs = np.where(candidate_mask)
 	ax_map.scatter(xs, ys, s=8, marker="o", linewidths=0.5, facecolors="none")
 
+	# detected spikes overlay
+	if highlight_detected_pixels and spikes_by_pixel:
+		sp_y = []
+		sp_x = []
+		for py, px in spikes_by_pixel.keys():
+			sp_y.append(py)
+			sp_x.append(px)
+		ax_map.scatter(
+			sp_x, sp_y,
+			s=42,
+			marker="s",
+			facecolors="none",
+			edgecolors="red",
+			linewidth=1.2,
+			label="detected spikes"
+		)
+		ax_map.legend(loc="upper right")
+
 	# marker for actual pixel
-	marker = ax_map.scatter([0], [0], s=80, marker="s", facecolors="none", linewidths=2)
+	marker = ax_map.scatter([0], [0], s=80, marker="s", facecolors="none", edgecolors="white", linewidths=2)
 
 	# spectral lines
 	(ln_raw,) = ax_spec.plot([], [], label="raw") if plot_raw else (None,)
-	(ln_open,) = ax_spec.plot([], [], label="opening") if plot_opening else (None,)
-	(ln_ero,) = ax_spec.plot([], [], label="erosion") if plot_erosion else (None,)
-	(ln_dil,) = ax_spec.plot([], [], label="dilation") if plot_dilation else (None,)
+	# (ln_open,) = ax_spec.plot([], [], label="opening") if plot_opening else (None,)
+	# (ln_ero,) = ax_spec.plot([], [], label="erosion") if plot_erosion else (None,)
+	# (ln_dil,) = ax_spec.plot([], [], label="dilation") if plot_dilation else (None,)
 	(ln_th,) = ax_spec.plot([], [], label="top_hat") if plot_top_hat else (None,)
 	(ln_corr,) = ax_spec.plot([], [], label="corrected") if plot_corrected_spectra else (None,)
 
@@ -58,10 +93,13 @@ def show_hover_map(
 	ax_spec.legend(loc="best")
 
 	frozen = {"state": False}  # right click = freeze/unfreeze
+	current = {"y": 0, "x": 0}
 
 	def _update(y: int, x: int) -> None:
 		y = int(np.clip(y, 0, H - 1))
 		x = int(np.clip(x, 0, W - 1))
+		current["y"] = y
+		current["x"] = x
 
 		marker.set_offsets([[x, y]])
 
@@ -69,14 +107,14 @@ def show_hover_map(
 		if plot_raw and ln_raw is not None:
 			ln_raw.set_data(x_axis, raw)
 
-		if plot_opening and ln_open is not None:
-			ln_open.set_data(x_axis, overlays["opening"][y, x, :])
-
-		if plot_erosion and ln_ero is not None:
-			ln_ero.set_data(x_axis, overlays["erosion"][y, x, :])
-
-		if plot_dilation and ln_dil is not None:
-			ln_dil.set_data(x_axis, overlays["dilation"][y, x, :])
+		# if plot_opening and ln_open is not None:
+		# 	ln_open.set_data(x_axis, overlays["opening"][y, x, :])
+		#
+		# if plot_erosion and ln_ero is not None:
+		# 	ln_ero.set_data(x_axis, overlays["erosion"][y, x, :])
+		#
+		# if plot_dilation and ln_dil is not None:
+		# 	ln_dil.set_data(x_axis, overlays["dilation"][y, x, :])
 
 		if plot_top_hat and ln_th is not None:
 			ln_th.set_data(x_axis, overlays["top_hat"][y, x, :])
@@ -123,10 +161,39 @@ def show_hover_map(
 			return
 		frozen["state"] = not frozen["state"]
 
+	ax_txt_y = fig.add_axes((0.12, 0.07, 0.10, 0.06))
+	ax_txt_x = fig.add_axes((0.26, 0.07, 0.10, 0.06))
+	ax_btn_go = fig.add_axes((0.39, 0.07, 0.09, 0.06))
+	txt_y = TextBox(ax_txt_y, "y", initial="0")
+	txt_x = TextBox(ax_txt_x, "x", initial="0")
+	btn_go = Button(ax_btn_go, "Go to (y,x)")
+
+	def _go_to_xy(_event=None) -> None:
+		try:
+			y = int(float(txt_y.text.strip()))
+			x = int(float(txt_x.text.strip()))
+		except Exception:
+			return
+
+		x = int(np.clip(x, 0, W - 1))
+		y = int(np.clip(y, 0, H - 1))
+		frozen["state"] = True
+		txt_x.set_val(str(x))
+		txt_y.set_val(str(y))
+		_update(y, x)
+
+	def _sync_inputs() -> None:
+		txt_x.set_val(str(current["x"]))
+		txt_y.set_val(str(current["y"]))
+
+	btn_go.on_clicked(_go_to_xy)
+	txt_x.on_submit(lambda _t: _go_to_xy())
+	txt_y.on_submit(lambda _t: _go_to_xy())
+
 	fig.canvas.mpl_connect("motion_notify_event", on_move)
 	fig.canvas.mpl_connect("button_press_event", on_click)
 
 	# init
 	_update(0, 0)
-	plt.tight_layout()
+	_sync_inputs()
 	plt.show()
