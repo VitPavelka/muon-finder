@@ -5,7 +5,8 @@ from typing import Dict, Tuple, List, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.widgets import TextBox, Button
+import time
+from matplotlib.widgets import TextBox, Button, CheckButtons
 
 from muon_pipeline import SpikeSegment
 
@@ -18,7 +19,7 @@ def show_hover_map(
 		spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]],
 		overlays: Dict[str, np.ndarray],  # erosion/dilation/opening/top_hat
 		plot_raw: bool = True,
-		plot_opening: bool = True,
+		plot_opening: bool = False,
 		plot_erosion: bool = False,
 		plot_dilation: bool = False,
 		plot_top_hat: bool = True,
@@ -26,10 +27,12 @@ def show_hover_map(
 		corrected_spectra: Optional[np.ndarray] = None,
 		map_central_mass: float = 0.95,
 		highlight_detected_pixels: bool = True,
+		hover_fps: float = 30.0,
 ) -> None:
 	H, W, N = spectra.shape
 
 	fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(13, 6))
+	plt.subplots_adjust(bottom=0.30)
 	fig.canvas.manager.set_window_title("Muon finder - hover viewer")
 
 	v = score_map.astype(float)
@@ -75,13 +78,39 @@ def show_hover_map(
 	# marker for actual pixel
 	marker = ax_map.scatter([0], [0], s=80, marker="s", facecolors="none", edgecolors="white", linewidths=2)
 
-	# spectral lines
-	(ln_raw,) = ax_spec.plot([], [], label="raw") if plot_raw else (None,)
-	# (ln_open,) = ax_spec.plot([], [], label="opening") if plot_opening else (None,)
-	# (ln_ero,) = ax_spec.plot([], [], label="erosion") if plot_erosion else (None,)
-	# (ln_dil,) = ax_spec.plot([], [], label="dilation") if plot_dilation else (None,)
-	(ln_th,) = ax_spec.plot([], [], label="top_hat") if plot_top_hat else (None,)
-	(ln_corr,) = ax_spec.plot([], [], label="corrected") if plot_corrected_spectra else (None,)
+	# stable line colors + checkbox-driven visibility
+	line_colors = {
+		"raw": "#1f77b4",
+		"opening": "#9467bd",
+		"erosion": "#7f7f7f",
+		"dilation": "#8c564b",
+		"top_hat": "#ff7f0e",
+		"corrected": "#2ca02c",
+	}
+	checked = {
+		"raw": bool(plot_raw),
+		"opening": bool(plot_opening),
+		"erosion": bool(plot_erosion),
+		"dilation": bool(plot_dilation),
+		"top_hat": bool(plot_top_hat),
+		"corrected": bool(plot_corrected_spectra),
+	}
+
+	# spectra lines
+	(ln_raw,) = ax_spec.plot([], [], label="raw", color=line_colors['raw'])
+	(ln_open,) = ax_spec.plot([], [], label="opening", color=line_colors['opening'])
+	(ln_ero,) = ax_spec.plot([], [], label="erosion", color=line_colors['erosion'])
+	(ln_dil,) = ax_spec.plot([], [], label="dilation", color=line_colors['dilation'])
+	(ln_th,) = ax_spec.plot([], [], label="top_hat", color=line_colors['top_hat'])
+	(ln_corr,) = ax_spec.plot([], [], label="corrected", color=line_colors['corrected'])
+	lines = {
+		"raw": ln_raw,
+		"opening": ln_open,
+		"erosion": ln_ero,
+		"dilation": ln_dil,
+		"top_hat": ln_th,
+		"corrected": ln_corr,
+	}
 
 	spike_lines: List = []
 
@@ -92,6 +121,8 @@ def show_hover_map(
 
 	frozen = {"state": False}  # right click = freeze/unfreeze
 	current = {"y": 0, "x": 0}
+	focus = {"which": "x", "replace_x": False, "replace_y": False}
+	hover_state = {"last_t": 0.0, "last_xy": (-1, -1)}
 
 	def _update(y: int, x: int) -> None:
 		y = int(np.clip(y, 0, H - 1))
@@ -102,23 +133,21 @@ def show_hover_map(
 		marker.set_offsets([[x, y]])
 
 		raw = spectra[y, x, :]
-		if plot_raw and ln_raw is not None:
-			ln_raw.set_data(x_axis, raw)
-
-		# if plot_opening and ln_open is not None:
-		# 	ln_open.set_data(x_axis, overlays["opening"][y, x, :])
-		#
-		# if plot_erosion and ln_ero is not None:
-		# 	ln_ero.set_data(x_axis, overlays["erosion"][y, x, :])
-		#
-		# if plot_dilation and ln_dil is not None:
-		# 	ln_dil.set_data(x_axis, overlays["dilation"][y, x, :])
-
-		if plot_top_hat and ln_th is not None:
-			ln_th.set_data(x_axis, overlays["top_hat"][y, x, :])
-
-		if plot_corrected_spectra and corrected_spectra is not None and ln_corr is not None:
+		ln_raw.set_data(x_axis, raw)
+		ln_open.set_data(x_axis, overlays['opening'][y, x, :])
+		ln_ero.set_data(x_axis, overlays['erosion'][y, x, :])
+		ln_dil.set_data(x_axis, overlays['dilation'][y, x, :])
+		ln_th.set_data(x_axis, overlays['top_hat'][y, x, :])
+		if corrected_spectra is not None:
 			ln_corr.set_data(x_axis, corrected_spectra[y, x, :])
+		else:
+			ln_corr.set_data([], [])
+
+		for nm, ln in lines.items():
+			if nm == "corrected" and corrected_spectra is None:
+				ln.set_visible(False)
+			else:
+				ln.set_visible(bool(checked[nm]))
 
 		# clear old spike lines
 		for l in spike_lines:
@@ -150,21 +179,60 @@ def show_hover_map(
 			return
 		x = int(round(event.xdata))
 		y = int(round(event.ydata))
+
+		if (x, y) == hover_state["last_xy"]:
+			return
+		now = time.perf_counter()
+		if hover_fps > 0:
+			min_dt = 1.0 / float(hover_fps)
+			if (now - hover_state['last_t']) < min_dt:
+				return
+		hover_state['last_t'] = now
+		hover_state['last_xy'] = (x, y)
 		_update(y, x)
 
 	def on_click(event) -> None:
+		if event.inaxes == ax_txt_x:
+			focus['which'] = "x"
+			if getattr(event, "dblclick", False):
+				focus['replace_x'] = True
+			return
+		if event.inaxes == ax_txt_y:
+			focus['which'] = "y"
+			if getattr(event, "dblclick", False):
+				focus['replace_y'] = True
+			return
+		if event.inaxes == ax_btn_go:
+			focus["which"] = "go"
+			return
+
 		if event.inaxes != ax_map:
 			return
 		if event.button != 3:
 			return
 		frozen["state"] = not frozen["state"]
 
-	ax_txt_y = fig.add_axes((0.12, 0.07, 0.10, 0.06))
-	ax_txt_x = fig.add_axes((0.26, 0.07, 0.10, 0.06))
-	ax_btn_go = fig.add_axes((0.39, 0.07, 0.09, 0.06))
+	def _toggle_line(label: str) -> None:
+		checked[label] = not checked[label]
+		_update(current["y"], current["x"])
+
+	ax_txt_y = fig.add_axes((0.12, 0.035, 0.08, 0.045))
+	ax_txt_x = fig.add_axes((0.22, 0.035, 0.08, 0.045))
+	ax_btn_go = fig.add_axes((0.32, 0.035, 0.08, 0.045))
+	ax_chk = fig.add_axes((0.56, 0.02, 0.16, 0.17))
 	txt_y = TextBox(ax_txt_y, "y", initial="0")
 	txt_x = TextBox(ax_txt_x, "x", initial="0")
 	btn_go = Button(ax_btn_go, "Go to (y,x)")
+
+	chk = CheckButtons(
+		ax_chk,
+		labels=["raw", "opening", "erosion", "dilation", "top_hat", "corrected"],
+		actives=[checked["raw"], checked["opening"], checked["erosion"], checked["dilation"], checked["top_hat"], checked["corrected"]],
+	)
+	chk.on_clicked(_toggle_line)
+	ax_chk.set_title("signals")
+	for lbl in chk.labels:
+		lbl.set_fontsize(9)
 
 	def _go_to_xy(_event=None) -> None:
 		try:
@@ -180,6 +248,30 @@ def show_hover_map(
 		txt_y.set_val(str(y))
 		_update(y, x)
 
+	def on_key(event) -> None:
+		key = (event.key or "").lower()
+		if key == "tab":
+			order = ["y", "x", "go"]
+			i = order.index(focus['which']) if focus['which'] in order else 0
+			focus['which'] = order[(i + 1) % len(order)]
+			return
+		if key == "ctrl+a":
+			if focus['which'] == "x":
+				focus['replace_x'] = True
+			elif focus['which'] == "y":
+				focus['replace_y'] = True
+			return
+		if key in ("enter", "return") and focus['which'] == "go":
+			_go_to_xy()
+			return
+
+		if focus['which'] == "x" and focus['replace_x'] and len(key) == 1 and key.isprintable():
+			txt_x.set_val("")
+			focus['replace_x'] = False
+		if focus['which'] == "y" and focus['replace_y'] and len(key) == 1 and key.isprintable():
+			txt_y.set_val("")
+			focus['replace_y'] = False
+
 	def _sync_inputs() -> None:
 		txt_x.set_val(str(current["x"]))
 		txt_y.set_val(str(current["y"]))
@@ -190,6 +282,7 @@ def show_hover_map(
 
 	fig.canvas.mpl_connect("motion_notify_event", on_move)
 	fig.canvas.mpl_connect("button_press_event", on_click)
+	fig.canvas.mpl_connect("key_press_event", on_key)
 
 	# init
 	_update(0, 0)
