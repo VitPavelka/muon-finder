@@ -2,12 +2,70 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from glob import glob0
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
-from morph1d import erosion_1d, dilation_1d, opening_1d, top_hat_1d
+from morph1d import erosion_1d, dilation_1d, opening_1d
+
+
+def _split_group_into_peak_regions(indices: np.ndarray, signal: np.ndarray) -> List[Tuple[int, int, int]]:
+	"""
+	Split one contiguous supra-threshold group into one or more peak-centered regions.
+
+	:param indices:
+	:param signal:
+	:return: list of (left_idx, right_idx, peak_idx), all inclusive and expressed in global spectral indices.
+	"""
+	if indices.size == 0:
+		return []
+
+	g = np.asarray(indices, dtype=int)
+	vals = np.asarray(signal[g], dtype=float)
+
+	# local maxima inside this contiguous group
+	local_pos: List[int] = []
+	for i in range(vals.size):
+		lv = vals[i - 1] if i > 0 else -np.inf
+		rv = vals[i + 1] if i < vals.size - 1 else -np.inf
+		if vals[i] >= lv and vals[i] >= rv:
+			local_pos.append(i)
+
+	# fallback: at least one peak per group
+	if not local_pos:
+		p = int(g[int(np.argmax(vals))])
+		return [(int(g[0]), int(g[-1]), p)]
+
+	# compress plateau maxima: keep one position per consecutive run
+	peak_pos: List[int] = []
+	for p in sorted(set(local_pos)):
+		if not peak_pos or p > peak_pos[-1] + 1:
+			peak_pos.append(p)
+		else:
+			prev = peak_pos[-1]
+			if vals[p] > vals[prev]:
+				peak_pos[-1] = p
+	peak_idx = [int(g[p]) for p in peak_pos]
+	if len(peak_idx) == 1:
+		return [(int(g[0]), int(g[-1]), peak_idx[0])]
+
+	# split boundaries at valley (minimum) between neighboring peaks
+	splits: List[int] = [int(g[0])]
+	for a, b in zip(peak_pos[:-1], peak_pos[1:]):
+		if b <= a + 1:
+			splits.append(int(g[b]))
+			continue
+		mid_local = int(np.argmin(vals[a:b + 1]) + a)
+		splits.append(int(g[mid_local]))
+	splits.append(int(g[-1]))
+
+	regions: List[Tuple[int, int, int]] = []
+	for i, p in enumerate(peak_idx):
+		left = splits[i]
+		right = splits[i]
+		regions.append((int(left), int(right), int(p)))
+
+	return regions
 
 
 def compute_morph_overlays(spectra: np.ndarray, se_size: int) -> Dict[str, np.ndarray]:
@@ -17,7 +75,7 @@ def compute_morph_overlays(spectra: np.ndarray, se_size: int) -> Dict[str, np.nd
 	"""
 	eros = erosion_1d(spectra, se_size)
 	dila = dilation_1d(spectra, se_size)
-	opn = dilation_1d(eros, se_size)
+	opn = opening_1d(eros, se_size)
 	th = spectra - opn
 	th[th < 0] = 0
 	return {"erosion": eros, "dilation": dila, "opening": opn, "top_hat": th}
@@ -221,64 +279,62 @@ def extract_spikes_for_candidates(
 		pix_segments: List[SpikeSegment] = []
 
 		for g in groups:
-			g0 = int(g[0])  # first index above thr_high
-			g1 = int(g[-1])   # last index above thr_high
-			peak_index = int(g[np.argmax(raw[g])])  # peak in RAW inside the group
+			regions = _split_group_into_peak_regions(g, th)
+			for g0, g1, peak_index in regions:
+				# enforce a tol smaller than the spike residual at the peak
+				res_peak = float(resid[peak_index])
+				tol_eff = min(tol, 0.5 * res_peak)
 
-			# enforce a tol smaller than the spike residual at the peak
-			res_peak = float(resid[peak_index])
-			tol_eff = min(tol, 0.5 * res_peak)
+				# LEFT ANCHOR: search left starting from sub-group start
+				left = g0
+				while left > 0 and resid[left] > tol_eff:
+					left -= 1
 
-			# LEFT ANCHOR: search left starting from g0 (not from peak)
-			left = g0
-			while left > 0 and resid[left] > tol_eff:
-				left -= 1
+				# RIGHT ANCHOR
+				right = g1
+				while right < (raw.size - 1) and resid[right] > tol_eff:
+					right += 1
 
-			# RIGHT ANCHOR: search right starting from g1
-			right = g1
-			while right < (raw.size - 1) and resid[right] > tol_eff:
-				right += 1
+				# anchors must be strictly outside the spike core
+				# if they collapse, force them to be at least neighbors if possible
+				if left >= peak_index:
+					left = peak_index - 1
+				if right <= peak_index:
+					right = peak_index + 1
 
-			# anchors must be strictly outside the spike core
-			# if they collapse, force them to be at least neighbors if possible
-			if left >= peak_index:
-				left = peak_index - 1
-			if right <= peak_index:
-				right = peak_index + 1
+				if left < 0 or right >= raw.size:
+					continue
+				if left >= right - 1:
+					continue  # nothing to replace
 
-			if left < 0 or right >= raw.size:
-				continue
-			if left >= right - 1:
-				continue  # nothing to replace
+				# optional widening (still keep anchors outside peak)
+				left2 = max(0, left - pad_pts)
+				right2 = min(raw.size - 1, right + pad_pts)
 
-			# optional widening (still keep anchors outside peak)
-			left2 = max(0, left - pad_pts)
-			right2 = min(raw.size - 1, right + pad_pts)
+				# check max removal width (between anchors)
+				removal_width = (right2 - left2 - 1)
+				if removal_width > max_width_pts:
+					continue
 
-			# check max removal width (between anchors)
-			removal_width = (right2 - left2 - 1)
-			if removal_width > max_width_pts:
-				continue
+				# compute peak height in top-hat (diagnostics)
+				peak_height = float(th[peak_index])
 
-			# compute peak height in top-hat (diagnostics)
-			peak_height = float(th[peak_index])
+				# integrate spike "excess" (use abs for descending x_axis)
+				seg = np.maximum(resid[left2+1:right2], 0.0)
+				area = float(abs(np.trapezoid(seg, x_axis[left2+1:right2])))
 
-			# integrate spike "excess" (use abs for descending x_axis)
-			seg = np.maximum(resid[left2+1:right2], 0.0)
-			area = float(abs(np.trapezoid(seg, x_axis[left2+1:right2])))
-
-			pix_segments.append(
-				SpikeSegment(
-					y=int(y), x=int(x),
-					peak_index=peak_index,
-					start=int(left2), end=int(right2),
-					peak_height=peak_height,
-					area=area,
+				pix_segments.append(
+					SpikeSegment(
+						y=int(y), x=int(x),
+						peak_index=int(peak_index),
+						start=int(left2), end=int(right2),
+						peak_height=peak_height,
+						area=area,
+					)
 				)
-			)
 
-			if pix_segments:
-				spikes.extend(pix_segments)
-				by_pix[(int(y), int(x))] = pix_segments
+		if pix_segments:
+			spikes.extend(pix_segments)
+			by_pix[(int(y), int(x))] = pix_segments
 
 	return spikes, by_pix

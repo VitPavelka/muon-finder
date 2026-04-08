@@ -36,8 +36,8 @@ def apply_despike(
 				continue
 
 			last = merged[-1]
-			# overlap/adjacent if next.start <= last.end
-			if s.start < last.end:
+			# merge only when overlapping AND likely representing same peak
+			if s.start < last.end and abs(s.peak_index - last.peak_index) <= 1:
 				# keep the wider anchors; keep the higher peak as representative
 				new_start = min(last.start, s.start)
 				new_end = max(last.end, s.end)
@@ -46,7 +46,7 @@ def apply_despike(
 					peak_height = s.peak_height
 				else:
 					peak_index = last.peak_index
-					peak_height = s.peak_height
+					peak_height = last.peak_height
 
 				merged[-1] = SpikeSegment(
 					y=last.y, x=last.x,

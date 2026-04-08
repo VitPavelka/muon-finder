@@ -45,10 +45,10 @@ def show_hover_map(
 	# spectral lines
 	(ln_raw,) = ax_spec.plot([], [], label="raw") if plot_raw else (None,)
 	(ln_open,) = ax_spec.plot([], [], label="opening") if plot_opening else (None,)
-	(ln_ero,) = ax_spec.plot([], [], label="erosion") if plot_erosion else None
-	(ln_dil,) = ax_spec.plot([], [], label="dilation") if plot_dilation else None
-	(ln_th,) = ax_spec.plot([], [], label="top_hat") if plot_top_hat else None
-	(ln_corr,) = ax_spec.plot([], [], label="corrected") if plot_corrected_spectra else None
+	(ln_ero,) = ax_spec.plot([], [], label="erosion") if plot_erosion else (None,)
+	(ln_dil,) = ax_spec.plot([], [], label="dilation") if plot_dilation else (None,)
+	(ln_th,) = ax_spec.plot([], [], label="top_hat") if plot_top_hat else (None,)
+	(ln_corr,) = ax_spec.plot([], [], label="corrected") if plot_corrected_spectra else (None,)
 
 	spike_lines: List = []
 
@@ -119,7 +119,7 @@ def show_hover_map(
 	def on_click(event) -> None:
 		if event.inaxes != ax_map:
 			return
-		if not event.button != 3:
+		if event.button != 3:
 			return
 		frozen["state"] = not frozen["state"]
 
