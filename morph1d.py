@@ -5,28 +5,25 @@ import numpy as np
 
 
 # --- Helpers ---
-def _grey_filter_1d(arr: np.ndarray, half_window: int, mode: str) -> np.ndarray:
+def _minmax_filter_1d(arr: np.ndarray, se_size: int, mode: str) -> np.ndarray:
 	"""
-	Grayscale min/max filter over the last axes.
+	Grayscale min/max filter over the last axis.
 	Prefers SciPy (fast, memory OK). Fallback: numpy sliding window (slow, memory demanding).
+	Note: even se_size is allowed; SciPy origin=0 makes it slightly left-biased for even sizes.
 	"""
-	if half_window < 0:
-		raise ValueError("Half window cannot be negative")
-	if half_window == 0:
+	if se_size < 1:
+		raise ValueError(f"se_size must be >= 1: {se_size}")
+	if se_size == 1:
 		return arr.copy()
-
-	size_last = 2 * half_window + 1
 
 	# SciPy
 	try:
-		from scipy.ndimage import grey_erosion, grey_dilation  # type: ignore
+		from scipy.ndimage import minimum_filter1d, maximum_filter1d  # type: ignore
 
-		size = [1] * arr.ndim
-		size[-1] = size_last
 		if mode == "min":
-			return grey_erosion(arr, size=tuple(size), mode="reflect")
+			return minimum_filter1d(arr, size=se_size, axis=-1, mode="reflect", origin=0)
 		if mode == "max":
-			return grey_dilation(arr, size=tuple(size), mode="reflect")
+			return maximum_filter1d(arr, size=se_size, axis=-1, mode="reflect", origin=0)
 		raise ValueError("`mode` must be either 'min' or 'max'")
 	except ImportError:
 		print("Consider installing `scipy`:\n"
@@ -36,10 +33,12 @@ def _grey_filter_1d(arr: np.ndarray, half_window: int, mode: str) -> np.ndarray:
 	# Numpy fallback (sliding_window_view can be RAM heavy for large maps)
 	from numpy.lib.stride_tricks import sliding_window_view
 
+	left = se_size // 2
+	right = se_size - 1 - left  # matches SciPy origin=0 behavior for even sizes
 	pad = [(0, 0)] * arr.ndim
-	pad[-1] = (half_window, half_window)
+	pad[-1] = (left, right)
 	padded = np.pad(arr, pad_width=pad, mode="reflect")
-	windows = sliding_window_view(padded, window_shape=size_last, axis=-1)
+	windows = sliding_window_view(padded, window_shape=se_size, axis=-1)
 
 	if mode == "min":
 		return windows.min(axis=-1)
@@ -49,20 +48,20 @@ def _grey_filter_1d(arr: np.ndarray, half_window: int, mode: str) -> np.ndarray:
 
 
 # --- Morphology ---
-def erosion_1d(arr: np.ndarray, half_window: int) -> np.ndarray:
-	return _grey_filter_1d(arr, half_window=half_window, mode="min")
+def erosion_1d(arr: np.ndarray, se_size: int) -> np.ndarray:
+	return _minmax_filter_1d(arr, se_size=se_size, mode="min")
 
 
-def dilation_1d(arr: np.ndarray, half_window: int) -> np.ndarray:
-	return _grey_filter_1d(arr, half_window=half_window, mode="max")
+def dilation_1d(arr: np.ndarray, se_size: int) -> np.ndarray:
+	return _minmax_filter_1d(arr, se_size=se_size, mode="max")
 
 
-def opening_1d(arr: np.ndarray, half_window: int) -> np.ndarray:
-	return dilation_1d(erosion_1d(arr, half_window), half_window)
+def opening_1d(arr: np.ndarray, se_size: int) -> np.ndarray:
+	return dilation_1d(erosion_1d(arr, se_size), se_size)
 
 
-def top_hat_1d(arr: np.ndarray, half_window: int) -> np.ndarray:
-	op = opening_1d(arr, half_window)
+def top_hat_1d(arr: np.ndarray, se_size: int) -> np.ndarray:
+	op = opening_1d(arr, se_size)
 	out = arr - op
 
 	out[out < 0] = 0

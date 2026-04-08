@@ -39,6 +39,7 @@ def save_result_npz(
 		threshold: float,
 		candidate_mask: np.ndarray,
 		spikes: List[SpikeSegment],
+		corrected_spectra: Optional[np.ndarray] = None,
 		overlays: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
 	out_path = Path(out_path)
@@ -71,6 +72,9 @@ def save_result_npz(
 	if overlays is not None:
 		for k, v in overlays.items():
 			payload[f"overlay_{k}"] = v
+
+	if corrected_spectra is not None:
+		payload["corrected_spectra"] = corrected_spectra.astype(np.float32)
 
 	np.savez_compressed(out_path, **payload)
 

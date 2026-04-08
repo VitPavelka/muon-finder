@@ -1,4 +1,4 @@
-# wdf_io.py
+# wdf.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -170,3 +170,44 @@ def load_wdf_map(path: Path) -> WdfMap:
 			"  pip install renishaw-wdf\n"
 			"  pip install renishawWiRE"
 		) from e
+
+
+def load_npz_map(path: Path) -> WdfMap:
+	"""
+	Load map-like dataset from NPZ produced by our pipeline.
+	Prefers 'corrected_spectra' if present, else uses 'spectra' if present.
+	"""
+	npz = np.load(path, allow_pickle=True)
+
+	x_axis = np.asarray(npz["x_axis"], dtype=float)
+
+	if "corrected_spectra" in npz:
+		spectra = np.asarray(npz["corrected_spectra"], dtype=np.float32)
+	elif "spectra" in npz:
+		spectra = np.asarray(npz["spectra"], dtype=np.float32)
+	else:
+		raise KeyError("NPZ does not contain 'spectra' nor 'corrected_spectra'.")
+
+	meta = {"backend": "npz"}
+
+	return WdfMap(
+		path=path,
+		x_axis=x_axis,
+		spectra=spectra,
+		xpos=npz["xpos"] if "xpos" in npz else None,
+		ypos=npz["ypos"] if "ypos" in npz else None,
+		meta=meta
+	)
+
+
+def load_dataset(path: Path) -> WdfMap:
+	path = Path(path)
+	suf = path.suffix.lower()
+
+	if suf == ".wdf":
+		return load_wdf_map(path)
+
+	if suf == ".npz":
+		return load_npz_map(path)
+
+	raise ValueError(f"Unsupported input type: {path.suffix}")

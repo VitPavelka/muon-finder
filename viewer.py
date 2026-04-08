@@ -21,6 +21,8 @@ def show_hover_map(
 		plot_erosion: bool = False,
 		plot_dilation: bool = False,
 		plot_top_hat: bool = True,
+		plot_corrected_spectra: bool = True,
+		corrected_spectra: Optional[np.ndarray] = None,
 ) -> None:
 	H, W, N = spectra.shape
 
@@ -46,6 +48,7 @@ def show_hover_map(
 	(ln_ero,) = ax_spec.plot([], [], label="erosion") if plot_erosion else None
 	(ln_dil,) = ax_spec.plot([], [], label="dilation") if plot_dilation else None
 	(ln_th,) = ax_spec.plot([], [], label="top_hat") if plot_top_hat else None
+	(ln_corr,) = ax_spec.plot([], [], label="corrected") if plot_corrected_spectra else None
 
 	spike_lines: List = []
 
@@ -77,6 +80,9 @@ def show_hover_map(
 
 		if plot_top_hat and ln_th is not None:
 			ln_th.set_data(x_axis, overlays["top_hat"][y, x, :])
+
+		if plot_corrected_spectra and corrected_spectra is not None and ln_corr is not None:
+			ln_corr.set_data(x_axis, corrected_spectra[y, x, :])
 
 		# clear old spike lines
 		for l in spike_lines:
