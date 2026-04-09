@@ -18,12 +18,14 @@ def show_hover_map(
 		candidate_mask: np.ndarray,       # (H,W)
 		spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]],
 		overlays: Dict[str, np.ndarray],  # erosion/dilation/opening/top_hat
+		source_coords_map: Optional[Dict[Tuple[int, int], Tuple[int, int]]] = None,  # compact(y,x) -> source(y,x)
 		plot_raw: bool = True,
 		plot_opening: bool = False,
 		plot_erosion: bool = False,
 		plot_dilation: bool = False,
 		plot_top_hat: bool = True,
 		plot_corrected_spectra: bool = True,
+		initial_checked: Optional[Dict[str, bool]] = None,
 		corrected_spectra: Optional[np.ndarray] = None,
 		map_central_mass: float = 0.95,
 		highlight_detected_pixels: bool = True,
@@ -56,24 +58,27 @@ def show_hover_map(
 	cbar.set_label("z (score intensity)")
 
 	# candidates' overlay (visually)
-	ys, xs = np.where(candidate_mask)
-	ax_map.scatter(xs, ys, s=8, marker="o", linewidths=0.5, facecolors="none")
+	# ys, xs = np.where(candidate_mask)
+	# ax_map.scatter(xs, ys, s=8, marker="o", linewidths=0.5, facecolors="none")
 
 	# detected spikes overlay
 	if highlight_detected_pixels and spikes_by_pixel:
 		sp_y = []
 		sp_x = []
-		for py, px in spikes_by_pixel.keys():
+		for (py, px), segs in spikes_by_pixel.items():
+			if not segs:
+				continue
 			sp_y.append(py)
 			sp_x.append(px)
-		ax_map.scatter(
-			sp_x, sp_y,
-			s=42,
-			marker="s",
-			facecolors="none",
-			edgecolors="red",
-			linewidth=1.2,
-		)
+		if sp_x:
+			ax_map.scatter(
+				sp_x, sp_y,
+				s=42,
+				marker="s",
+				facecolors="none",
+				edgecolors="red",
+				linewidth=1.2
+			)
 
 	# marker for actual pixel
 	marker = ax_map.scatter([0], [0], s=80, marker="s", facecolors="none", edgecolors="white", linewidths=2)
@@ -88,13 +93,17 @@ def show_hover_map(
 		"corrected": "#2ca02c",
 	}
 	checked = {
-		"raw": bool(plot_raw),
-		"opening": bool(plot_opening),
-		"erosion": bool(plot_erosion),
-		"dilation": bool(plot_dilation),
-		"top_hat": bool(plot_top_hat),
-		"corrected": bool(plot_corrected_spectra),
+		"raw": True,
+		"opening": False,
+		"erosion": False,
+		"dilation": False,
+		"top_hat": True,
+		"corrected": True,
 	}
+	if initial_checked:
+		for k, v in initial_checked.items():
+			if k in checked:
+				checked[k] = bool(v)
 
 	# spectra lines
 	(ln_raw,) = ax_spec.plot([], [], label="raw", color=line_colors['raw'])
@@ -189,7 +198,13 @@ def show_hover_map(
 			l = ax_spec.axvline(xx, linestyle="--", linewidth=1)
 			spike_lines.append(l)
 
-		ax_spec.set_title(f"spectrum @ (y={y}, x={x}) | spikes={len(segs)}")
+		if source_coords_map is not None:
+			src_y, src_x = source_coords_map.get((y, x), (y, x))
+			ax_spec.set_title(
+				f"spectrum @ compact(y={y}, x={x}) -> source (y={src_y}, x={src_x}) | spikes={len(segs)}"
+			)
+		else:
+			ax_spec.set_title(f"spectrum @ (y={y}, x={x}) | spikes={len(segs)}")
 		ax_spec.relim()
 		ax_spec.autoscale_view()
 

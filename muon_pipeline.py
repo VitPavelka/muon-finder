@@ -36,15 +36,19 @@ def _split_group_into_peak_regions(indices: np.ndarray, signal: np.ndarray) -> L
 		p = int(g[int(np.argmax(vals))])
 		return [(int(g[0]), int(g[-1]), p)]
 
-	# compress plateau maxima: keep one position per consecutive run
+	# compress plateau maxima: keep exactly one position per consecutive run
 	peak_pos: List[int] = []
-	for p in sorted(set(local_pos)):
-		if not peak_pos or p > peak_pos[-1] + 1:
-			peak_pos.append(p)
-		else:
-			prev = peak_pos[-1]
-			if vals[p] > vals[prev]:
-				peak_pos[-1] = p
+	local_sorted = sorted(set(local_pos))
+	run: List[int] = [local_sorted[0]]
+	for p in local_sorted[1:]:
+		if p == run[-1] + 1:
+			run.append(p)
+			continue
+		best = max(run, key=lambda idx: vals[idx])
+		peak_pos.append(int(best))
+		run = [p]
+	best = max(run, key=lambda idx: vals[idx])
+	peak_pos.append(int(best))
 	peak_idx = [int(g[p]) for p in peak_pos]
 	if len(peak_idx) == 1:
 		return [(int(g[0]), int(g[-1]), peak_idx[0])]

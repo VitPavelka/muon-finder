@@ -1,185 +1,320 @@
 # muon_finder.py
 from __future__ import annotations
 
-import numpy as np
-
+import argparse
+import json
+import math
+import pathlib
 from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
+
+import numpy as np
 
 from wdf_io import load_dataset
 from muon_pipeline import (
 	compute_morph_overlays,
 	score_map_from_top_hat,
 	threshold_score_map,
-	neighbour_filter_ratio,
 	extract_spikes_for_candidates,
+	neighbour_filter_ratio,
+	SpikeSegment
 )
-from manual_review import manual_confirm_signals
 from despike import apply_despike
-from results_io import save_result_npz, save_spikes_csv
 from viewer import show_hover_map
+from results_io import save_result_npz, save_spikes_csv
+from debug_report import build_debug_report, save_debug_report_json
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+	"input_path": "",
+	"se_size": 5,
+	"score_mode": "max",
+	"threshold_method": "quantile",
+	"threshold_quantile": 0.1,
+	"threshold_k_mad": 20.0,
+	"threshold_min_abs": None,
+	"k_mad_pixel": 8.0,
+	"min_peak": 0.0,
+	"baseline_se_size": 11,
+	"edge_k_mad": 2.0,
+	"max_width_pts": 20,
+	"pad_pts": 0,
+	"neighbor_filter_enabled": False,
+	"neighbor_radius": 1,
+	"neighbor_ratio_min": 3.0,
+	"coords_csv": None,
+	"use_compact_coords_view": True,
+	"despike_enabled": True,
+	"save_npz_path": None,
+	"save_spikes_csv_path": None,
+	"save_corrected_in_npz": True,
+	"save_overlays_in_npz": True,
+	"debug_report_path": None,
+	"debug_include_per_spectrum": True,
+	"debug_top_pixels": 25,
+}
 
 
-# -------------------------
-# CONFIG (temporarily here)
-# -------------------------
-WDF_PATH = Path(r"C:\Users\pavel\Desktop\AVCR\NewRaman\porizek\wdf\petalit_785nm_20xObj_800ctr_1s_100prc.wdf")
-
-# Morphology: half-window w => structural element is (2*w + 1)
-SE_SIZE = 5
-
-# Score map from top-hat
-SCORE_MODE = "max"  # "max" | "sum" | "l2"
-
-# Thresholding candidates
-THRESH_METHOD = "quantile"  # "quantile" | "mad"
-THRESH_QUANTILE = 0.1
-THRESH_K_MAD = 20.0         # thr = median + k*MAD
-THRESH_MIN_ABS = None       # absolute threshold 200.0
-
-# Extraction of spike segments in spectrum
-SPIKE_MAX_WIDTH_PTS = 20   # max width of segment in spectral points
-SPIKE_K_MAD_PIXEL = 8   # thr_pixel = median(top_hat) + k*MAD(top_hat) (on spectrum)
-SPIKE_MIN_PEAK = 800     # can be >0
-
-# Local filter on map
-USE_NEIGHBOUR_FILTER = True
-NEIGH_RADIUS = 5   # 1 => 3x3
-NEIGH_RATIO_MIN = 1
-
-# Manual conformation
-MANUAL_CONFORMATION = False
-
-# Despike
-BASELINE_SE_SIZE = 11
-EDGE_K_MAD = 2.0
+def load_config(config_path: Optional[Path]) -> Dict[str, Any]:
+	cfg = dict(DEFAULT_CONFIG)
+	if config_path is None:
+		return cfg
+	path = Path(config_path)
+	user_cfg = json.loads(path.read_text(encoding="utf-8"))
+	cfg.update(user_cfg)
+	return cfg
 
 
-# Saving
-SAVE = False
-SAVE_OVERLAYS = False  # save erosion/dilation/opening/top_hat (larger file)
-OUT_NPZ = Path("muon_results.npz")
-OUT_CSV = Path("muon_spikes.csv")
+def load_target_coords_csv(path: Path, shape_hw: Tuple[int, int]) -> List[Tuple[int, int]]:
+	h, w = shape_hw
+	raw = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding="utf-8")
+	if raw.size == 0:
+		return []
 
-# Viewer
-SHOW_VIEWER = True
-PLOT_RAW = True
-PLOT_OPENING = False
-PLOT_EROSION = False
-PLOT_DILATION = False
-PLOT_TOPHAT = True
-PLOT_CORRECTED = True
+	cols = {c.lower(): c for c in raw.dtype.names or []}
+	y_col = cols.get("y")
+	x_col = cols.get("x")
+	if y_col is None or x_col is None:
+		raise ValueError("coords CSV must contain headers 'y' and 'x'.")
+
+	coords: List[Tuple[int, int]] = []
+	seen = set()
+	for yv, xv in zip(np.atleast_1d(raw[y_col]), np.atleast_1d(raw[x_col])):
+		y = int(yv)
+		x = int(xv)
+		if y < 0 or y >= h or x < 0 or x >= w:
+			continue
+		key = (y, x)
+		if key in seen:
+			continue
+		seen.add(key)
+		coords.append(key)
+	return coords
+
+
+def build_compact_subset(
+		x_axis: np.ndarray,
+		raw_spectra: np.ndarray,
+		score_map: np.ndarray,
+		candidate_mask: np.ndarray,
+		overlays: Dict[str, np.ndarray],
+		spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]],
+		coords: List[Tuple[int, int]],
+		corrected_spectra: Optional[np.ndarray] = None,
+) -> Tuple[
+	np.ndarray, np.ndarray, np.ndarray,
+	Dict[str, np.ndarray], Dict[Tuple[int, int], List[SpikeSegment]],
+	Dict[Tuple[int, int], Tuple[int, int]], Optional[np.ndarray]
+]:
+	n = len(coords)
+	if n == 0:
+		raise ValueError("No coordinates for compact subset.")
+
+	grid_w = int(math.ceil(math.sqrt(n)))
+	grid_h = int(math.ceil(n / grid_w))
+	spec_n = x_axis.size
+
+	raw_compact = np.zeros((grid_h, grid_w, spec_n), dtype=raw_spectra.dtype)
+	corr_compact = None
+	if corrected_spectra is not None:
+		corr_compact = np.zeros((grid_h, grid_w, spec_n), dtype=corrected_spectra.dtype)
+	score_compact = np.zeros((grid_h, grid_w), dtype=score_map.dtype)
+	cand_compact = np.zeros((grid_h, grid_w), dtype=bool)
+	overlay_compact: Dict[str, np.ndarray] = {
+		k: np.zeros((grid_h, grid_w, spec_n), dtype=v.dtype) for k, v in overlays.items()
+	}
+	spikes_compact: Dict[Tuple[int, int], List[SpikeSegment]] = {}
+	coord_map: Dict[Tuple[int, int], Tuple[int, int]] = {}
+
+	for i, (src_y, src_x) in enumerate(coords):
+		yy = i // grid_w
+		xx = i % grid_w
+		coord_map[(yy, xx)] = (src_y, src_x)
+
+		raw_compact[yy, xx, :] = raw_spectra[src_y, src_x, :]
+		if corr_compact is not None:
+			corr_compact[yy, xx, :] = corrected_spectra[src_y, src_x, :]
+		score_compact[yy, xx] = score_map[src_y, src_x]
+		cand_compact[yy, xx] = bool(candidate_mask[src_y, src_x])
+		for k in overlay_compact:
+			overlay_compact[k][yy, xx, :] = overlays[k][src_y, src_x, :]
+
+		src_spikes = spikes_by_pixel.get((src_y, src_x), [])
+		if src_spikes:
+			spikes_compact[(yy, xx)] = [
+				SpikeSegment(
+					y=yy,
+					x=xx,
+					peak_index=s.peak_index,
+					start=s.start,
+					end=s.end,
+					peak_height=s.peak_height,
+					area=s.area,
+				)
+				for s in src_spikes
+			]
+
+	return raw_compact, score_compact, cand_compact, overlay_compact, spikes_compact, coord_map, corr_compact
+
+
+def run(cfg: Dict[str, Any]) -> None:
+
+	# 0) config file
+	in_path = Path(cfg['input_path'])
+
+	# 1) load data
+	ds = load_dataset(in_path)
+	x_axis = ds.x_axis
+	raw = ds.spectra
+
+	# 2) morphology
+	overlays = compute_morph_overlays(raw, se_size=int(cfg['se_size']))
+
+	# 3a) score map + candidates
+	score_map = score_map_from_top_hat(overlays['top_hat'], mode=str(cfg['score_mode']))
+	thr = threshold_score_map(
+		score_map=score_map,
+		method=str(cfg['threshold_method']),
+		quantile=float(cfg['threshold_quantile']),
+		k_mad=float(cfg['threshold_k_mad']),
+		min_abs=cfg['threshold_min_abs'],
+	)
+	candidate_mask = score_map >= thr
+
+	target_coords: Optional[List[Tuple[int, int]]] = None
+	if cfg.get("coords_csv"):
+		target_coords = load_target_coords_csv(Path(cfg['coords_csv']), shape_hw=score_map.shape)
+		coord_mask = np.zeros_like(candidate_mask, dtype=bool)
+		for yy, xx in target_coords:
+			coord_mask[yy, xx] = True
+		# For coordinate-based optimization we run extraction only on requested spectra
+		candidate_mask = coord_mask
+
+	# 3b) spike segments (narrow bands) for candidate pixels
+	spikes, spikes_by_pixel = extract_spikes_for_candidates(
+		x_axis=x_axis,
+		top_hat=overlays['top_hat'],
+		candidate_mask=candidate_mask,
+		raw_spectra=raw,
+		max_width_pts=int(cfg['max_width_pts']),
+		k_mad_pixel=float(cfg['k_mad_pixel']),
+		min_peak=float(cfg['min_peak']),
+		baseline_se_size=cfg['baseline_se_size'],
+		edge_k_mad=float(cfg['edge_k_mad']),
+		pad_pts=int(cfg['pad_pts']),
+	)
+
+	# 3) comparison with neighbors
+	if bool(cfg['neighbor_filter_enabled']):
+		accepted = neighbour_filter_ratio(
+			top_hat=overlays['top_hat'],
+			spikes=spikes,
+			radius=int(cfg['neighbor_radius']),
+			ratio_min=float(cfg['neighbor_ratio_min']),
+		)
+		accepted_set = set(accepted)
+
+		# rebuild spikes_by_pixel + rebuild cand from kept spikes
+		spikes_by_pixel = {
+			pix: [s for s in segs if s in accepted_set]
+			for pix, segs in spikes_by_pixel.items()
+		}
+		spikes_by_pixel = {pix: segs for pix, segs in spikes_by_pixel.items() if segs}
+		spikes = accepted
+
+	corrected = raw
+
+	# 5) Despike
+	if bool(cfg['despike_enabled']):
+		corrected = apply_despike(
+			x_axis=x_axis, spectra=raw, accepted_spikes=spikes
+		)
+
+	# 6) Viewer (hover)
+	view_x = x_axis
+	view_spectra = raw
+	view_score = score_map
+	view_mask = candidate_mask
+	view_overlays = overlays
+	view_spikes_by_pixel = spikes_by_pixel
+	source_coords_map = None
+	view_corrected = corrected if bool(cfg['despike_enabled']) else None
+
+	if target_coords and bool(cfg['use_compact_coords_view']):
+		(
+			view_spectra,
+			view_score,
+			view_mask,
+			view_overlays,
+			view_spikes_by_pixel,
+			source_coords_map,
+			view_corrected,
+		) = build_compact_subset(
+			x_axis=view_x,
+			raw_spectra=view_spectra,
+			score_map=view_score,
+			candidate_mask=view_mask,
+			overlays=view_overlays,
+			spikes_by_pixel=view_spikes_by_pixel,
+			coords=target_coords,
+			corrected_spectra=view_corrected,
+		)
+	show_hover_map(
+		x_axis=view_x,
+		spectra=view_spectra,
+		score_map=view_score,
+		candidate_mask=view_mask,
+		spikes_by_pixel=view_spikes_by_pixel,
+		overlays=view_overlays,
+		source_coords_map=source_coords_map,
+		corrected_spectra=view_corrected,
+		initial_checked={"raw": True, "top_hat": True, "corrected:": True},
+	)
+
+	# 7) Save data and report
+	if cfg.get("save_npz_path"):
+		save_result_npz(
+			out_path=Path(cfg['save_npz_path']),
+			ds=ds,
+			score_map=score_map,
+			threshold=float(thr),
+			candidate_mask=candidate_mask,
+			spikes=spikes,
+			corrected_spectra=corrected if bool(cfg['save_corrected_in_npz']) else None,
+			overlays=overlays if bool(cfg['save_overlays_in_npz']) else None,
+		)
+
+	if cfg.get("save_spikes_csv_path"):
+		save_spikes_csv(path=Path(cfg["save_spikes_csv_path"]), spikes=spikes)
+
+	if cfg.get("debug_report_path"):
+		report = build_debug_report(
+			score_map=score_map,
+			candidate_mask=candidate_mask,
+			spikes_by_pixel=spikes_by_pixel,
+			threshold=float(thr),
+			target_coords=target_coords,
+			include_per_spectrum=bool(cfg['debug_include_per_spectrum']),
+			max_top_pixels=int(cfg['debug_top_pixels']),
+		)
+		save_debug_report_json(Path(cfg['debug_report_path']), report)
 
 
 def main() -> None:
-	# 0) load
-	ds = load_dataset(WDF_PATH)
-	print(f"[load] shape(H,W,N)={ds.spectra.shape}, axis={ds.x_axis.shape}, file={ds.path}")
+	parser = argparse.ArgumentParser(description="Muon finder")
+	parser.add_argument("--config", type=Path, default=None, help="Path to JSON config file.")
+	parser.add_argument("--input", type=Path, default=None, help="Input .wdf or .npz path (overrides config).")
+	parser.add_argument("--coords-csv", type=Path, default=None, help="CSV with columns y,x for targeted spectra.")
+	args = parser.parse_args()
 
-	# 1) morphology
-	overlays = compute_morph_overlays(ds.spectra, se_size=SE_SIZE)
-	top_hat = overlays["top_hat"]
+	cfg = load_config(args.config)
+	if args.input is not None:
+		cfg['input_path'] = str(args.input)
+	if args.coords_csv is not None:
+		cfg['coords_csv'] = str(args.coords_csv)
+	if not cfg.get("input_path"):
+		raise ValueError("Set input path via config 'input_path' or CLI --input.")
 
-	# 2) score map + candidates
-	score = score_map_from_top_hat(top_hat, mode=SCORE_MODE)
-	thr = threshold_score_map(
-		score,
-		method=THRESH_METHOD,
-		quantile=THRESH_QUANTILE,
-		k_mad=THRESH_K_MAD,
-		min_abs=THRESH_MIN_ABS,
-	)
-	cand = score >= thr
-
-	# 2b) spike segments (narrow bands) for candidate pixels
-	spikes, spikes_by_pixel = extract_spikes_for_candidates(
-		x_axis=ds.x_axis,
-		top_hat=top_hat,
-		candidate_mask=cand,
-		raw_spectra=ds.spectra,
-		max_width_pts=SPIKE_MAX_WIDTH_PTS,
-		k_mad_pixel=SPIKE_K_MAD_PIXEL,
-		min_peak=SPIKE_MIN_PEAK,
-		baseline_se_size=BASELINE_SE_SIZE,
-		edge_k_mad=EDGE_K_MAD
-	)
-	print(f"[candidates] {int(cand.sum())} pixels above threshold (thr={thr:.6g})")
-	print(f"[spikes] extracted segments: {len(spikes)}")
-
-	# 3) comparison with neighbors
-	pre_spikes = len(spikes)
-
-	if USE_NEIGHBOUR_FILTER and spikes:
-		spikes = neighbour_filter_ratio(
-			top_hat=top_hat,
-			spikes=spikes,
-			radius=NEIGH_RADIUS,
-			ratio_min=NEIGH_RATIO_MIN,
-		)
-
-		# rebuild spikes_by_pixel + rebuild cand from kept spikes
-		spikes_by_pixel = {}
-		cand2 = np.zeros_like(cand, dtype=bool)
-
-		for s in spikes:
-			spikes_by_pixel.setdefault((s.y, s.x), []).append(s)
-			cand2[s.y, s.x] = True
-
-		cand = cand2
-
-		print(f"[neigh] spikes kept: {len(spikes)}/{pre_spikes}, pixels kept: {int(cand.sum())}")
-	else:
-		print(f"[neigh] skipped, spikes: {pre_spikes}")
-
-	# 4) Manual confirmation
-	accepted_spikes = spikes
-	if MANUAL_CONFORMATION and spikes_by_pixel:
-		accepted_spikes = manual_confirm_signals(
-			x_axis=ds.x_axis,
-			spectra=ds.spectra,
-			spikes_by_pixel=spikes_by_pixel,
-			overlays=overlays,
-		)
-
-	# 5) Despike
-	corrected_spectra = apply_despike(
-		x_axis=ds.x_axis,
-		spectra=ds.spectra,
-		accepted_spikes=accepted_spikes,
-	)
-
-	# 6) save
-	if SAVE:
-		overlays_to_save = overlays if SAVE_OVERLAYS else None
-		save_result_npz(
-			out_path=OUT_NPZ,
-			ds=ds,
-			score_map=score,
-			threshold=thr,
-			candidate_mask=cand,
-			spikes=spikes,
-			overlays=overlays_to_save,
-			corrected_spectra=corrected_spectra,
-		)
-		save_spikes_csv(OUT_CSV, spikes)
-		print(f"[save] {OUT_NPZ} + {OUT_CSV}")
-
-	# 7) viewer (hover)
-	if SHOW_VIEWER:
-		show_hover_map(
-			x_axis=ds.x_axis,
-			spectra=ds.spectra,
-			score_map=score,
-			candidate_mask=cand,
-			spikes_by_pixel=spikes_by_pixel,
-			overlays=overlays,
-			plot_raw=PLOT_RAW,
-			plot_opening=PLOT_OPENING,
-			plot_erosion=PLOT_EROSION,
-			plot_dilation=PLOT_DILATION,
-			plot_top_hat=PLOT_TOPHAT,
-			plot_corrected_spectra=PLOT_CORRECTED,
-			corrected_spectra=corrected_spectra,
-		)
+	run(cfg)
 
 
 if __name__ == "__main__":

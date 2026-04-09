@@ -1,0 +1,544 @@
+{
+  "shape_hw": [
+    126,
+    251
+  ],
+  "threshold": 84.81163024902344,
+  "score_stats": {
+    "min": 0.0,
+    "max": 112771.1328125,
+    "median": 758.4612426757812,
+    "p95": 2695.27392578125
+  },
+  "n_candidates": 33,
+  "n_pixels_with_spikes": 15,
+  "n_spikes_total": 20,
+  "top_pixels": [
+    {
+      "y": 54,
+      "x": 89,
+      "n_spikes": 4,
+      "max_peak_height": 3130.38037109375,
+      "sum_area": 17028.731550693512
+    },
+    {
+      "y": 49,
+      "x": 14,
+      "n_spikes": 2,
+      "max_peak_height": 18241.76953125,
+      "sum_area": 90913.53891789913
+    },
+    {
+      "y": 77,
+      "x": 153,
+      "n_spikes": 2,
+      "max_peak_height": 2140.98974609375,
+      "sum_area": 17959.46069601178
+    },
+    {
+      "y": 100,
+      "x": 123,
+      "n_spikes": 1,
+      "max_peak_height": 19757.02734375,
+      "sum_area": 48497.50697281957
+    },
+    {
+      "y": 124,
+      "x": 243,
+      "n_spikes": 1,
+      "max_peak_height": 8704.15625,
+      "sum_area": 14435.256212458014
+    },
+    {
+      "y": 62,
+      "x": 15,
+      "n_spikes": 1,
+      "max_peak_height": 8376.8203125,
+      "sum_area": 22085.80689716339
+    },
+    {
+      "y": 10,
+      "x": 160,
+      "n_spikes": 1,
+      "max_peak_height": 7273.77099609375,
+      "sum_area": 22066.71228992939
+    },
+    {
+      "y": 12,
+      "x": 33,
+      "n_spikes": 1,
+      "max_peak_height": 5898.283203125,
+      "sum_area": 17350.62158191949
+    },
+    {
+      "y": 7,
+      "x": 50,
+      "n_spikes": 1,
+      "max_peak_height": 3552.4345703125,
+      "sum_area": 9742.728177830577
+    },
+    {
+      "y": 50,
+      "x": 137,
+      "n_spikes": 1,
+      "max_peak_height": 3263.7939453125,
+      "sum_area": 6407.395782589912
+    },
+    {
+      "y": 19,
+      "x": 122,
+      "n_spikes": 1,
+      "max_peak_height": 2293.420166015625,
+      "sum_area": 6808.601566374302
+    },
+    {
+      "y": 22,
+      "x": 145,
+      "n_spikes": 1,
+      "max_peak_height": 2189.30615234375,
+      "sum_area": 4950.348131537437
+    },
+    {
+      "y": 55,
+      "x": 153,
+      "n_spikes": 1,
+      "max_peak_height": 1914.4534912109375,
+      "sum_area": 13840.37899261713
+    },
+    {
+      "y": 37,
+      "x": 30,
+      "n_spikes": 1,
+      "max_peak_height": 1457.0079345703125,
+      "sum_area": 4099.833732545376
+    },
+    {
+      "y": 31,
+      "x": 179,
+      "n_spikes": 1,
+      "max_peak_height": 1207.5167236328125,
+      "sum_area": 8340.53979986906
+    }
+  ],
+  "per_spectrum": [
+    {
+      "y": 7,
+      "x": 50,
+      "is_candidate": true,
+      "score": 3552.4345703125,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 499,
+          "start": 497,
+          "end": 503,
+          "peak_height": 3552.4345703125,
+          "area": 9742.728177830577
+        }
+      ]
+    },
+    {
+      "y": 10,
+      "x": 127,
+      "is_candidate": true,
+      "score": 2062.271728515625,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 10,
+      "x": 160,
+      "is_candidate": true,
+      "score": 7273.77099609375,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 684,
+          "start": 680,
+          "end": 687,
+          "peak_height": 7273.77099609375,
+          "area": 22066.71228992939
+        }
+      ]
+    },
+    {
+      "y": 11,
+      "x": 120,
+      "is_candidate": true,
+      "score": 2239.314697265625,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 12,
+      "x": 33,
+      "is_candidate": true,
+      "score": 5898.283203125,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 994,
+          "start": 989,
+          "end": 997,
+          "peak_height": 5898.283203125,
+          "area": 17350.62158191949
+        }
+      ]
+    },
+    {
+      "y": 13,
+      "x": 154,
+      "is_candidate": true,
+      "score": 3582.921630859375,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 14,
+      "x": 127,
+      "is_candidate": true,
+      "score": 6752.90576171875,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 14,
+      "x": 162,
+      "is_candidate": true,
+      "score": 4138.69921875,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 18,
+      "x": 145,
+      "is_candidate": true,
+      "score": 3016.32763671875,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 19,
+      "x": 122,
+      "is_candidate": true,
+      "score": 2293.420166015625,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 225,
+          "start": 222,
+          "end": 228,
+          "peak_height": 2293.420166015625,
+          "area": 6808.601566374302
+        }
+      ]
+    },
+    {
+      "y": 22,
+      "x": 145,
+      "is_candidate": true,
+      "score": 2189.30615234375,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 592,
+          "start": 588,
+          "end": 594,
+          "peak_height": 2189.30615234375,
+          "area": 4950.348131537437
+        }
+      ]
+    },
+    {
+      "y": 27,
+      "x": 121,
+      "is_candidate": true,
+      "score": 2797.126220703125,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 31,
+      "x": 179,
+      "is_candidate": true,
+      "score": 2000.923095703125,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 772,
+          "start": 767,
+          "end": 777,
+          "peak_height": 1207.5167236328125,
+          "area": 8340.53979986906
+        }
+      ]
+    },
+    {
+      "y": 33,
+      "x": 247,
+      "is_candidate": true,
+      "score": 1198.9298095703125,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 36,
+      "x": 246,
+      "is_candidate": true,
+      "score": 2718.872314453125,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 37,
+      "x": 30,
+      "is_candidate": true,
+      "score": 1457.0079345703125,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 228,
+          "start": 227,
+          "end": 238,
+          "peak_height": 1457.0079345703125,
+          "area": 4099.833732545376
+        }
+      ]
+    },
+    {
+      "y": 38,
+      "x": 163,
+      "is_candidate": true,
+      "score": 2563.277587890625,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 48,
+      "x": 201,
+      "is_candidate": true,
+      "score": 3832.437744140625,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 49,
+      "x": 14,
+      "is_candidate": true,
+      "score": 18241.76953125,
+      "n_spikes": 2,
+      "spikes": [
+        {
+          "peak_index": 64,
+          "start": 62,
+          "end": 71,
+          "peak_height": 18241.76953125,
+          "area": 45456.769458949566
+        },
+        {
+          "peak_index": 69,
+          "start": 62,
+          "end": 71,
+          "peak_height": 4110.72119140625,
+          "area": 45456.769458949566
+        }
+      ]
+    },
+    {
+      "y": 50,
+      "x": 137,
+      "is_candidate": true,
+      "score": 3884.442138671875,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 937,
+          "start": 935,
+          "end": 940,
+          "peak_height": 3263.7939453125,
+          "area": 6407.395782589912
+        }
+      ]
+    },
+    {
+      "y": 54,
+      "x": 89,
+      "is_candidate": true,
+      "score": 3130.38037109375,
+      "n_spikes": 4,
+      "spikes": [
+        {
+          "peak_index": 811,
+          "start": 810,
+          "end": 817,
+          "peak_height": 1706.050048828125,
+          "area": 4051.0356580018997
+        },
+        {
+          "peak_index": 815,
+          "start": 810,
+          "end": 817,
+          "peak_height": 1012.280029296875,
+          "area": 4051.0356580018997
+        },
+        {
+          "peak_index": 818,
+          "start": 817,
+          "end": 822,
+          "peak_height": 1425.861328125,
+          "area": 4463.330117344856
+        },
+        {
+          "peak_index": 821,
+          "start": 817,
+          "end": 822,
+          "peak_height": 3130.38037109375,
+          "area": 4463.330117344856
+        }
+      ]
+    },
+    {
+      "y": 55,
+      "x": 153,
+      "is_candidate": true,
+      "score": 2754.89697265625,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 772,
+          "start": 767,
+          "end": 777,
+          "peak_height": 1914.4534912109375,
+          "area": 13840.37899261713
+        }
+      ]
+    },
+    {
+      "y": 57,
+      "x": 226,
+      "is_candidate": true,
+      "score": 2273.1435546875,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 59,
+      "x": 219,
+      "is_candidate": true,
+      "score": 2066.289306640625,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 62,
+      "x": 15,
+      "is_candidate": true,
+      "score": 8376.8203125,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 927,
+          "start": 922,
+          "end": 930,
+          "peak_height": 8376.8203125,
+          "area": 22085.80689716339
+        }
+      ]
+    },
+    {
+      "y": 65,
+      "x": 213,
+      "is_candidate": true,
+      "score": 1535.134521484375,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 65,
+      "x": 214,
+      "is_candidate": true,
+      "score": 3145.595458984375,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 69,
+      "x": 125,
+      "is_candidate": true,
+      "score": 3348.10791015625,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 77,
+      "x": 153,
+      "is_candidate": true,
+      "score": 2402.65966796875,
+      "n_spikes": 2,
+      "spikes": [
+        {
+          "peak_index": 936,
+          "start": 931,
+          "end": 941,
+          "peak_height": 2140.98974609375,
+          "area": 11521.534112870693
+        },
+        {
+          "peak_index": 958,
+          "start": 953,
+          "end": 963,
+          "peak_height": 1031.8544921875,
+          "area": 6437.9265831410885
+        }
+      ]
+    },
+    {
+      "y": 100,
+      "x": 123,
+      "is_candidate": true,
+      "score": 19757.02734375,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 491,
+          "start": 487,
+          "end": 495,
+          "peak_height": 19757.02734375,
+          "area": 48497.50697281957
+        }
+      ]
+    },
+    {
+      "y": 101,
+      "x": 13,
+      "is_candidate": true,
+      "score": 246.30345153808594,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 103,
+      "x": 227,
+      "is_candidate": true,
+      "score": 689.9581909179688,
+      "n_spikes": 0,
+      "spikes": []
+    },
+    {
+      "y": 124,
+      "x": 243,
+      "is_candidate": true,
+      "score": 8704.15625,
+      "n_spikes": 1,
+      "spikes": [
+        {
+          "peak_index": 227,
+          "start": 225,
+          "end": 230,
+          "peak_height": 8704.15625,
+          "area": 14435.256212458014
+        }
+      ]
+    }
+  ]
+}
