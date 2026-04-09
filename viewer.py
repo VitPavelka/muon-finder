@@ -27,7 +27,7 @@ def show_hover_map(
 		corrected_spectra: Optional[np.ndarray] = None,
 		map_central_mass: float = 0.95,
 		highlight_detected_pixels: bool = True,
-		hover_fps: float = 30.0,
+		hover_fps: float = 10.0,
 ) -> None:
 	H, W, N = spectra.shape
 
@@ -117,12 +117,35 @@ def show_hover_map(
 	ax_spec.set_title("spectrum @ (y,x)")
 	ax_spec.set_xlabel("Raman shift/cm$^{-1}$")
 	ax_spec.set_ylabel("Intensity")
-	ax_spec.legend(loc="best")
+	ax_spec.legend(loc="upper right")
 
 	frozen = {"state": False}  # right click = freeze/unfreeze
 	current = {"y": 0, "x": 0}
 	focus = {"which": "x", "replace_x": False, "replace_y": False}
 	hover_state = {"last_t": 0.0, "last_xy": (-1, -1)}
+
+	def _refresh_legend() -> None:
+		handles = []
+		labels = []
+		for nm, ln in lines.items():
+			if ln.get_visible():
+				handles.append(ln)
+				labels.append(nm)
+		leg = ax_spec.get_legend()
+		if leg is not None:
+			leg.remove()
+		if handles:
+			ax_spec.legend(handles, labels, loc="best")
+
+	def _set_focus(which: str) -> None:
+		focus['which'] = which
+		txt_x.set_active(which == "x")
+		txt_y.set_active(which == "y")
+
+		ax_txt_x.set_facecolor("#ffffff" if which == "x" else "#f0f0f0")
+		ax_txt_y.set_facecolor("#ffffff" if which == "y" else "#f0f0f0")
+		ax_btn_go.set_facecolor("#dfefff" if which == "go" else "#f0f0f0")
+		fig.canvas.draw_idle()
 
 	def _update(y: int, x: int) -> None:
 		y = int(np.clip(y, 0, H - 1))
@@ -148,6 +171,8 @@ def show_hover_map(
 				ln.set_visible(False)
 			else:
 				ln.set_visible(bool(checked[nm]))
+
+		_refresh_legend()
 
 		# clear old spike lines
 		for l in spike_lines:
@@ -193,17 +218,17 @@ def show_hover_map(
 
 	def on_click(event) -> None:
 		if event.inaxes == ax_txt_x:
-			focus['which'] = "x"
+			_set_focus("x")
 			if getattr(event, "dblclick", False):
 				focus['replace_x'] = True
 			return
 		if event.inaxes == ax_txt_y:
-			focus['which'] = "y"
+			_set_focus("y")
 			if getattr(event, "dblclick", False):
 				focus['replace_y'] = True
 			return
 		if event.inaxes == ax_btn_go:
-			focus["which"] = "go"
+			_set_focus("go")
 			return
 
 		if event.inaxes != ax_map:
@@ -253,7 +278,7 @@ def show_hover_map(
 		if key == "tab":
 			order = ["y", "x", "go"]
 			i = order.index(focus['which']) if focus['which'] in order else 0
-			focus['which'] = order[(i + 1) % len(order)]
+			_set_focus(order[(i + 1) % len(order)])
 			return
 		if key == "ctrl+a":
 			if focus['which'] == "x":
@@ -261,7 +286,7 @@ def show_hover_map(
 			elif focus['which'] == "y":
 				focus['replace_y'] = True
 			return
-		if key in ("enter", "return") and focus['which'] == "go":
+		if key in ("enter", "return") and focus['which'] in ("x", "y", "go"):
 			_go_to_xy()
 			return
 
@@ -285,6 +310,7 @@ def show_hover_map(
 	fig.canvas.mpl_connect("key_press_event", on_key)
 
 	# init
+	_set_focus("x")
 	_update(0, 0)
 	_sync_inputs()
 	plt.show()

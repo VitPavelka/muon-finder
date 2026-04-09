@@ -63,9 +63,9 @@ OUT_CSV = Path("muon_spikes.csv")
 # Viewer
 SHOW_VIEWER = True
 PLOT_RAW = True
-PLOT_OPENING = True
-PLOT_EROSION = True
-PLOT_DILATION = True
+PLOT_OPENING = False
+PLOT_EROSION = False
+PLOT_DILATION = False
 PLOT_TOPHAT = True
 PLOT_CORRECTED = True
 
@@ -130,7 +130,7 @@ def main() -> None:
 	else:
 		print(f"[neigh] skipped, spikes: {pre_spikes}")
 
-	# 4) Manual conformation
+	# 4) Manual confirmation
 	accepted_spikes = spikes
 	if MANUAL_CONFORMATION and spikes_by_pixel:
 		accepted_spikes = manual_confirm_signals(
