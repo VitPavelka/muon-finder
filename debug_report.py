@@ -18,6 +18,9 @@ def build_debug_report(
 		target_coords: Optional[List[Tuple[int, int]]] = None,
 		include_per_spectrum: bool = False,
 		max_top_pixels: int = 25,
+		raw_spectra: Optional[np.ndarray] = None,  # (H,W,N)
+		overlays: Optional[Dict[str, np.ndarray]] = None,  # expects at least 'gradient' if available
+		x_axis: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
 	finite = score_map[np.isfinite(score_map)]
 	if finite.size == 0:
@@ -57,6 +60,124 @@ def build_debug_report(
 		"top_pixels": top_pixels,
 	}
 
+	def _merge_duplicate_segments(segs: List[SpikeSegment]) -> List[SpikeSegment]:
+		"""
+		Merge segments sharing identical (start, end) into one representative spike.
+		Keeps highes peak_height as representative.
+		"""
+		if not segs:
+			return []
+		buckets: Dict[Tuple[int, int], List[SpikeSegment]] = {}
+		for s in segs:
+			buckets.setdefault((int(s.start), int(s.end)), []).append(s)
+		out: List[SpikeSegment] = []
+		for (_a, _b), group in buckets.items():
+			best = max(group, key=lambda s: float(s.peak_height))
+			out.append(best)
+		out.sort(key=lambda s: (s.start, s.peak_index, s.end))
+		return out
+
+	def _muon_score(feat: Dict[str, Any]) -> Dict[str, Any]:
+		# bounded transforms to avoid domination by any single large feature
+		gz = float(feat.get("gradient_max_z", 0.0))
+		rz = float(feat.get("rise_slope_z", 0.0))
+		fz = float(feat.get("fall_slope_z", 0.0))
+		pw = float(feat.get("plateau_width_90", 0.0))
+		asym = abs(float(feat.get("edge_asymmetry", 1.0)))
+
+		s_grad = float(np.tanh(gz / 6.0))
+		s_rise = float(np.tanh(rz / 3.0))
+		s_fall = float(np.tanh(fz / 3.0))
+		s_plateau = float(np.exp(-((pw - 3.0) / 4.0) ** 2))
+		s_asym = float(np.exp(-asym / 0.5))
+
+		weights = {
+			"s_grad": 0.35,
+			"s_rise": 0.2,
+			"s_fall": 0.2,
+			"s_plateau": 0.15,
+			"s_asym": 0.1,
+		}
+		score = (
+			weights['s_grad'] * s_grad
+			+ weights['s_rise'] * s_rise
+			+ weights['s_fall'] * s_fall
+			+ weights['s_plateau'] * s_plateau
+			+ weights['s_asym'] * s_asym
+		)
+		return {
+			"muon_score": float(score),
+			"muon_score_components": {
+				"s_grad": s_grad,
+				"s_rise": s_rise,
+				"s_fall": s_fall,
+				"s_plateau": s_plateau,
+				"s_asym": s_asym,
+				"weights": weights,
+			},
+		}
+
+	def _spike_features(y: int, x: int, s: SpikeSegment) -> Dict[str, Any]:
+		out: Dict[str, Any] = {
+			"width_pts": int(max(0, s.end - s.start - 1)),
+			"peak_index": int(s.peak_index),
+			"start": int(s.start),
+			"end": int(s.end),
+			"peak_height": float(s.peak_height),
+			"area": float(s.area),
+		}
+		if raw_spectra is not None:
+			out['raw_peak_value'] = float(raw_spectra[int(y), int(x), int(s.peak_index)])
+
+		# Primary features are computed from morphological gradient.
+		if overlays is None or "gradient" not in overlays:
+			return out
+		grad_spec = overlays['gradient'][int(y), int(x), :].astype(float)
+		n = grad_spec.size
+		a = int(np.clip(s.start, 0, n - 1))
+		b = int(np.clip(s.end, 0, n - 1))
+		p = int(np.clip(s.peak_index, 0, n - 1))
+		if not (a < p < b):
+			return out
+
+		segment = grad_spec[a:b + 1]
+		if segment.size < 3:
+			return out
+
+		d = np.diff(segment)
+		rise = d[: max(1, p - a)]
+		fall = d[max(1, p - a) :]
+		rise_slope = float(np.max(rise)) if rise.size else 0.0
+		fall_slope = float(np.min(fall)) if fall.size else 0.0
+
+		seg_med = float(np.median(segment))
+		seg_mad = float(np.median(np.abs(segment - seg_med)))
+		seg_mad = max(seg_mad, 1e-12)
+		out['rise_slope'] = rise_slope
+		out['fall_slope'] = fall_slope
+		out['rise_slope_z'] = float(rise_slope / seg_mad)
+		out['fall_slope_z'] = float(abs(fall_slope / seg_med))
+
+		peak_val = float(grad_spec[p])
+		lvl = 0.9 * peak_val
+		plateau = int(np.count_nonzero(segment >= lvl))
+		out['plateau_width_90'] = plateau
+		out['edge_asymmetry'] = float(
+			(abs(rise_slope) - abs(fall_slope)) / (abs(rise_slope) + abs(fall_slope) + 1e-12)
+		)
+
+		gmed = float(np.median(segment))
+		gmad = float(np.median(np.abs(segment - gmed)))
+		gmad = max(gmad, 1e-12)
+		out['gradient_max'] = float(np.max(segment))
+		out['gradient_max_z'] = float(np.max(segment) / gmad)
+		out['feature_source'] = "gradient"
+		if x_axis is not None and 0 <= p < x_axis.size:
+			out['peak_position_cm1'] = float(x_axis[p])
+		out.update(_muon_score(out))
+
+		return out
+
 	if include_per_spectrum:
 		if target_coords is not None:
 			iter_coords = target_coords
@@ -65,7 +186,7 @@ def build_debug_report(
 
 		per_spec = []
 		for y, x in iter_coords:
-			segs = spikes_by_pixel.get((int(y), int(x)), [])
+			segs = _merge_duplicate_segments(spikes_by_pixel.get((int(y), int(x)), []))
 			per_spec.append(
 				{
 					"y": int(y),
@@ -74,13 +195,7 @@ def build_debug_report(
 					"score": float(score_map[int(y), int(x)]),
 					"n_spikes": int(len(segs)),
 					"spikes": [
-						{
-							"peak_index": int(s.peak_index),
-							"start": int(s.start),
-							"end": int(s.end),
-							"peak_height": float(s.peak_height),
-							"area": float(s.area),
-						}
+						_spike_features(int(y), int(x), s)
 						for s in segs
 					],
 				}

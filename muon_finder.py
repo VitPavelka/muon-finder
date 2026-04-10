@@ -267,7 +267,13 @@ def run(cfg: Dict[str, Any]) -> None:
 		overlays=view_overlays,
 		source_coords_map=source_coords_map,
 		corrected_spectra=view_corrected,
-		initial_checked={"raw": True, "top_hat": True, "corrected:": True},
+		initial_checked={
+			"raw": True,
+			"top_hat": True,
+			"gradient": True,
+			"dilation_minus_opening": True,
+			"corrected:": True,
+		},
 	)
 
 	# 7) Save data and report
@@ -295,6 +301,9 @@ def run(cfg: Dict[str, Any]) -> None:
 			target_coords=target_coords,
 			include_per_spectrum=bool(cfg['debug_include_per_spectrum']),
 			max_top_pixels=int(cfg['debug_top_pixels']),
+			raw_spectra=raw,
+			overlays=overlays,
+			x_axis=x_axis,
 		)
 		save_debug_report_json(Path(cfg['debug_report_path']), report)
 

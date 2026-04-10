@@ -23,3 +23,5 @@ Thumbs.db
 # main
 muon_finder.py
 muon_finder_backup.py
+config.json
+debug.json

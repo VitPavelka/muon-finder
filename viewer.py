@@ -90,6 +90,8 @@ def show_hover_map(
 		"erosion": "#7f7f7f",
 		"dilation": "#8c564b",
 		"top_hat": "#ff7f0e",
+		"gradient": "#e377c2",
+		"dilation_minus_opening": "#bcbd22",
 		"corrected": "#2ca02c",
 	}
 	checked = {
@@ -98,7 +100,9 @@ def show_hover_map(
 		"erosion": False,
 		"dilation": False,
 		"top_hat": True,
-		"corrected": True,
+		"gradient": True,
+		"dilation_minus_opening": True,
+		"corrected": False,
 	}
 	if initial_checked:
 		for k, v in initial_checked.items():
@@ -111,6 +115,8 @@ def show_hover_map(
 	(ln_ero,) = ax_spec.plot([], [], label="erosion", color=line_colors['erosion'])
 	(ln_dil,) = ax_spec.plot([], [], label="dilation", color=line_colors['dilation'])
 	(ln_th,) = ax_spec.plot([], [], label="top_hat", color=line_colors['top_hat'])
+	(ln_grad,) = ax_spec.plot([], [], label="gradient", color=line_colors['gradient'])
+	(ln_dmo,) = ax_spec.plot([], [], label="dilation_minus_opening", color=line_colors['dilation_minus_opening'])
 	(ln_corr,) = ax_spec.plot([], [], label="corrected", color=line_colors['corrected'])
 	lines = {
 		"raw": ln_raw,
@@ -118,6 +124,8 @@ def show_hover_map(
 		"erosion": ln_ero,
 		"dilation": ln_dil,
 		"top_hat": ln_th,
+		"gradient": ln_grad,
+		"dilation_minus_opening": ln_dmo,
 		"corrected": ln_corr,
 	}
 
@@ -170,6 +178,14 @@ def show_hover_map(
 		ln_ero.set_data(x_axis, overlays['erosion'][y, x, :])
 		ln_dil.set_data(x_axis, overlays['dilation'][y, x, :])
 		ln_th.set_data(x_axis, overlays['top_hat'][y, x, :])
+		if "gradient" in overlays:
+			ln_grad.set_data(x_axis, overlays["gradient"][y, x, :])
+		else:
+			ln_grad.set_data([], [])
+		if "dilation_minus_opening" in overlays:
+			ln_dmo.set_data(x_axis, overlays["dilation_minus_opening"][y, x, :])
+		else:
+			ln_dmo.set_data([], [])
 		if corrected_spectra is not None:
 			ln_corr.set_data(x_axis, corrected_spectra[y, x, :])
 		else:
@@ -177,6 +193,10 @@ def show_hover_map(
 
 		for nm, ln in lines.items():
 			if nm == "corrected" and corrected_spectra is None:
+				ln.set_visible(False)
+			elif nm == "gradient" and "gradient" not in overlays:
+				ln.set_visible(False)
+			elif nm == "dilation_minus_opening" and "dilation_minus_opening" not in overlays:
 				ln.set_visible(False)
 			else:
 				ln.set_visible(bool(checked[nm]))
@@ -192,12 +212,13 @@ def show_hover_map(
 		spike_lines.clear()
 
 		# add spike markers
-		segs = spikes_by_pixel.get((y, x), [])
-		for s in segs:
-			xx = x_axis[s.peak_index]
-			l = ax_spec.axvline(xx, linestyle="--", linewidth=1)
-			spike_lines.append(l)
+		# segs = spikes_by_pixel.get((y, x), [])
+		# for s in segs:
+		# 	xx = x_axis[s.peak_index]
+		# 	l = ax_spec.axvline(xx, linestyle="--", linewidth=1)
+		# 	spike_lines.append(l)
 
+		# title of the plot
 		if source_coords_map is not None:
 			src_y, src_x = source_coords_map.get((y, x), (y, x))
 			ax_spec.set_title(
@@ -266,8 +287,9 @@ def show_hover_map(
 
 	chk = CheckButtons(
 		ax_chk,
-		labels=["raw", "opening", "erosion", "dilation", "top_hat", "corrected"],
-		actives=[checked["raw"], checked["opening"], checked["erosion"], checked["dilation"], checked["top_hat"], checked["corrected"]],
+		labels=["raw", "opening", "erosion", "dilation", "top_hat", "gradient", "dilation_minus_opening", "corrected"],
+		actives=[checked["raw"], checked["opening"], checked["erosion"], checked["dilation"],
+		         checked["top_hat"], checked['gradient'], checked['dilation_minus_opening'],checked["corrected"]],
 	)
 	chk.on_clicked(_toggle_line)
 	ax_chk.set_title("signals")

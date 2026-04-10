@@ -47,3 +47,10 @@ Use config keys:
 - `debug_report_path`
 
 The debug report includes aggregate counts and (optionally) per-spectrum details for selected coordinates.
+Per-spike debug fields include shape descriptors computed primarily from morphological gradient
+(e.g. `rise_slope_z`, `fall_slope_z`, `plateau_width_90`, `gradient_max_z`), plus `muon_score` and `peak_position_cm1`.
+
+### Quick helper: plot one debug parameter vs spectrum index
+```bash
+python debug_explorer.py --report path/to/debug_report.json --y 62 --x 15 --param muon_score --x-axis candidate_index
+```
