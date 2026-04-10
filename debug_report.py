@@ -79,38 +79,43 @@ def build_debug_report(
 
 	def _muon_score(feat: Dict[str, Any]) -> Dict[str, Any]:
 		# bounded transforms to avoid domination by any single large feature
+		rise = float(feat.get("rise_slope", 0.0))
+		fall = float(feat.get("fall_slope", 0.0))
+		gabs = float(feat.get("gradient_max", 0.0))
 		gz = float(feat.get("gradient_max_z", 0.0))
-		rz = float(feat.get("rise_slope_z", 0.0))
-		fz = float(feat.get("fall_slope_z", 0.0))
 		pw = float(feat.get("plateau_width_90", 0.0))
 		asym = abs(float(feat.get("edge_asymmetry", 1.0)))
 
 		s_grad = float(np.tanh(gz / 6.0))
-		s_rise = float(np.tanh(rz / 3.0))
-		s_fall = float(np.tanh(fz / 3.0))
+		s_grad_abs = float(np.tanh(gabs / 2000.0))
+		s_rise_abs = float(np.tanh(max(rise, 0.0) / 1200.0))
+		s_fall_abs = float(np.tanh(abs(min(fall, 0.0)) / 1200.0))
 		s_plateau = float(np.exp(-((pw - 3.0) / 4.0) ** 2))
 		s_asym = float(np.exp(-asym / 0.5))
 
 		weights = {
-			"s_grad": 0.35,
-			"s_rise": 0.2,
-			"s_fall": 0.2,
-			"s_plateau": 0.15,
-			"s_asym": 0.1,
+			"s_rise_abs": 0.4,
+			"s_fall_abs": 0.4,
+			"s_grad_abs": 0.15,
+			"s_grad": 0.03,
+			"s_plateau": 0.01,
+			"s_asym": 0.01
 		}
 		score = (
-			weights['s_grad'] * s_grad
-			+ weights['s_rise'] * s_rise
-			+ weights['s_fall'] * s_fall
+			weights['s_rise_abs'] * s_rise_abs
+			+ weights['s_fall_abs'] * s_fall_abs
+			+ weights['s_grad_abs'] * s_grad_abs
+			+ weights['s_grad'] + s_grad
 			+ weights['s_plateau'] * s_plateau
 			+ weights['s_asym'] * s_asym
 		)
 		return {
 			"muon_score": float(score),
 			"muon_score_components": {
+				"s_rise_abs": s_rise_abs,
+				"s_fall_abs": s_fall_abs,
+				"s_grad_abs": s_grad_abs,
 				"s_grad": s_grad,
-				"s_rise": s_rise,
-				"s_fall": s_fall,
 				"s_plateau": s_plateau,
 				"s_asym": s_asym,
 				"weights": weights,
@@ -150,13 +155,22 @@ def build_debug_report(
 		rise_slope = float(np.max(rise)) if rise.size else 0.0
 		fall_slope = float(np.min(fall)) if fall.size else 0.0
 
-		seg_med = float(np.median(segment))
-		seg_mad = float(np.median(np.abs(segment - seg_med)))
-		seg_mad = max(seg_mad, 1e-12)
+		context = max(10, 3 * max(1, b - a + 1))
+		l0 = max(0, a - context)
+		r1 = min(n, b + context + 1)
+		bg = np.concatenate([grad_spec[l0:a], grad_spec[b + 1:r1]])
+		if bg.size < 5:
+			bg = np.concatenate([grad_spec[:a], grad_spec[b + 1:]])
+		if bg.size < 5:
+			bg = grad_spec
+		bg_med = float(np.median(bg))
+		bg_mad = float(np.median(np.abs(bg - bg_med)))
+		bg_mad = max(bg_mad, 1e-12)
 		out['rise_slope'] = rise_slope
 		out['fall_slope'] = fall_slope
-		out['rise_slope_z'] = float(rise_slope / seg_mad)
-		out['fall_slope_z'] = float(abs(fall_slope / seg_med))
+		out['rise_slope_z'] = float(rise_slope / bg_mad)
+		out['fall_slope_z'] = float(abs(fall_slope / bg_mad))
+		out['noise_mad_gradient'] = float(bg_mad)
 
 		peak_val = float(grad_spec[p])
 		lvl = 0.9 * peak_val
@@ -166,11 +180,8 @@ def build_debug_report(
 			(abs(rise_slope) - abs(fall_slope)) / (abs(rise_slope) + abs(fall_slope) + 1e-12)
 		)
 
-		gmed = float(np.median(segment))
-		gmad = float(np.median(np.abs(segment - gmed)))
-		gmad = max(gmad, 1e-12)
 		out['gradient_max'] = float(np.max(segment))
-		out['gradient_max_z'] = float(np.max(segment) / gmad)
+		out['gradient_max_z'] = float(np.max(segment) / bg_mad)
 		out['feature_source'] = "gradient"
 		if x_axis is not None and 0 <= p < x_axis.size:
 			out['peak_position_cm1'] = float(x_axis[p])

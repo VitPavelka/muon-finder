@@ -42,7 +42,7 @@ from selected points.
 
 ### Outputs and debug report
 Use config keys:
-- `save_npy_path`
+- `save_npz_path`
 - `save_spikes_csv_path`
 - `debug_report_path`
 
@@ -53,4 +53,9 @@ Per-spike debug fields include shape descriptors computed primarily from morphol
 ### Quick helper: plot one debug parameter vs spectrum index
 ```bash
 python debug_explorer.py --report path/to/debug_report.json --y 62 --x 15 --param muon_score --x-axis candidate_index
+```
+
+Across many spectra (one reduced value per spectrum):
+```bash
+python debug_explorer.py -- report path/to/debug_report.json --mode spectra_overview --param muon_score --reduce max --max-spectra 500
 ```
