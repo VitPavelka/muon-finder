@@ -14,4 +14,22 @@ creates a score map, extracts narrow spike segments, and provides a hover viewer
 pip install -r requirements.txt
 
 ## Run
-python muon_finder.py
+python muon_finder.py --input /path/to/map.wdf
+
+### Optional: target only selected spectra by coordinates
+Prepare a CSV with headers `y,x`, e.g.:
+
+```csv
+y,x
+108,144
+112,87
+34,201
+```
+
+Then run:
+
+```bash
+python muon_finder.py --input /path/to/map.wdf --coords-csv /path/to/targets.csv
+```
+
+This mode extracts/despikes only specified coordinates and can render a compact (near-square) viewer layout from selected points.

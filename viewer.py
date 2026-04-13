@@ -18,6 +18,7 @@ def show_hover_map(
 		candidate_mask: np.ndarray,       # (H,W)
 		spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]],
 		overlays: Dict[str, np.ndarray],  # erosion/dilation/opening/top_hat
+		source_coords_map: Optional[Dict[Tuple[int, int], Tuple[int, int]]] = None,  # compact(y,x) -> source(y,x)
 		plot_raw: bool = True,
 		plot_opening: bool = False,
 		plot_erosion: bool = False,
@@ -189,7 +190,13 @@ def show_hover_map(
 			l = ax_spec.axvline(xx, linestyle="--", linewidth=1)
 			spike_lines.append(l)
 
-		ax_spec.set_title(f"spectrum @ (y={y}, x={x}) | spikes={len(segs)}")
+		if source_coords_map is not None:
+			src_y, src_x = source_coords_map.get((y, x), (y, x))
+			ax_spec.set_title(
+				f"spectrum @ compact(y={y}, x={x}) -> source(y={src_y}, x={src_x}) | spikes={len(segs)}"
+			)
+		else:
+			ax_spec.set_title(f"spectrum @ (y={y}, x={x}) | spikes={len(segs)}")
 		ax_spec.relim()
 		ax_spec.autoscale_view()
 
