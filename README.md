@@ -50,12 +50,12 @@ The debug report includes aggregate counts and (optionally) per-spectrum details
 Per-spike debug fields include shape descriptors computed primarily from morphological gradient
 (e.g. `rise_slope_z`, `fall_slope_z`, `plateau_width_90`, `gradient_max_z`), plus `muon_score` and `peak_position_cm1`.
 
-### Quick helper: plot one debug parameter vs spectrum index
+### Quick helper: one spectrum by coordinates
 ```bash
-python debug_explorer.py --report path/to/debug_report.json --y 62 --x 15 --param muon_score --x-axis candidate_index
+python debug_explorer.py --report path/to/debug_report.json --mode candidates_in_spectrum --y 62 --x 15 --param muon_score --x-axis candidate_index
 ```
 
-Across many spectra (one reduced value per spectrum):
+Many spectra as panels (each panel shows all candidates of one spectrum):
 ```bash
-python debug_explorer.py -- report path/to/debug_report.json --mode spectra_overview --param muon_score --reduce max --max-spectra 500
+python debug_explorer.py --report path/to/debug_report.json --mode multi_spectra_panels --param muon_score --x-axis candidate_index
 ```
