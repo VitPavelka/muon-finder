@@ -19,6 +19,8 @@ from muon_pipeline import (
 )
 from despike import apply_despike
 from viewer import show_hover_map
+from results_io import save_result_npz, save_spikes_csv
+from debug_report import build_debug_report, save_debug_report_json
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -41,6 +43,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"coords_csv": None,
 	"use_compact_coords_view": True,
 	"despike_enabled": True,
+	"save_npz_path": None,
+	"save_spikes_csv_path": None,
+	"save_corrected_in_npz": True,
+	"save_overlays_in_npz": True,
+	"debug_report_path": None,
+	"debug_include_per_spectrum": True,
+	"debug_top_pixels": 25,
 }
 
 
@@ -231,7 +240,35 @@ def run(cfg: Dict[str, Any]) -> None:
 		overlays=view_overlays,
 		source_coords_map=source_coords_map,
 		corrected_spectra=view_spectra if bool(cfg["despike_enabled"]) else None,
+		initial_checked={"raw": True, "top_hat": True, "corrected": True},
 	)
+
+	if cfg.get("save_npz_path"):
+		save_result_npz(
+			out_path=Path(cfg["save_npz_path"]),
+			ds=ds,
+			score_map=score_map,
+			threshold=float(thr),
+			candidate_mask=candidate_mask,
+			spikes=spikes,
+			corrected_spectra=corrected if bool(cfg["save_corrected_in_npz"]) else None,
+			overlays=overlays if bool(cfg["save_overlays_in_npz"]) else None,
+		)
+
+	if cfg.get("save_spikes_csv_path"):
+		save_spikes_csv(path=Path(cfg["save_spikes_csv_path"]), spikes=spikes)
+
+	if cfg.get("debug_report_path"):
+		report = build_debug_report(
+			score_map=score_map,
+			candidate_mask=candidate_mask,
+			spikes_by_pixel=spikes_by_pixel,
+			threshold=float(thr),
+			target_coords=target_coords,
+			include_per_spectrum=bool(cfg["debug_include_per_spectrum"]),
+			max_top_pixels=int(cfg["debug_top_pixels"]),
+		)
+		save_debug_report_json(Path(cfg["debug_report_path"]), report)
 
 
 def main() -> None:
@@ -255,4 +292,3 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
-

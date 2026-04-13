@@ -16,6 +16,11 @@ pip install -r requirements.txt
 ## Run
 python muon_finder.py --input /path/to/map.wdf
 
+### Run with config file
+```bash
+python muon_finder.py --config config.example.json
+```
+
 ### Optional: target only selected spectra by coordinates
 Prepare a CSV with headers `y,x`, e.g.:
 
@@ -33,3 +38,11 @@ python muon_finder.py --input /path/to/map.wdf --coords-csv /path/to/targets.csv
 ```
 
 This mode extracts/despikes only specified coordinates and can render a compact (near-square) viewer layout from selected points.
+
+### Outputs and debug report
+Use config keys:
+- `save_npz_path`
+- `save_spikes_csv_path`
+- `debug_report_path`
+
+The debug report includes aggregate counts and (optionally) per-spectrum details for selected coordinates.
