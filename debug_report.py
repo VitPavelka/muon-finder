@@ -21,7 +21,38 @@ def build_debug_report(
 		raw_spectra: Optional[np.ndarray] = None,  # (H,W,N)
 		overlays: Optional[Dict[str, np.ndarray]] = None,  # expects at least 'gradient' if available
 		x_axis: Optional[np.ndarray] = None,
+		feature_signal_source: str = "gradient",  # gradient | raw
+		merge_duplicate_segments: bool = False,
 ) -> Dict[str, Any]:
+	def _merge_duplicate_segments(segs: List[SpikeSegment]) -> List[SpikeSegment]:
+		"""
+		Merge segments sharing identical (start, end) into one representative spike.
+		Keeps highes peak_height as representative.
+		"""
+		if not segs:
+			return []
+		buckets: Dict[Tuple[int, int], List[SpikeSegment]] = {}
+		for s in segs:
+			buckets.setdefault((int(s.start), int(s.end)), []).append(s)
+		out: List[SpikeSegment] = []
+		for (_a, _b), group in buckets.items():
+			best = max(group, key=lambda s: float(s.peak_height))
+			out.append(best)
+		out.sort(key=lambda s: (s.start, s.peak_index, s.end))
+		return out
+
+	if bool(merge_duplicate_segments):
+		merged_spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]] = {
+			pix: _merge_duplicate_segments(segs)
+			for pix, segs in spikes_by_pixel.items()
+		}
+	else:
+		merged_spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]] = {
+			pix: list(segs)
+			for pix, segs in spikes_by_pixel.items()
+		}
+	raw_n_spikes_total = int(sum(len(segs) for segs in spikes_by_pixel.values()))
+
 	finite = score_map[np.isfinite(score_map)]
 	if finite.size == 0:
 		score_stats = {"min": None, "max": None, "median": None, "p95": None}
@@ -33,9 +64,9 @@ def build_debug_report(
 			"p95": float(np.percentile(finite, 95.0)),
 		}
 
-	all_spikes = [s for segs in spikes_by_pixel.values() for s in segs]
+	all_spikes = [s for segs in merged_spikes_by_pixel.values() for s in segs]
 	pixel_rows = []
-	for (y, x), segs in spikes_by_pixel.items():
+	for (y, x), segs in merged_spikes_by_pixel.items():
 		if not segs:
 			continue
 		pixel_rows.append(
@@ -55,27 +86,11 @@ def build_debug_report(
 		"threshold": float(threshold),
 		"score_stats": score_stats,
 		"n_candidates": int(np.count_nonzero(candidate_mask)),
-		"n_pixels_with_spikes": int(sum(1 for segs in spikes_by_pixel.values() if segs)),
+		"n_pixels_with_spikes": int(sum(1 for segs in merged_spikes_by_pixel.values() if segs)),
 		"n_spikes_total": int(len(all_spikes)),
+		"n_spikes_total_raw": raw_n_spikes_total,
 		"top_pixels": top_pixels,
 	}
-
-	def _merge_duplicate_segments(segs: List[SpikeSegment]) -> List[SpikeSegment]:
-		"""
-		Merge segments sharing identical (start, end) into one representative spike.
-		Keeps highes peak_height as representative.
-		"""
-		if not segs:
-			return []
-		buckets: Dict[Tuple[int, int], List[SpikeSegment]] = {}
-		for s in segs:
-			buckets.setdefault((int(s.start), int(s.end)), []).append(s)
-		out: List[SpikeSegment] = []
-		for (_a, _b), group in buckets.items():
-			best = max(group, key=lambda s: float(s.peak_height))
-			out.append(best)
-		out.sort(key=lambda s: (s.start, s.peak_index, s.end))
-		return out
 
 	def _muon_score(feat: Dict[str, Any]) -> Dict[str, Any]:
 		# bounded transforms to avoid domination by any single large feature
@@ -134,18 +149,26 @@ def build_debug_report(
 		if raw_spectra is not None:
 			out['raw_peak_value'] = float(raw_spectra[int(y), int(x), int(s.peak_index)])
 
-		# Primary features are computed from morphological gradient.
-		if overlays is None or "gradient" not in overlays:
-			return out
-		grad_spec = overlays['gradient'][int(y), int(x), :].astype(float)
-		n = grad_spec.size
+		src = str(feature_signal_source).lower().strip()
+		if src == "raw":
+			if raw_spectra is None:
+				return out
+			sig_spec = raw_spectra[int(y), int(x), :].astype(float)
+		else:
+			# Primary features are computed from morphological gradient.
+			if overlays is None or "gradient" not in overlays:
+				return out
+			sig_spec = overlays['gradient'][int(y), int(x), :].astype(float)
+			src = "gradient"
+
+		n = sig_spec.size
 		a = int(np.clip(s.start, 0, n - 1))
 		b = int(np.clip(s.end, 0, n - 1))
 		p = int(np.clip(s.peak_index, 0, n - 1))
 		if not (a < p < b):
 			return out
 
-		segment = grad_spec[a:b + 1]
+		segment = sig_spec[a:b + 1]
 		if segment.size < 3:
 			return out
 
@@ -158,11 +181,11 @@ def build_debug_report(
 		context = max(10, 3 * max(1, b - a + 1))
 		l0 = max(0, a - context)
 		r1 = min(n, b + context + 1)
-		bg = np.concatenate([grad_spec[l0:a], grad_spec[b + 1:r1]])
+		bg = np.concatenate([sig_spec[l0:a], sig_spec[b + 1:r1]])
 		if bg.size < 5:
-			bg = np.concatenate([grad_spec[:a], grad_spec[b + 1:]])
+			bg = np.concatenate([sig_spec[:a], sig_spec[b + 1:]])
 		if bg.size < 5:
-			bg = grad_spec
+			bg = sig_spec
 		bg_med = float(np.median(bg))
 		bg_mad = float(np.median(np.abs(bg - bg_med)))
 		bg_mad = max(bg_mad, 1e-12)
@@ -170,9 +193,11 @@ def build_debug_report(
 		out['fall_slope'] = fall_slope
 		out['rise_slope_z'] = float(rise_slope / bg_mad)
 		out['fall_slope_z'] = float(abs(fall_slope / bg_mad))
+		out['noise_mad_signal'] = float(bg_mad)
+		# Backward-compatible key kept for existin tooling
 		out['noise_mad_gradient'] = float(bg_mad)
 
-		peak_val = float(grad_spec[p])
+		peak_val = float(sig_spec[p])
 		lvl = 0.9 * peak_val
 		plateau = int(np.count_nonzero(segment >= lvl))
 		out['plateau_width_90'] = plateau
@@ -182,7 +207,7 @@ def build_debug_report(
 
 		out['gradient_max'] = float(np.max(segment))
 		out['gradient_max_z'] = float(np.max(segment) / bg_mad)
-		out['feature_source'] = "gradient"
+		out['feature_source'] = src
 		if x_axis is not None and 0 <= p < x_axis.size:
 			out['peak_position_cm1'] = float(x_axis[p])
 		out.update(_muon_score(out))
@@ -193,11 +218,11 @@ def build_debug_report(
 		if target_coords is not None:
 			iter_coords = target_coords
 		else:
-			iter_coords = sorted(spikes_by_pixel.keys(), key=lambda t: (t[0], t[1]))
+			iter_coords = sorted(merged_spikes_by_pixel.keys(), key=lambda t: (t[0], t[1]))
 
 		per_spec = []
 		for y, x in iter_coords:
-			segs = _merge_duplicate_segments(spikes_by_pixel.get((int(y), int(x)), []))
+			segs = merged_spikes_by_pixel.get((int(y), int(x)), [])
 			per_spec.append(
 				{
 					"y": int(y),

@@ -31,6 +31,23 @@ def show_hover_map(
 		highlight_detected_pixels: bool = True,
 		hover_fps: float = 10.0,
 ) -> None:
+	def _merge_duplicate_segments(segs: List[SpikeSegment]) -> List[SpikeSegment]:
+		if not segs:
+			return []
+		buckets: Dict[Tuple[int, int], List[SpikeSegment]] = {}
+		for s in segs:
+			buckets.setdefault((int(s.start), int(s.end)), []).append(s)
+		out: List[SpikeSegment] = []
+		for _, group in buckets.items():
+			out.append(max(group, key=lambda s: float(s.peak_height)))
+		out.sort(key=lambda s: (s.start, s.peak_index, s.end))
+		return out
+
+	merged_spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]] = {
+		pix: _merge_duplicate_segments(segs)
+		for pix, segs in spikes_by_pixel.items()
+	}
+
 	H, W, N = spectra.shape
 
 	fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(13, 6))
@@ -61,24 +78,24 @@ def show_hover_map(
 	# ys, xs = np.where(candidate_mask)
 	# ax_map.scatter(xs, ys, s=8, marker="o", linewidths=0.5, facecolors="none")
 
-	# detected spikes overlay
-	if highlight_detected_pixels and spikes_by_pixel:
-		sp_y = []
-		sp_x = []
-		for (py, px), segs in spikes_by_pixel.items():
-			if not segs:
-				continue
-			sp_y.append(py)
-			sp_x.append(px)
-		if sp_x:
-			ax_map.scatter(
-				sp_x, sp_y,
-				s=42,
-				marker="s",
-				facecolors="none",
-				edgecolors="red",
-				linewidth=1.2
-			)
+	# # detected spikes overlay
+	# if highlight_detected_pixels and merged_spikes_by_pixel:
+	# 	sp_y = []
+	# 	sp_x = []
+	# 	for (py, px), segs in merged_spikes_by_pixel.items():
+	# 		if not segs:
+	# 			continue
+	# 		sp_y.append(py)
+	# 		sp_x.append(px)
+	# 	if sp_x:
+	# 		ax_map.scatter(
+	# 			sp_x, sp_y,
+	# 			s=42,
+	# 			marker="s",
+	# 			facecolors="none",
+	# 			edgecolors="red",
+	# 			linewidth=1.2
+	# 		)
 
 	# marker for actual pixel
 	marker = ax_map.scatter([0], [0], s=80, marker="s", facecolors="none", edgecolors="white", linewidths=2)
@@ -129,7 +146,14 @@ def show_hover_map(
 		"corrected": ln_corr,
 	}
 
-	spike_lines: List = []
+	spike_peak_lines: List = []
+	spike_edge_lines: List = []
+	spike_bands: List = []
+	spike_overlay_checked = {
+		"spike_peaks": True,
+		"spike_edges": True,
+		"spike_bands": True,
+	}
 
 	ax_spec.set_title("spectrum @ (y,x)")
 	ax_spec.set_xlabel("Raman shift/cm$^{-1}$")
@@ -203,20 +227,39 @@ def show_hover_map(
 
 		_refresh_legend()
 
-		# clear old spike lines
-		for l in spike_lines:
-			try:
-				l.remove()
-			except Exception:
-				pass
-		spike_lines.clear()
+		# clear old spike overlays
+		for col in (spike_peak_lines, spike_edge_lines, spike_bands):
+			for artist in col:
+				try:
+					artist.remove()
+				except Exception:
+					pass
+			col.clear()
 
-		# add spike markers
-		# segs = spikes_by_pixel.get((y, x), [])
-		# for s in segs:
-		# 	xx = x_axis[s.peak_index]
-		# 	l = ax_spec.axvline(xx, linestyle="--", linewidth=1)
-		# 	spike_lines.append(l)
+		# add spike markers (deduplicated by start/end)
+		segs = merged_spikes_by_pixel.get((y,x), [])
+		for s in segs:
+			pi = int(np.clip(s.peak_index, 0, len(x_axis) - 1))
+			si = int(np.clip(s.start, 0, len(x_axis) - 1))
+			ei = int(np.clip(s.end, 0, len(x_axis) - 1))
+			x_peak = x_axis[pi]
+			x_start = x_axis[si]
+			x_end = x_axis[ei]
+
+			if spike_overlay_checked['spike_bands']:
+				x0 = min(float(x_start), float(x_end))
+				x1 = max(float(x_start), float(x_end))
+				band = ax_spec.axvspan(x0, x1, color="green", alpha=0.12, zorder=0)
+				spike_bands.append(band)
+
+			if spike_overlay_checked['spike_edges']:
+				le = ax_spec.axvline(x_start, linestyle="--", linewidth=1, color="green", alpha=0.9)
+				re = ax_spec.axvline(x_end, linestyle="--", linewidth=1, color="green", alpha=0.9)
+				spike_edge_lines.extend([le, re])
+
+			if spike_overlay_checked['spike_peaks']:
+				lp = ax_spec.axvline(x_peak, linestyle="--", linewidth=1, color="red", alpha=0.9)
+				spike_peak_lines.append(lp)
 
 		# title of the plot
 		if source_coords_map is not None:
@@ -274,22 +317,32 @@ def show_hover_map(
 		frozen["state"] = not frozen["state"]
 
 	def _toggle_line(label: str) -> None:
-		checked[label] = not checked[label]
+		if label in checked:
+			checked[label] = not checked[label]
+		elif label in spike_overlay_checked:
+			spike_overlay_checked[label] = not spike_overlay_checked[label]
 		_update(current["y"], current["x"])
 
 	ax_txt_y = fig.add_axes((0.12, 0.035, 0.08, 0.045))
 	ax_txt_x = fig.add_axes((0.22, 0.035, 0.08, 0.045))
 	ax_btn_go = fig.add_axes((0.32, 0.035, 0.08, 0.045))
-	ax_chk = fig.add_axes((0.56, 0.02, 0.16, 0.17))
+	ax_chk = fig.add_axes((0.52, 0.02, 0.22, 0.24))
 	txt_y = TextBox(ax_txt_y, "y", initial="0")
 	txt_x = TextBox(ax_txt_x, "x", initial="0")
 	btn_go = Button(ax_btn_go, "Go to (y,x)")
 
 	chk = CheckButtons(
 		ax_chk,
-		labels=["raw", "opening", "erosion", "dilation", "top_hat", "gradient", "dilation_minus_opening", "corrected"],
-		actives=[checked["raw"], checked["opening"], checked["erosion"], checked["dilation"],
-		         checked["top_hat"], checked['gradient'], checked['dilation_minus_opening'],checked["corrected"]],
+		labels=[
+			"raw", "opening", "erosion", "dilation", "top_hat", "gradient", "dilation_minus_opening", "corrected",
+			"spike_peaks", "spike_edges", "spike_bands"
+		],
+		actives=[
+			checked["raw"], checked["opening"], checked["erosion"], checked["dilation"], checked["top_hat"],
+			checked['gradient'], checked['dilation_minus_opening'], checked["corrected"],
+			spike_overlay_checked['spike_peaks'], spike_overlay_checked['spike_edges'], spike_overlay_checked['spike_bands']
+
+		],
 	)
 	chk.on_clicked(_toggle_line)
 	ax_chk.set_title("signals")

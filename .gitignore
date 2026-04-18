@@ -25,3 +25,7 @@ muon_finder.py
 muon_finder_backup.py
 config.json
 debug.json
+config*
+plots/
+stats*
+debug*

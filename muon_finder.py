@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import pathlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -23,6 +22,7 @@ from despike import apply_despike
 from viewer import show_hover_map
 from results_io import save_result_npz, save_spikes_csv
 from debug_report import build_debug_report, save_debug_report_json
+from preprocess import resample_axis_and_spectra
 
 DEFAULT_CONFIG: Dict[str, Any] = {
 	"input_path": "",
@@ -44,6 +44,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"coords_csv": None,
 	"use_compact_coords_view": True,
 	"despike_enabled": True,
+	"resample_enabled": False,
+	"resample_factor": 2,
 	"save_npz_path": None,
 	"save_spikes_csv_path": None,
 	"save_corrected_in_npz": True,
@@ -51,6 +53,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"debug_report_path": None,
 	"debug_include_per_spectrum": True,
 	"debug_top_pixels": 25,
+	"debug_feature_signal_source": "gradient",  # gradient | raw
+	"debug_merge_duplicate_segments": False,
 }
 
 
@@ -66,7 +70,7 @@ def load_config(config_path: Optional[Path]) -> Dict[str, Any]:
 
 def load_target_coords_csv(path: Path, shape_hw: Tuple[int, int]) -> List[Tuple[int, int]]:
 	h, w = shape_hw
-	raw = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding="utf-8")
+	raw = np.genfromtxt(path, delimiter=";", names=True, dtype=None, encoding="utf-8")
 	if raw.size == 0:
 		return []
 
@@ -161,10 +165,17 @@ def run(cfg: Dict[str, Any]) -> None:
 	# 0) config file
 	in_path = Path(cfg['input_path'])
 
-	# 1) load data
+	# 1) load and optionally resample data
 	ds = load_dataset(in_path)
 	x_axis = ds.x_axis
 	raw = ds.spectra
+
+	if bool(cfg.get("resample_enabled", False)):
+		x_axis, raw = resample_axis_and_spectra(
+			x_axis=x_axis,
+			spectra=raw,
+			factor=int(cfg.get("resample_factor", 2)),
+		)
 
 	# 2) morphology
 	overlays = compute_morph_overlays(raw, se_size=int(cfg['se_size']))
@@ -258,23 +269,6 @@ def run(cfg: Dict[str, Any]) -> None:
 			coords=target_coords,
 			corrected_spectra=view_corrected,
 		)
-	show_hover_map(
-		x_axis=view_x,
-		spectra=view_spectra,
-		score_map=view_score,
-		candidate_mask=view_mask,
-		spikes_by_pixel=view_spikes_by_pixel,
-		overlays=view_overlays,
-		source_coords_map=source_coords_map,
-		corrected_spectra=view_corrected,
-		initial_checked={
-			"raw": True,
-			"top_hat": True,
-			"gradient": True,
-			"dilation_minus_opening": True,
-			"corrected:": True,
-		},
-	)
 
 	# 7) Save data and report
 	if cfg.get("save_npz_path"):
@@ -304,8 +298,28 @@ def run(cfg: Dict[str, Any]) -> None:
 			raw_spectra=raw,
 			overlays=overlays,
 			x_axis=x_axis,
+			feature_signal_source=str(cfg.get("debug_feature_signal_source", "gradient")),
+			merge_duplicate_segments=bool(cfg.get("debug_merge_duplicate_segments", False)),
 		)
 		save_debug_report_json(Path(cfg['debug_report_path']), report)
+
+	show_hover_map(
+		x_axis=view_x,
+		spectra=view_spectra,
+		score_map=view_score,
+		candidate_mask=view_mask,
+		spikes_by_pixel=view_spikes_by_pixel,
+		overlays=view_overlays,
+		source_coords_map=source_coords_map,
+		corrected_spectra=view_corrected,
+		initial_checked={
+			"raw": True,
+			"top_hat": True,
+			"gradient": True,
+			"dilation_minus_opening": True,
+			"corrected:": True,
+		},
+	)
 
 
 def main() -> None:
