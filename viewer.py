@@ -53,25 +53,28 @@ def show_hover_map(
 
 	# candidates' overlay (visually)
 	ys, xs = np.where(candidate_mask)
-	ax_map.scatter(xs, ys, s=8, marker="o", linewidths=0.5, facecolors="none")
+	ax_map.scatter(xs, ys, s=8, marker="o", linewidths=0.5, facecolors="none", edgecolors="cyan")
 
 	# detected spikes overlay
 	if highlight_detected_pixels and spikes_by_pixel:
 		sp_y = []
 		sp_x = []
-		for py, px in spikes_by_pixel.keys():
+		for (py, px), segs in spikes_by_pixel.items():
+			if not segs:
+				continue
 			sp_y.append(py)
 			sp_x.append(px)
-		ax_map.scatter(
-			sp_x, sp_y,
-			s=42,
-			marker="s",
-			facecolors="none",
-			edgecolors="red",
-			linewidths=1.2,
-			label="detected spikes",
-		)
-		ax_map.legend(loc="upper right")
+		if sp_x:
+			ax_map.scatter(
+				sp_x, sp_y,
+				s=42,
+				marker="s",
+				facecolors="none",
+				edgecolors="red",
+				linewidths=1.2,
+				label="detected spikes",
+			)
+			ax_map.legend(loc="upper right")
 
 	# marker for actual pixel
 	marker = ax_map.scatter([0], [0], s=90, marker="s", facecolors="none", edgecolors="white", linewidths=2)

@@ -200,6 +200,7 @@ def run(cfg: Dict[str, Any]) -> None:
 			pix: [s for s in segs if s in accepted_set]
 			for pix, segs in spikes_by_pixel.items()
 		}
+		spikes_by_pixel = {pix: segs for pix, segs in spikes_by_pixel.items() if segs}
 		spikes = accepted
 
 	corrected = raw
