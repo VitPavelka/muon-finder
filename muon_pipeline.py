@@ -79,7 +79,7 @@ def compute_morph_overlays(spectra: np.ndarray, se_size: int) -> Dict[str, np.nd
 	"""
 	eros = erosion_1d(spectra, se_size)
 	dila = dilation_1d(spectra, se_size)
-	opn = opening_1d(eros, se_size)
+	opn = opening_1d(spectra, se_size)
 	th = spectra - opn
 	th[th < 0] = 0
 	grad = dila - eros  # morphological gradient

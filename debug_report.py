@@ -26,19 +26,41 @@ def build_debug_report(
 ) -> Dict[str, Any]:
 	def _merge_duplicate_segments(segs: List[SpikeSegment]) -> List[SpikeSegment]:
 		"""
-		Merge segments sharing identical (start, end) into one representative spike.
-		Keeps highes peak_height as representative.
+		Merge segments with overlapping intervals (not only exact same start/end).
+		Keeps the strongest peak as representative and expands to union interval.
 		"""
 		if not segs:
 			return []
-		buckets: Dict[Tuple[int, int], List[SpikeSegment]] = {}
-		for s in segs:
-			buckets.setdefault((int(s.start), int(s.end)), []).append(s)
+		sorted_segs = sorted(segs, key=lambda s: (int(s.start), int(s.end), int(s.peak_index)))
 		out: List[SpikeSegment] = []
-		for (_a, _b), group in buckets.items():
-			best = max(group, key=lambda s: float(s.peak_height))
-			out.append(best)
-		out.sort(key=lambda s: (s.start, s.peak_index, s.end))
+		for s in sorted_segs:
+			if not out:
+				out.append(s)
+				continue
+			last = out[-1]
+			overlap_or_adjacent = max(int(last.start), int(s.start)) <= min(int(last.end), int(s.end) + 1)
+			# keep merge conservative by requiring close peaks
+			same_peak_family = abs(int(last.peak_index) - int(s.peak_index)) <= 2
+			if overlap_or_adjacent and same_peak_family:
+				new_start = min(int(last.start), int(s.start))
+				new_end = max(int(last.end), int(s.end))
+				if float(s.peak_height) >= float(last.peak_height):
+					best_peak = int(s.peak_index)
+					best_height = float(s.peak_height)
+				else:
+					best_peak = int(last.peak_index)
+					best_height = float(last.peak_height)
+				out[-1] = SpikeSegment(
+					y=int(last.y),
+					x=int(last.x),
+					peak_index=best_peak,
+					start=new_start,
+					end=new_end,
+					peak_height=best_height,
+					area=float(last.area) + float(s.area),
+				)
+			else:
+				out.append(s)
 		return out
 
 	if bool(merge_duplicate_segments):
@@ -207,6 +229,34 @@ def build_debug_report(
 
 		out['gradient_max'] = float(np.max(segment))
 		out['gradient_max_z'] = float(np.max(segment) / bg_mad)
+		half = 0.5 * peak_val
+		above_half = np.where(segment >= half)[0]
+		if above_half.size:
+			fwhm_pts = int(above_half[-1] - above_half[0] + 1)
+		else:
+			fwhm_pts = 0
+		out['fwhm_pts'] = fwhm_pts
+		if x_axis is not None and 0 <= p < x_axis.size and above_half.size:
+			l_ix = int(a + above_half[0])
+			r_ix = int(a + above_half[-1])
+			out['fwhm_cm1'] = float(abs(float(x_axis[r_ix]) - float(x_axis[l_ix])))
+		else:
+			out['fwhm_cm1'] = float("nan")
+
+		top_mask = segment >= lvl
+		top_vals = segment[top_mask]
+		out['top_points_n'] = int(top_vals.size)
+		if top_vals.size >= 2:
+			top_std = float(np.std(top_vals))
+			top_med = float(np.median(top_vals))
+			top_mad = float(np.median(np.abs(top_vals - top_med)))
+		else:
+			top_std = 0.0
+			top_mad = 0.0
+		out['top_fluct_std'] = top_std
+		out['top_fluct_mad'] = top_mad
+		out['top_fluck_rel_std'] = float(top_std / (abs(peak_val) + 1e-12))
+
 		out['feature_source'] = src
 		if x_axis is not None and 0 <= p < x_axis.size:
 			out['peak_position_cm1'] = float(x_axis[p])
