@@ -58,6 +58,7 @@ def load_config(config_path: Optional[Path]) -> Dict[str, Any]:
 	if config_path is None:
 		return cfg
 	path = Path(config_path)
+	# NOTE: use json.loads(text) - json.load expects a file object.
 	user_cfg = json.loads(path.read_text(encoding="utf-8"))
 	cfg.update(user_cfg)
 	return cfg
