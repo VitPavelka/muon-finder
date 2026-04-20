@@ -242,17 +242,17 @@ def run(cfg: Dict[str, Any]) -> None:
 				corrected_spectra=view_corrected,
 			)
 
-	show_hover_map(
-		x_axis=view_x,
-		spectra=view_spectra,
+		show_hover_map(
+			x_axis=view_x,
+			spectra=view_spectra,
 		score_map=view_score,
 		candidate_mask=view_mask,
 		spikes_by_pixel=view_spikes_by_pixel,
-		overlays=view_overlays,
-		source_coords_map=source_coords_map,
-		corrected_spectra=view_corrected,
-		initial_checked={"raw": True, "top_hat": True, "corrected": True},
-	)
+			overlays=view_overlays,
+			source_coords_map=source_coords_map,
+			corrected_spectra=view_corrected,
+			initial_checked={"raw": True, "top_hat": True, "gradient": True, "corrected": False},
+		)
 
 	if cfg.get("save_npz_path"):
 		save_result_npz(

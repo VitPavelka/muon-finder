@@ -73,14 +73,16 @@ def _split_group_into_peak_regions(indices: np.ndarray, signal: np.ndarray) -> L
 def compute_morph_overlays(spectra: np.ndarray, se_size: int) -> Dict[str, np.ndarray]:
 	"""
 	spectra: (H, W, N)
-	returns dict: erosion, dilation, opening, top_hat
+	returns dict: erosion, dilation, opening, top_hat, gradient
 	"""
 	eros = erosion_1d(spectra, se_size)
 	dila = dilation_1d(spectra, se_size)
 	opn = opening_1d(spectra, se_size)
 	th = spectra - opn
 	th[th < 0] = 0
-	return {"erosion": eros, "dilation": dila, "opening": opn, "top_hat": th}
+	grad = dila - eros  # morphological gradient
+	grad[grad < 0] = 0
+	return {"erosion": eros, "dilation": dila, "opening": opn, "top_hat": th, "gradient": grad}
 
 
 def score_map_from_top_hat(

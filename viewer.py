@@ -86,6 +86,7 @@ def show_hover_map(
 		"erosion": "#7f7f7f",
 		"dilation": "#8c564b",
 		"top_hat": "#ff7f0e",
+		"gradient": "#e377c2",
 		"corrected": "#2ca02c",
 	}
 	checked = {
@@ -94,7 +95,8 @@ def show_hover_map(
 		"erosion": False,
 		"dilation": False,
 		"top_hat": True,
-		"corrected": True,
+		"gradient": True,
+		"corrected": False,
 	}
 	if initial_checked:
 		for k, v in initial_checked.items():
@@ -106,6 +108,7 @@ def show_hover_map(
 	(ln_ero,) = ax_spec.plot([], [], label="erosion", color=line_colors["erosion"])
 	(ln_dil,) = ax_spec.plot([], [], label="dilation", color=line_colors["dilation"])
 	(ln_th,) = ax_spec.plot([], [], label="top_hat", color=line_colors["top_hat"])
+	(ln_grad,) = ax_spec.plot([], [], label="gradient", color=line_colors["gradient"])
 	(ln_corr,) = ax_spec.plot([], [], label="corrected", color=line_colors["corrected"])
 	lines = {
 		"raw": ln_raw,
@@ -113,6 +116,7 @@ def show_hover_map(
 		"erosion": ln_ero,
 		"dilation": ln_dil,
 		"top_hat": ln_th,
+		"gradient": ln_grad,
 		"corrected": ln_corr,
 	}
 
@@ -165,6 +169,10 @@ def show_hover_map(
 		ln_ero.set_data(x_axis, overlays["erosion"][y, x, :])
 		ln_dil.set_data(x_axis, overlays["dilation"][y, x, :])
 		ln_th.set_data(x_axis, overlays["top_hat"][y, x, :])
+		if "gradient" in overlays:
+			ln_grad.set_data(x_axis, overlays["gradient"][y, x, :])
+		else:
+			ln_grad.set_data([], [])
 		if corrected_spectra is not None:
 			ln_corr.set_data(x_axis, corrected_spectra[y, x, :])
 		else:
@@ -172,6 +180,8 @@ def show_hover_map(
 
 		for nm, ln in lines.items():
 			if nm == "corrected" and corrected_spectra is None:
+				ln.set_visible(False)
+			elif nm == "gradient" and "gradient" not in overlays:
 				ln.set_visible(False)
 			else:
 				ln.set_visible(bool(checked[nm]))
@@ -301,8 +311,8 @@ def show_hover_map(
 	btn_go = Button(ax_btn_go, "Go to (x,y)")
 	chk = CheckButtons(
 		ax_chk,
-		labels=["raw", "opening", "erosion", "dilation", "top_hat", "corrected"],
-		actives=[checked["raw"], checked["opening"], checked["erosion"], checked["dilation"], checked["top_hat"], checked["corrected"]],
+		labels=["raw", "opening", "erosion", "dilation", "top_hat", "gradient", "corrected"],
+		actives=[checked["raw"], checked["opening"], checked["erosion"], checked["dilation"], checked["top_hat"], checked["gradient"], checked["corrected"]],
 	)
 	btn_go.on_clicked(_go_to_xy)
 	txt_x.on_submit(lambda _t: _go_to_xy())
