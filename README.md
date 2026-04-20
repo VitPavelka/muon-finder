@@ -46,4 +46,4 @@ Use config keys:
 - `debug_report_path`
 
 The debug report includes aggregate counts and (optionally) per-spectrum details for selected coordinates.
-Per-spike debug fields include simple shape descriptors such as `rise_slope_z`, `fall_slope_z`, `plateau_width_90`, and `gradient_max_z`.
+Per-spike debug fields include shape descriptors computed primarily from morphological gradient (e.g. `rise_slope_z`, `fall_slope_z`, `plateau_width_90`, `gradient_max_z`).

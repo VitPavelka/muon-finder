@@ -67,18 +67,21 @@ def build_debug_report(
 			"peak_height": float(s.peak_height),
 			"area": float(s.area),
 		}
-		if raw_spectra is None:
-			return out
+		if raw_spectra is not None:
+			out["raw_peak_value"] = float(raw_spectra[int(y), int(x), int(s.peak_index)])
 
-		spec = raw_spectra[int(y), int(x), :].astype(float)
-		n = spec.size
+		# Primary features are computed from morphological gradient.
+		if overlays is None or "gradient" not in overlays:
+			return out
+		grad_spec = overlays["gradient"][int(y), int(x), :].astype(float)
+		n = grad_spec.size
 		a = int(np.clip(s.start, 0, n - 1))
 		b = int(np.clip(s.end, 0, n - 1))
 		p = int(np.clip(s.peak_index, 0, n - 1))
 		if not (a < p < b):
 			return out
 
-		segment = spec[a:b + 1]
+		segment = grad_spec[a:b + 1]
 		if segment.size < 3:
 			return out
 
@@ -96,7 +99,7 @@ def build_debug_report(
 		out["rise_slope_z"] = float(rise_slope / seg_mad)
 		out["fall_slope_z"] = float(abs(fall_slope) / seg_mad)
 
-		peak_val = float(spec[p])
+		peak_val = float(grad_spec[p])
 		lvl = 0.9 * peak_val
 		plateau = int(np.count_nonzero(segment >= lvl))
 		out["plateau_width_90"] = plateau
@@ -104,13 +107,12 @@ def build_debug_report(
 			(abs(rise_slope) - abs(fall_slope)) / (abs(rise_slope) + abs(fall_slope) + 1e-12)
 		)
 
-		if overlays is not None and "gradient" in overlays:
-			gseg = overlays["gradient"][int(y), int(x), a:b + 1].astype(float)
-			gmed = float(np.median(gseg))
-			gmad = float(np.median(np.abs(gseg - gmed)))
-			gmad = max(gmad, 1e-12)
-			out["gradient_max"] = float(np.max(gseg))
-			out["gradient_max_z"] = float(np.max(gseg) / gmad)
+		gmed = float(np.median(segment))
+		gmad = float(np.median(np.abs(segment - gmed)))
+		gmad = max(gmad, 1e-12)
+		out["gradient_max"] = float(np.max(segment))
+		out["gradient_max_z"] = float(np.max(segment) / gmad)
+		out["feature_source"] = "gradient"
 
 		return out
 
