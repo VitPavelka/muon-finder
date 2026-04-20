@@ -9,6 +9,7 @@ import time
 from matplotlib.widgets import TextBox, Button, CheckButtons
 
 from muon_pipeline import SpikeSegment
+from spike_merge import merge_spike_segments
 
 
 def show_hover_map(
@@ -32,38 +33,7 @@ def show_hover_map(
 		hover_fps: float = 10.0,
 ) -> None:
 	def _merge_duplicate_segments(segs: List[SpikeSegment]) -> List[SpikeSegment]:
-		if not segs:
-			return []
-		sorted_segs = sorted(segs, key=lambda s: (int(s.start), int(s.end), int(s.peak_index)))
-		out: List[SpikeSegment] = []
-		for s in sorted_segs:
-			if not out:
-				out.append(s)
-				continue
-			last = out[-1]
-			overlap_or_adjacent = max(int(last.start), int(s.start)) <= (min(int(last.end), int(s.end)) + 1)
-			same_peak_family = abs(int(last.peak_index) - int(s.peak_index)) <= 2
-			if overlap_or_adjacent and same_peak_family:
-				new_start = min(int(last.start), int(s.start))
-				new_end = max(int(last.end), int(s.end))
-				if float(s.peak_height) >= float(last.peak_height):
-					best_peak = int(s.peak_index)
-					best_height = float(s.peak_height)
-				else:
-					best_peak = int(last.peak_index)
-					best_height = float(last.peak_height)
-				out[-1] = SpikeSegment(
-					y=int(last.y),
-					x=int(last.x),
-					peak_index=best_peak,
-					start=new_start,
-					end=new_end,
-					peak_height=best_height,
-					area=float(last.area) + float(s.area)
-				)
-			else:
-				out.append(s)
-		return out
+		return merge_spike_segments(segs, merge_adjacent=True, peak_distance_max=None)
 
 	merged_spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]] = {
 		pix: _merge_duplicate_segments(segs)

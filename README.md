@@ -55,7 +55,7 @@ Per-spike debug fields include shape descriptors computed primarily from morphol
 
 You can switch feature extraction signal source for debug report via:
 - `debug_feature_signal_source`: `"gradient"` (default) or  `"raw"`
-- `debug_merge_duplicate_segments`: `true/false` (for experiments with multi-spike overlap, you can disable merging)
+- `merge_duplicate_segments`: `true/false` (applies to both debug report and viewer spike overlay merge)
 
 When set to `raw`,slope/asymmetry/plateau/`gradient_max*`-named fields are computed from the raw spectrum in the candidate interval; `feature_source` in JSON reflects the selected source.
 

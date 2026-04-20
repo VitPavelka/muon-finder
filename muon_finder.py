@@ -54,7 +54,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"debug_include_per_spectrum": True,
 	"debug_top_pixels": 25,
 	"debug_feature_signal_source": "gradient",  # gradient | raw
-	"debug_merge_duplicate_segments": False,
+	"merge_duplicate_segments": False,
 }
 
 
@@ -286,6 +286,7 @@ def run(cfg: Dict[str, Any]) -> None:
 	if cfg.get("save_spikes_csv_path"):
 		save_spikes_csv(path=Path(cfg["save_spikes_csv_path"]), spikes=spikes)
 
+	merge_dups = bool(cfg.get("merge_duplicate_segments", cfg.get("debug_merge_duplicate_segments", False)))
 	if cfg.get("debug_report_path"):
 		report = build_debug_report(
 			score_map=score_map,
@@ -299,7 +300,7 @@ def run(cfg: Dict[str, Any]) -> None:
 			overlays=overlays,
 			x_axis=x_axis,
 			feature_signal_source=str(cfg.get("debug_feature_signal_source", "gradient")),
-			merge_duplicate_segments=bool(cfg.get("debug_merge_duplicate_segments", False)),
+			merge_duplicate_segments=merge_dups,
 		)
 		save_debug_report_json(Path(cfg['debug_report_path']), report)
 
@@ -316,8 +317,8 @@ def run(cfg: Dict[str, Any]) -> None:
 			"raw": True,
 			"top_hat": True,
 			"gradient": True,
-			"dilation_minus_opening": True,
-			"corrected:": True,
+			"dilation_minus_opening": False,
+			"corrected:": False,
 		},
 	)
 
