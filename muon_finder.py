@@ -93,14 +93,15 @@ def load_target_coords_csv(path: Path, shape_hw: Tuple[int, int]) -> List[Tuple[
 
 def build_compact_subset(
 		x_axis: np.ndarray,
-		spectra: np.ndarray,
+		raw_spectra: np.ndarray,
 		score_map: np.ndarray,
 		candidate_mask: np.ndarray,
 		overlays: Dict[str, np.ndarray],
 		spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]],
 		coords: List[Tuple[int, int]],
+		corrected_spectra: Optional[np.ndarray] = None,
 ) -> Tuple[
-		np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[Tuple[int, int], List[SpikeSegment]], Dict[Tuple[int, int], Tuple[int, int]]
+		np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[Tuple[int, int], List[SpikeSegment]], Dict[Tuple[int, int], Tuple[int, int]], Optional[np.ndarray]
 ]:
 	n = len(coords)
 	if n == 0:
@@ -110,7 +111,10 @@ def build_compact_subset(
 	grid_h = int(math.ceil(n / grid_w))
 	spec_n = x_axis.size
 
-	spec_compact = np.zeros((grid_h, grid_w, spec_n), dtype=spectra.dtype)
+	raw_compact = np.zeros((grid_h, grid_w, spec_n), dtype=raw_spectra.dtype)
+	corr_compact = None
+	if corrected_spectra is not None:
+		corr_compact = np.zeros((grid_h, grid_w, spec_n), dtype=corrected_spectra.dtype)
 	score_compact = np.zeros((grid_h, grid_w), dtype=score_map.dtype)
 	cand_compact = np.zeros((grid_h, grid_w), dtype=bool)
 	overlay_compact: Dict[str, np.ndarray] = {
@@ -124,7 +128,9 @@ def build_compact_subset(
 		xx = i % grid_w
 		coord_map[(yy, xx)] = (src_y, src_x)
 
-		spec_compact[yy, xx, :] = spectra[src_y, src_x, :]
+		raw_compact[yy, xx, :] = raw_spectra[src_y, src_x, :]
+		if corr_compact is not None:
+			corr_compact[yy, xx, :] = corrected_spectra[src_y, src_x, :]
 		score_compact[yy, xx] = score_map[src_y, src_x]
 		cand_compact[yy, xx] = bool(candidate_mask[src_y, src_x])
 		for k in overlay_compact:
@@ -145,7 +151,7 @@ def build_compact_subset(
 				for s in src_spikes
 			]
 
-	return spec_compact, score_compact, cand_compact, overlay_compact, spikes_compact, coord_map
+	return raw_compact, score_compact, cand_compact, overlay_compact, spikes_compact, coord_map, corr_compact
 
 
 def run(cfg: Dict[str, Any]) -> None:
@@ -208,30 +214,33 @@ def run(cfg: Dict[str, Any]) -> None:
 		corrected = apply_despike(x_axis=x_axis, spectra=raw, accepted_spikes=spikes)
 
 	view_x = x_axis
-	view_spectra = corrected
+	view_spectra = raw
 	view_score = score_map
 	view_mask = candidate_mask
 	view_overlays = overlays
 	view_spikes_by_pixel = spikes_by_pixel
 	source_coords_map = None
+	view_corrected = corrected if bool(cfg["despike_enabled"]) else None
 
 	if target_coords and bool(cfg["use_compact_coords_view"]):
 		(
-			view_spectra,
-			view_score,
-			view_mask,
-			view_overlays,
-			view_spikes_by_pixel,
-			source_coords_map,
-		) = build_compact_subset(
-			x_axis=view_x,
-			spectra=view_spectra,
-			score_map=view_score,
-			candidate_mask=view_mask,
-			overlays=view_overlays,
-			spikes_by_pixel=view_spikes_by_pixel,
-			coords=target_coords,
-		)
+				view_spectra,
+				view_score,
+				view_mask,
+				view_overlays,
+				view_spikes_by_pixel,
+				source_coords_map,
+				view_corrected,
+			) = build_compact_subset(
+				x_axis=view_x,
+				raw_spectra=view_spectra,
+				score_map=view_score,
+				candidate_mask=view_mask,
+				overlays=view_overlays,
+				spikes_by_pixel=view_spikes_by_pixel,
+				coords=target_coords,
+				corrected_spectra=view_corrected,
+			)
 
 	show_hover_map(
 		x_axis=view_x,
@@ -241,7 +250,7 @@ def run(cfg: Dict[str, Any]) -> None:
 		spikes_by_pixel=view_spikes_by_pixel,
 		overlays=view_overlays,
 		source_coords_map=source_coords_map,
-		corrected_spectra=view_spectra if bool(cfg["despike_enabled"]) else None,
+		corrected_spectra=view_corrected,
 		initial_checked={"raw": True, "top_hat": True, "corrected": True},
 	)
 
