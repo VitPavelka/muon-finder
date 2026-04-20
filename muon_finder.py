@@ -251,7 +251,13 @@ def run(cfg: Dict[str, Any]) -> None:
 			overlays=view_overlays,
 			source_coords_map=source_coords_map,
 			corrected_spectra=view_corrected,
-			initial_checked={"raw": True, "top_hat": True, "gradient": True, "corrected": False},
+			initial_checked={
+				"raw": True,
+				"top_hat": True,
+				"gradient": True,
+				"dilation_minus_opening": True,
+				"corrected": False,
+			},
 		)
 
 	if cfg.get("save_npz_path"):
