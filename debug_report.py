@@ -17,6 +17,8 @@ def build_debug_report(
 		target_coords: Optional[List[Tuple[int, int]]] = None,
 		include_per_spectrum: bool = False,
 		max_top_pixels: int = 25,
+		raw_spectra: Optional[np.ndarray] = None,   # (H,W,N)
+		overlays: Optional[Dict[str, np.ndarray]] = None,  # expects at least 'gradient' if available
 ) -> Dict[str, Any]:
 	finite = score_map[np.isfinite(score_map)]
 	if finite.size == 0:
@@ -56,6 +58,62 @@ def build_debug_report(
 		"top_pixels": top_pixels,
 	}
 
+	def _spike_features(y: int, x: int, s: SpikeSegment) -> Dict[str, Any]:
+		out: Dict[str, Any] = {
+			"width_pts": int(max(0, s.end - s.start - 1)),
+			"peak_index": int(s.peak_index),
+			"start": int(s.start),
+			"end": int(s.end),
+			"peak_height": float(s.peak_height),
+			"area": float(s.area),
+		}
+		if raw_spectra is None:
+			return out
+
+		spec = raw_spectra[int(y), int(x), :].astype(float)
+		n = spec.size
+		a = int(np.clip(s.start, 0, n - 1))
+		b = int(np.clip(s.end, 0, n - 1))
+		p = int(np.clip(s.peak_index, 0, n - 1))
+		if not (a < p < b):
+			return out
+
+		segment = spec[a:b + 1]
+		if segment.size < 3:
+			return out
+
+		d = np.diff(segment)
+		rise = d[: max(1, p - a)]
+		fall = d[max(1, p - a):]
+		rise_slope = float(np.max(rise)) if rise.size else 0.0
+		fall_slope = float(np.min(fall)) if fall.size else 0.0
+
+		seg_med = float(np.median(segment))
+		seg_mad = float(np.median(np.abs(segment - seg_med)))
+		seg_mad = max(seg_mad, 1e-12)
+		out["rise_slope"] = rise_slope
+		out["fall_slope"] = fall_slope
+		out["rise_slope_z"] = float(rise_slope / seg_mad)
+		out["fall_slope_z"] = float(abs(fall_slope) / seg_mad)
+
+		peak_val = float(spec[p])
+		lvl = 0.9 * peak_val
+		plateau = int(np.count_nonzero(segment >= lvl))
+		out["plateau_width_90"] = plateau
+		out["edge_asymmetry"] = float(
+			(abs(rise_slope) - abs(fall_slope)) / (abs(rise_slope) + abs(fall_slope) + 1e-12)
+		)
+
+		if overlays is not None and "gradient" in overlays:
+			gseg = overlays["gradient"][int(y), int(x), a:b + 1].astype(float)
+			gmed = float(np.median(gseg))
+			gmad = float(np.median(np.abs(gseg - gmed)))
+			gmad = max(gmad, 1e-12)
+			out["gradient_max"] = float(np.max(gseg))
+			out["gradient_max_z"] = float(np.max(gseg) / gmad)
+
+		return out
+
 	if include_per_spectrum:
 		if target_coords is not None:
 			iter_coords = target_coords
@@ -73,13 +131,7 @@ def build_debug_report(
 					"score": float(score_map[int(y), int(x)]),
 					"n_spikes": int(len(segs)),
 					"spikes": [
-						{
-							"peak_index": int(s.peak_index),
-							"start": int(s.start),
-							"end": int(s.end),
-							"peak_height": float(s.peak_height),
-							"area": float(s.area),
-						}
+						_spike_features(int(y), int(x), s)
 						for s in segs
 					],
 				}
@@ -92,4 +144,3 @@ def build_debug_report(
 def save_debug_report_json(path: Path, report: Dict[str, Any]) -> None:
 	path = Path(path)
 	path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-
