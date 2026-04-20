@@ -286,6 +286,7 @@ def run(cfg: Dict[str, Any]) -> None:
 			max_top_pixels=int(cfg["debug_top_pixels"]),
 			raw_spectra=raw,
 			overlays=overlays,
+			x_axis=x_axis,
 		)
 		save_debug_report_json(Path(cfg["debug_report_path"]), report)
 
