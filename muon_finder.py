@@ -55,6 +55,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"debug_top_pixels": 25,
 	"debug_feature_signal_source": "gradient",  # gradient | raw
 	"merge_duplicate_segments": False,
+	"feature_expand_to_gradient_foot": True,
+	"feature_foot_k_mad": 2.0,
+	"feature_foot_min_run": 2,
+	"feature_window_method": "mad_run",  # mad_run | erosion_touch
+	"feature_erosion_se_size": 5,
+	"boundary_minimum_source": "gradient"
 }
 
 
@@ -301,6 +307,12 @@ def run(cfg: Dict[str, Any]) -> None:
 			x_axis=x_axis,
 			feature_signal_source=str(cfg.get("debug_feature_signal_source", "gradient")),
 			merge_duplicate_segments=merge_dups,
+			feature_expand_to_gradient_foot=bool(cfg.get("feature_expand_to_gradient_foot", True)),
+			feature_foot_k_mad=float(cfg.get("feature_foot_k_mad", 2.0)),
+			feature_foot_min_run=int(cfg.get("feature_foot_min_run", 2)),
+			feature_window_method=cfg.get("feature_window_method", "mad_run"),
+			feature_erosion_se_size=int(cfg.get("feature_erosion_se_size", 5)),
+			boundary_minimum_source=cfg.get("boundary_minimum_source", "gradient"),
 		)
 		save_debug_report_json(Path(cfg['debug_report_path']), report)
 
@@ -318,8 +330,14 @@ def run(cfg: Dict[str, Any]) -> None:
 			"top_hat": True,
 			"gradient": True,
 			"dilation_minus_opening": False,
-			"corrected:": False,
+			"corrected": False,
 		},
+		merge_duplicate_segments=merge_dups,
+		feature_expand_to_gradient_foot=bool(cfg.get("feature_expand_to_gradient_foot", True)),
+		feature_foot_k_mad=float(cfg.get("feature_foot_k_mad", 2.0)),
+		feature_foot_min_run=int(cfg.get("feature_foot_min_run", 2)),
+		feature_window_method=cfg.get("feature_window_method", "mad_run"),
+		feature_erosion_se_size=int(cfg.get("feature_erosion_se_size", 5)),
 	)
 
 

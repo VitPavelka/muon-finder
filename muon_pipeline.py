@@ -330,8 +330,15 @@ def extract_spikes_for_candidates(
 				if removal_width > max_width_pts:
 					continue
 
-				# compute peak height in top-hat (diagnostics)
-				peak_height = float(th[peak_index])
+				# For downstream merge/visualization use peak from RAW spectrum
+				# within detected anchor interval (exclusive anchors).
+				inner_start = int(left2 + 1)
+				inner_end = int(right2)
+				if inner_end <= inner_start:
+					continue
+				raw_window = raw[inner_start:inner_end]
+				peak_index = int(inner_start + int(np.argmax(raw_window)))
+				peak_height = float(raw[peak_index])
 
 				# integrate spike "excess" (use abs for descending x_axis)
 				seg = np.maximum(resid[left2+1:right2], 0.0)

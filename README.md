@@ -56,8 +56,17 @@ Per-spike debug fields include shape descriptors computed primarily from morphol
 You can switch feature extraction signal source for debug report via:
 - `debug_feature_signal_source`: `"gradient"` (default) or  `"raw"`
 - `merge_duplicate_segments`: `true/false` (applies to both debug report and viewer spike overlay merge)
+- `feature_expand_to_gradient_foot`: `true/false` (expand feature interval from anchors toward local gradient "foot")
+- `feature_foot_k_mad`: baseline threshold multiplier for foot detection (default `2.0`)
+- `feature_foot_min_run`: minimum consecutive points under threshold to accept as foot (default `2`)
+- `feature_window_method`: `"mad_run"` (default) or `"erosion_touch"` mode (default `5`).
+- `boundary_minimum_source` `"raw"` (default) or `"gradient"` for splitting overlaps between neighboring peaks
 
 When set to `raw`,slope/asymmetry/plateau/`gradient_max*`-named fields are computed from the raw spectrum in the candidate interval; `feature_source` in JSON reflects the selected source.
+When `feature_expand_to_gradient_foot=true`, feature metrics are computed on the expanded interval and JSON includes
+`feature_window_start`/`feature_window_end` fields so you can verify what was used.
+The same expanded interval is used for viewer spike egde/band overlays, so green bands reflect the effective feature window.
+If neighboring expanded windows overlap, boundaries are split at local minima of the selected `boundary_minimum_source`
 
 ### Interactive labeling helper (click-to-label)
 You can label candidates directly in a raw-spectrum GUI (separate script):
@@ -138,6 +147,7 @@ Optional modeling flags:
 - `--logreg-quadratic` adds univariate quadratic logistic fit (`z` and `z^2`)
 - `--mi-bins 10` sets quantile-bin count for mutual information estimate
 - `--plots-dir out/plots --top-k 12` writes ranking plot (`feature_auc_ranking.png`)
+- `--bootstrap-iters 1000 --bootstrap-seed 42` adds bootstrap AUC CI and plot (`feature_auc_bootstrap_ci.png`)
 
 `debug_stats.py` now reports for each feature:
 - Pearson and Spearman correlation to `is_muon`
@@ -146,3 +156,8 @@ Optional modeling flags:
 - `auc_feature_oriented` + `auc_direction` (same discrimination with the best direction handling)
 - `mutual_info_bits` (discretized mutual information estimate)
 - `logreg` block with univariate logistic regression coefficients and diagnostics (`auc_logreg`, `mcfadden_r2`, `status`)
+- bootstrap AUC interval fields (`auc_boot_mean`, `auc_boot_ci_lo`, `auc_boot_ci_hi`)
+
+`debug_report` now also includes versioned score:
+- `spike_score_v1` from weighted normalized components
+  - `rise_slope_z` (0.36), `gradient_max_z` (0.18), `area_z` (0.10)

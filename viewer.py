@@ -1,7 +1,7 @@
 # viewer.py
 from __future__ import annotations
 
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Literal
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,6 +10,10 @@ from matplotlib.widgets import TextBox, Button, CheckButtons
 
 from muon_pipeline import SpikeSegment
 from spike_merge import merge_spike_segments
+from feature_window import (
+	expand_interval_to_signal_foot,
+	enforce_shared_boundaries_by_minima
+)
 
 
 def show_hover_map(
@@ -31,14 +35,27 @@ def show_hover_map(
 		map_central_mass: float = 0.95,
 		highlight_detected_pixels: bool = True,
 		hover_fps: float = 10.0,
+		merge_duplicate_segments: bool = False,
+		feature_expand_to_gradient_foot: bool = False,
+		feature_foot_k_mad: float = 2.0,
+		feature_foot_min_run: int = 2,
+		feature_window_method: Literal["mad_run", "erosion_touch"] = "mad_run",
+		feature_erosion_se_size: int = 5,
+		boundary_minimum_source: Literal["raw", "gradient"] = "gradient"
 ) -> None:
 	def _merge_duplicate_segments(segs: List[SpikeSegment]) -> List[SpikeSegment]:
 		return merge_spike_segments(segs, merge_adjacent=True, peak_distance_max=None)
 
-	merged_spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]] = {
-		pix: _merge_duplicate_segments(segs)
-		for pix, segs in spikes_by_pixel.items()
-	}
+	if bool(merge_duplicate_segments):
+		view_spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]] = {
+			pix: _merge_duplicate_segments(segs)
+			for pix, segs in spikes_by_pixel.items()
+		}
+	else:
+		view_spikes_by_pixel = {
+			pix: list(segs)
+			for pix, segs in spikes_by_pixel.items()
+		}
 
 	H, W, N = spectra.shape
 
@@ -229,11 +246,50 @@ def show_hover_map(
 			col.clear()
 
 		# add spike markers (deduplicated by start/end)
-		segs = merged_spikes_by_pixel.get((y,x), [])
+		segs = view_spikes_by_pixel.get((y, x), [])
+		peaks: List[int] = []
+		lefts: List[int] = []
+		rights: List[int] = []
+
 		for s in segs:
 			pi = int(np.clip(s.peak_index, 0, len(x_axis) - 1))
 			si = int(np.clip(s.start, 0, len(x_axis) - 1))
 			ei = int(np.clip(s.end, 0, len(x_axis) - 1))
+
+			if bool(feature_expand_to_gradient_foot) and "gradient" in overlays:
+				grad_sig = overlays["gradient"][y, x, :].astype(float)
+				si, ei = expand_interval_to_signal_foot(
+					sig=grad_sig,
+					left=si,
+					right=ei,
+					peak=pi,
+					enabled=True,
+					k_mad=float(feature_foot_k_mad),
+					min_run=int(feature_foot_min_run),
+					method=feature_window_method,
+					erosion_se_size=int(feature_erosion_se_size),
+				)
+
+			peaks.append(pi)
+			lefts.append(int(si))
+			rights.append(int(ei))
+
+		bsrc = str(boundary_minimum_source).strip().lower()
+		if bsrc == "gradient" and "gradient" in overlays:
+			boundary_sig = overlays['gradient'][y, x, :].astype(float)
+		else:
+			boundary_sig = spectra[y, x, :].astype(float)
+		lefts, rights = enforce_shared_boundaries_by_minima(
+			peaks=peaks,
+			lefts=lefts,
+			rights=rights,
+			signal=boundary_sig,
+		)
+
+		for idx, s in enumerate(segs):
+			pi = int(np.clip(s.peak_index, 0, len(x_axis) - 1))
+			si = int(np.clip(lefts[idx], 0, len(x_axis) - 1))
+			ei = int(np.clip(rights[idx], 0, len(x_axis) - 1))
 			x_peak = x_axis[pi]
 			x_start = x_axis[si]
 			x_end = x_axis[ei]

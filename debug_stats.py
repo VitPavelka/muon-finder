@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import minimize
-from scipy.stats import rankdata
+from scipy.stats import rankdata, norm
 
 
 def _flatten_spikes(report: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -206,6 +206,115 @@ def _save_auc_barplot(results: List[Dict[str, Any]], out_path: Path, top_k: int)
 	plt.close()
 
 
+def _compute_midrank(x: np.ndarray) -> np.ndarray:
+	J = np.argsort(x)
+	Z = x[J]
+	N = len(x)
+	T = np.zeros(N, dtype=float)
+	i = 0
+	while i < N:
+		j = i
+		while j < N and Z[j] == Z[i]:
+			j += 1
+		T[i:j] = 0.5 * (i + j - 1) + 1.0
+		i = j
+	T2 = np.empty(N, dtype=float)
+	T2[J] = T
+	return T2
+
+
+def _fast_delong(preds_sorted_t: np.ndarray, m: int) -> Tuple[np.ndarray, np.ndarray]:
+	n = preds_sorted_t.shape[1] - m
+	k = preds_sorted_t.shape[0]
+	pos = preds_sorted_t[:, :m]
+	neg = preds_sorted_t[:, m:]
+
+	tx = np.empty((k, m), dtype=float)
+	ty = np.empty((k, n), dtype=float)
+	tz = np.empty((k, m + n), dtype=float)
+	for r in range(k):
+		tx[r, :] = _compute_midrank(pos[r, :])
+		ty[r, :] = _compute_midrank(neg[r, :])
+		tz[r, :] = _compute_midrank(preds_sorted_t[r, :])
+
+	aucs = tz[:, :m].sum(axis=1) / m / n - (m + 1.0) / 2.0 / n
+	v01 = (tz[:, :m] - tx) / n
+	v10 = 1.0 - (tz[:, m:] - ty) / m
+	sx = np.cov(v01)
+	sy = np.cov(v10)
+	del_cov = sx / m + sy / n
+	return aucs, del_cov
+
+
+def _delong_2sample(y_true: np.ndarray, s1: np.ndarray, s2: np.ndarray) -> Dict[str, float]:
+	y = y_true.astype(int)
+	m = int(np.sum(y == 1))
+	n = int(np.sum(y == 0))
+	if m < 2 or n < 2:
+		return {'z': float("nan"), 'p_value': float("nan")}
+	order = np.argsort(-y)
+	preds = np.vstack([s1[order], s2[order]])
+	aucs, cov = _fast_delong(preds, m)
+	var = float(cov[0, 0] + cov[1, 1] - 2.0 * cov[0, 1])
+	if var <= 0:
+		return {'z': float("nan"), 'p_value': float("nan")}
+	z = float((aucs[0] - aucs[1]) / np.sqrt(var))
+	p = float(2.0 * (1.0 - norm.cdf(abs(z))))
+	return {'z': z, 'p_value': p}
+
+
+def _bootstrap_auc_ci(
+		y_true: np.ndarray,
+		score: np.ndarray,
+		n_boot: int = 1000,
+		seed: int = 0,
+) -> Dict[str, float]:
+	y = y_true.astype(int)
+	n = y.size
+	rng = np.random.default_rng(seed)
+	vals = []
+	for _ in range(max(10, int(n_boot))):
+		idx = rng.integers(0, n, size=n)
+		yb = y[idx]
+		if np.unique(yb).size < 2:
+			continue
+		sb = score[idx]
+		a = _roc_auc_binary(yb, sb)
+		if np.isfinite(a):
+			vals.append(float(a))
+	if not vals:
+		return {'auc_boot_mean': float("nan"), 'auc_boot_ci_lo': float("nan"), 'auc_boot_ci_hi': float("nan")}
+	arr = np.array(vals, dtype=float)
+	return {
+		'auc_boot_mean': float(np.mean(arr)),
+		'auc_boot_ci_lo': float(np.quantile(arr, 0.025)),
+		'auc_boot_ci_hi': float(np.quantile(arr, 0.975)),
+	}
+
+
+def _save_auc_ci_plot(results: List[Dict[str, Any]], out_path: Path, top_k: int) -> None:
+	valid = [r for r in results if np.isfinite(r.get('auc_feature_oriented', np.nan))]
+	if not valid:
+		return
+	valid.sort(key=lambda r: float(r['auc_feature_oriented']), reverse=True)
+	top = valid[: max(1, int(top_k))]
+	names = [str(r['feature']) for r in top][::-1]
+	auc = [float(r['auc_feature_oriented']) for r in top][::-1]
+	lo = [float(r.get('auc_boot_ci_lo', np.nan)) for r in top][::-1]
+	hi = [float(r.get('auc_boot_ci_hi', np.nan)) for r in top][::-1]
+	err_left = np.array([max(0.0, a - l) if np.isfinite(l) else 0.0 for a, l in zip(auc, lo)], dtype=float)
+	err_right = np.array([max(0.0, h - a) if np.isfinite(h) else 0.0 for a, h in zip(auc, hi)], dtype=float)
+
+	plt.figure(figsize=(9, max(4, 0.35 * len(top) + 1)))
+	plt.barh(names, auc, xerr=np.vstack([err_left, err_right]), capsize=2)
+	plt.axvline(0.5, linestyle='--', linewidth=1.0, color="k")
+	plt.xlabel("AUC (oriented) with 95 % bootstrap CI")
+	plt.title("Top features: AUC with bootstrap CI")
+	plt.tight_layout()
+	plt.savefig(out_path, dpi=150)
+	plt.close()
+
+
 def main() -> None:
 	parser = argparse.ArgumentParser(description="Correlation helper for debug_report spikes.")
 	parser.add_argument("--report", type=Path, required=True, help="Path ot debug_report.json")
@@ -232,6 +341,12 @@ def main() -> None:
 	)
 	parser.add_argument(
 		"--top-k", type=int, default=12, help="Top K features for ranking plot."
+	)
+	parser.add_argument(
+		"--bootstrap-iters", type=int, default=1000, help="Bootstrap iterations for AUC CI."
+	)
+	parser.add_argument(
+		"--bootstrap-seed", type=int, default=42, help="Random seed for bootstrap."
 	)
 	args = parser.parse_args()
 
@@ -278,19 +393,73 @@ def main() -> None:
 				"auc_direction": auc_direction,
 				"mutual_info_bits": _mutual_info_binary_discrete(xv, yv, bins=max(2, int(args.mi_bins))),
 				"logreg": _fit_univariate_logreg(xv, yv, quadratic=bool(args.logreg_quadratic)),
+				"_x_eval": xv,
+				"_y_eval": yv,
 			}
 		)
+
+	# bootstrap CI per feature
+	for i, r in enumerate(results):
+		xv = np.array(r.get('_x_eval', []), dtype=float)
+		yv = np.array(r.get('y_eval', []), dtype=float)
+		if xv.size < 4:
+			continue
+		boot = _bootstrap_auc_ci(
+			y_true=yv,
+			score=xv,
+			n_boot=int(args.bootstrap_iters),
+			seed=int(args.bootstrap_seed + i),
+		)
+		r.update(boot)
 
 	results.sort(
 		key=lambda r: r["auc_feature_oriented"] if np.isfinite(r["auc_feature_oriented"]) else -1,
 		reverse=True,
 	)
-	out = {"n_labeled_spikes": len(paired), "correlations": results}
+
+	# DeLong: compare each feature against the best-oriented feature
+	delong_vs_best: List[Dict[str, Any]] = []
+	if results:
+		best = results[0]
+		xb = np.array(best.get('_x_eval', []), dtype=float)
+		yb = np.array(best.get('y_eval', []), dtype=float)
+		best_orient = -1.0 if str(best.get('auc_direction')) == "negative" else 1.0
+		sb = best_orient * xb
+		for r in results[1:]:
+			xr = np.array(r.get('_x_eval', []), dtype=float)
+			yr = np.array(r.get('y_eval', []), dtype=float)
+			if xr.size != sb.size or yr.size != yb.size:
+				continue
+			orient = -1.0 if str(r.get('auc_direction')) == "negative" else 1.0
+			sr = orient * xr
+			d = _delong_2sample(yb, sb, sr)
+			delong_vs_best.append(
+				{
+					'best_feature': str(best['feature']),
+					'other_feature': str(r['feature']),
+					'auc_best': float(best.get('auc_feature_oriented', float("nan"))),
+					'auc_other': float(r.get('auc_feature_oriented', float("nan"))),
+					'delta_auc': float(best.get('auc_feature_oriented', float("nan")) - r.get('auc_feature_oriented', float("nan"))),
+					'z': float(d.get('z', float("nan"))),
+					'p_value': float(d.get('p_value', float("nan"))),
+				}
+			)
+
+	for r in results:
+		r.pop('_x_eval', None)
+		r.pop('_y_eval', None)
+
+	out = {
+		'n_labeled_spikes': len(paired),
+		'correlations': results,
+		'delong_vs_best': delong_vs_best,
+	}
 
 	if args.plots_dir:
 		p = Path(args.plots_dir)
 		p.mkdir(parents=True, exist_ok=True)
 		_save_auc_barplot(results, p / "feature_auc_ranking.png", top_k=int(args.top_k))
+		_save_auc_ci_plot(results, p / "feature_auc_bootstrap_ci.png", top_k=int(args.top_k))
 
 	if args.out_json:
 		Path(args.out_json).write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
