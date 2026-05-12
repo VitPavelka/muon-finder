@@ -10,11 +10,8 @@ from typing import Dict, List, Tuple, Any, Optional, Literal, Sequence
 import numpy as np
 
 from muon_pipeline import SpikeSegment
-from spike_merge import merge_spike_segments_by_signal_foot
-from feature_window import (
-	expand_interval_to_signal_foot,
-	enforce_shared_boundaries_by_minima,
-)
+from primary_candidate_preparation import prepare_primary_ss4_segments
+from feature_window import expand_interval_to_signal_foot
 from feature_discrimination import (
 	compute_peak_curvature_features,
 	compute_peak_curvature_d3_features,
@@ -389,64 +386,22 @@ def build_debug_report(
 		return None
 
 	def _prepare_pixel_segments(y: int, x: int, segs: List[SpikeSegment]) -> List[SpikeSegment]:
-		if not segs:
-			return []
-		src_sig = _feature_source_signal(int(y), int(x))
-		peaks: List[int] = []
-		lefts: List[int] = []
-		rights: List[int] = []
-		for s in segs:
-			a0 = int(s.start)
-			b0 = int(s.end)
-			p0 = int(s.peak_index)
-			if src_sig is not None:
-				a0, b0 = expand_interval_to_signal_foot(
-					sig=src_sig,
-					left=a0,
-					right=b0,
-					peak=p0,
-					enabled=bool(feature_expand_to_gradient_foot),
-					k_mad=float(feature_foot_k_mad),
-					min_run=int(feature_foot_min_run),
-					method=feature_window_method,
-					erosion_se_size=int(feature_erosion_se_size),
-				)
-			peaks.append(p0)
-			lefts.append(int(a0))
-			rights.append(int(b0))
-
-		boundary_sig = _boundary_source_signal(int(y), int(x))
-		if boundary_sig is not None:
-			lefts, rights = enforce_shared_boundaries_by_minima(
-				peaks=peaks,
-				lefts=lefts,
-				rights=rights,
-				signal=boundary_sig,
-			)
-
-		prepared = [
-			SpikeSegment(
-				y=int(y),
-				x=int(x),
-				peak_index=int(peaks[i]),
-				start=int(lefts[i]),
-				end=int(rights[i]),
-				peak_height=float(segs[i].peak_height),
-				area=float(segs[i].area),
-			)
-			for i in range(len(segs))
-		]
-		if bool(merge_duplicate_segments) and overlays is not None and "gradient" in overlays:
-			prepared = merge_spike_segments_by_signal_foot(
-				prepared,
-				signal=overlays['gradient'][int(y), int(x), :].astype(float),
-				k_mad=float(feature_foot_k_mad),
-				min_run=int(feature_foot_min_run),
-				max_width_pts=(None if merge_max_width_pts is None else int(merge_max_width_pts)),
-				merge_adjacent=True,
-				peak_distance_max=None,
-			)
-		return prepared
+		merge_sig = overlays['gradient'][int(y), int(x), :].astype(float) if overlays is not None and "gradient" in overlays else None
+		return prepare_primary_ss4_segments(
+			y=int(y),
+			x=int(x),
+			segs=segs,
+			feature_signal=_feature_source_signal(int(y), int(x)),
+			boundary_signal=_boundary_source_signal(int(y), int(x)),
+			merge_signal=merge_sig,
+			feature_expand_to_gradient_foot=bool(feature_expand_to_gradient_foot),
+			feature_foot_k_mad=float(feature_foot_k_mad),
+			feature_foot_min_run=int(feature_foot_min_run),
+			feature_window_method=feature_window_method,
+			feature_erosion_se_size=int(feature_erosion_se_size),
+			merge_duplicate_segments=bool(merge_duplicate_segments),
+			merge_max_width_pts=merge_max_width_pts,
+		)
 
 	merged_spikes_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]] = {
 		pix: _prepare_pixel_segments(int(pix[0]), int(pix[1]), list(segs))

@@ -161,6 +161,11 @@ def _secondary_ss4_for_cell(
 		return {
 			"secondary_ss4_ran": True,
 			"secondary_ss4_invalid_reason": "cell_too_short",
+			"secondary_spike_score_v1": float("nan"),
+			"secondary_pce_negpref_t098_evidence_signed": float("nan"),
+			"secondary_recdw_sum_0_90_raman_veto_evidence_signed": float("nan"),
+			"secondary_rve_value_used_for_ss4": float("nan"),
+			"secondary_rve_metric_source": "not_computed_cell_too_short",
 			"secondary_ss1": float("nan"),
 			"secondary_pce": float("nan"),
 			"secondary_edge": float("nan"),
@@ -233,6 +238,13 @@ def _secondary_ss4_for_cell(
 		"secondary_ss4_ran": True,
 		"secondary_anchor_index": int(apex),
 		"secondary_anchor_source": anchor_source,
+		"secondary_spike_score_v1": float(ss1),
+		"secondary_pce_negpref_t098_evidence_signed": float(pce),
+		"secondary_recdw_sum_0_90_raman_veto_evidence_signed": float("nan"),
+		"secondary_rve_value_used_for_ss4": float(rve),
+		"secondary_rve_metric_source": "local_cell_upper_width_proxy_not_primary_recdw",
+		"secondary_rve_metric_note": "Primary recdw_sum_0_90_raman_veto_evidence_signed is dataset-normalized and is not recomputed exactly for isolated contact cells.",
+		"secondary_edge_rve_proxy": float(rve),
 		"secondary_ss1": float(ss1),
 		"secondary_pce": float(pce),
 		"secondary_edge": float(rve),
@@ -455,6 +467,7 @@ def analyze_erosion_dilation_contact_cells(
 		apex = int(np.clip(parent.peak_index, 0, n - 1))
 		if start > end:
 			start, end = end, start
+		parent_id = f"primary:{int(y)}:{int(x)}:{int(apex)}:{int(start)}:{int(end)}"
 		cl = max(0, start - pad)
 		cr = min(n - 1, end + pad)
 		raw_ctx = raw[cl:cr + 1]
@@ -507,6 +520,10 @@ def analyze_erosion_dilation_contact_cells(
 					high_salience=3.0 / sensitivity,
 				)
 				cells.append({
+					"cell_id": f"{parent_id}:cell:{int(idx)}",
+					"parent_id": parent_id,
+					"y": int(y),
+					"x": int(x),
 					"cell_index": int(idx),
 					"cell_left": int(left),
 					"cell_right": int(right),
@@ -570,7 +587,7 @@ def analyze_erosion_dilation_contact_cells(
 				if pre == "definite_parent_spike":
 					c["secondary_final_class"] = "spike"
 					c["secondary_final_is_spike"] = True
-					c["secondary_final_source"] = "primary_ss4_parent_apex"
+					c["secondary_final_source"] = "parent_apex"
 					c["secondary_ss4_ran"] = False
 				elif pre == "definite_noise":
 					c["secondary_final_class"] = "non_spike"
@@ -652,6 +669,8 @@ def analyze_erosion_dilation_contact_cells(
 				and c.get("secondary_anchor_index") is not None
 			]
 			chord = _build_final_chord(raw, gl, gr, required_indices=required)
+			chord["chord_id"] = f"{parent_id}:chord:{len(final_chords)}"
+			chord["parent_id"] = parent_id
 			chord["cell_indices"] = [int(v) for v in group.get("cell_indices", [])]
 			chord["y"] = int(y)
 			chord["x"] = int(x)
@@ -694,6 +713,13 @@ def analyze_erosion_dilation_contact_cells(
 			island_reason = "no_parent_apex_cell"
 		key = (y, x, apex, start, end)
 		meta = dict(parent_metadata.get(key, {}))
+		primary_ss4 = meta.get("primary_ss4", meta.get("ss4", 1.0))
+		primary_ss4_reason = meta.get("primary_ss4_reason", meta.get("ss4_reason"))
+		primary_ss4_decision = meta.get("primary_ss4_decision", meta.get("ss4_decision"))
+		primary_ss1 = meta.get("primary_spike_score_v1", meta.get("spike_score_v1"))
+		primary_pce = meta.get("primary_pce_negpref_t098_evidence_signed", meta.get("pce_negpref_t098_evidence_signed"))
+		primary_edge = meta.get("primary_recdw_sum_0_90_raman_veto_evidence_signed", meta.get("recdw_sum_0_90_raman_veto_evidence_signed"))
+		primary_edge_feature = meta.get("primary_ss4_rve_feature", meta.get("ss4_rve_feature"))
 		summary = {
 			"n_erosion_contacts": int(erosion_contacts.size),
 			"n_dilation_contacts": int(dilation_contacts.size),
@@ -723,18 +749,27 @@ def analyze_erosion_dilation_contact_cells(
 			"incomplete_contact_segmentation": bool(erosion_contacts.size < 2),
 		}
 		parent_rows.append({
+			"parent_id": parent_id,
+			"candidate_id": meta.get("candidate_id", parent_id),
 			"y": y,
 			"x": x,
 			"parent_start": int(start),
 			"parent_end": int(end),
 			"parent_apex": int(apex),
 			"parent_peak_height": float(parent.peak_height),
-			"parent_ss4_value": _clean_value(meta.get("ss4", 1.0)),
-			"parent_ss4_reason": meta.get("ss4_reason"),
-			"parent_ss1": _clean_value(meta.get("spike_score_v1")),
-			"parent_pce": _clean_value(meta.get("pce_negpref_t098_evidence_signed")),
-			"parent_edge": _clean_value(meta.get("recdw_sum_0_90_raman_veto_evidence_signed")),
-			"parent_edge_feature": meta.get("ss4_rve_feature"),
+			"primary_spike_score_v1": _clean_value(primary_ss1),
+			"primary_pce_negpref_t098_evidence_signed": _clean_value(primary_pce),
+			"primary_recdw_sum_0_90_raman_veto_evidence_signed": _clean_value(primary_edge),
+			"primary_ss4": _clean_value(primary_ss4),
+			"primary_ss4_decision": primary_ss4_decision,
+			"primary_ss4_reason": primary_ss4_reason,
+			"primary_ss4_rve_feature": primary_edge_feature,
+			"parent_ss4_value": _clean_value(primary_ss4),
+			"parent_ss4_reason": primary_ss4_reason,
+			"parent_ss1": _clean_value(primary_ss1),
+			"parent_pce": _clean_value(primary_pce),
+			"parent_edge": _clean_value(primary_edge),
+			"parent_edge_feature": primary_edge_feature,
 			"context_left": int(cl),
 			"context_right": int(cr),
 			"local_noise": float(local_noise),

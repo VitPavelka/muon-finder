@@ -27,9 +27,9 @@ from viewer import show_hover_map
 from results_io import save_result_npz, save_spikes_csv
 from debug_report import build_debug_report, save_debug_report_json
 from preprocess import resample_axis_and_spectra
-from feature_window import expand_interval_to_signal_foot, enforce_shared_boundaries_by_minima
 from feature_discrimination import compute_edge_width_metrics, compute_peak_curvature_features, compute_spike_score_v2_features
 from muon_decision import annotate_feature_dict_with_spike_score_v4, classify_segment_with_muon_rule_v3
+from primary_candidate_preparation import prepare_primary_ss4_segments
 
 DEFAULT_CONFIG: Dict[str, Any] = {
 	"input_path": "",
@@ -403,8 +403,10 @@ def run(cfg: Dict[str, Any]) -> None:
 			return
 		out_dir_raw = cfg.get("ss4_histogram_dir")
 		if not out_dir_raw:
-			return
-		out_dir = Path(str(out_dir_raw))
+			base_dir = Path(str(cfg.get("output_dir", "") or "."))
+			out_dir = base_dir / "ss4_histograms"
+		else:
+			out_dir = Path(str(out_dir_raw))
 		out_dir.mkdir(parents=True, exist_ok=True)
 		prefix = str(cfg.get("ss4_histogram_prefix", "ss4_primary")).strip() or "ss4_primary"
 		series = {
@@ -434,12 +436,42 @@ def run(cfg: Dict[str, Any]) -> None:
 			plt.close(fig_h)
 		print(f"[ss4-hist] saved primary SS4 histograms to {out_dir}")
 
+	def _primary_candidate_id(y: int, x: int, peak: int, start: int, end: int) -> str:
+		return f"primary:{int(y)}:{int(x)}:{int(peak)}:{int(start)}:{int(end)}"
+
+	def _primary_ss4_record(y: int, x: int, peak: int, start: int, end: int, features: Dict[str, Any]) -> Dict[str, Any]:
+		candidate_id = _primary_candidate_id(y, x, peak, start, end)
+		return {
+			"candidate_id": candidate_id,
+			"parent_id": candidate_id,
+			"y": int(y),
+			"x": int(x),
+			"peak_index": int(peak),
+			"start": int(start),
+			"end": int(end),
+			"primary_spike_score_v1": features.get("spike_score_v1"),
+			"primary_pce_negpref_t098_evidence_signed": features.get("pce_negpref_t098_evidence_signed"),
+			"primary_recdw_sum_0_90_raman_veto_evidence_signed": features.get("recdw_sum_0_90_raman_veto_evidence_signed"),
+			"primary_ss4": features.get("ss4"),
+			"primary_ss4_decision": features.get("ss4_decision"),
+			"primary_ss4_reason": features.get("ss4_reason"),
+			"primary_ss4_rve_feature": features.get("ss4_rve_feature"),
+			# Legacy aliases are kept read-only for older debug/report consumers.
+			"spike_score_v1": features.get("spike_score_v1"),
+			"pce_negpref_t098_evidence_signed": features.get("pce_negpref_t098_evidence_signed"),
+			"recdw_sum_0_90_raman_veto_evidence_signed": features.get("recdw_sum_0_90_raman_veto_evidence_signed"),
+			"ss4": features.get("ss4"),
+			"ss4_decision": features.get("ss4_decision"),
+			"ss4_reason": features.get("ss4_reason"),
+			"ss4_rve_feature": features.get("ss4_rve_feature"),
+		}
+
 	def _iter_prepared_spikes_for_ss4() -> List[Tuple[SpikeSegment, SpikeSegment]]:
 		rows: List[Tuple[SpikeSegment, SpikeSegment]] = []
 		for (y, x), segs in spikes_by_pixel.items():
 			prepared = _prepare_decision_segments(int(y), int(x), list(segs))
-			for original, prepared_seg in zip(segs, prepared):
-				rows.append((original, prepared_seg))
+			for prepared_seg in prepared:
+				rows.append((prepared_seg, prepared_seg))
 		return rows
 
 	def _minimal_ss4_base_features(raw_sig: np.ndarray, grad_sig: Optional[np.ndarray], seg: SpikeSegment) -> Dict[str, float]:
@@ -594,34 +626,21 @@ def run(cfg: Dict[str, Any]) -> None:
 			)
 			v = float(features.get("ss4", np.nan))
 			prepared_seg = rec["prepared"]
-			ss4_candidate_metrics_by_pixel.setdefault((int(prepared_seg.y), int(prepared_seg.x)), []).append({
-				"y": int(prepared_seg.y),
-				"x": int(prepared_seg.x),
-				"peak_index": int(prepared_seg.peak_index),
-				"start": int(prepared_seg.start),
-				"end": int(prepared_seg.end),
-				"ss4": features.get("ss4"),
-				"ss4_reason": features.get("ss4_reason"),
-				"ss4_decision": features.get("ss4_decision"),
-				"ss4_rve_feature": features.get("ss4_rve_feature"),
-				"spike_score_v1": features.get("spike_score_v1"),
-				"pce_negpref_t098_evidence_signed": features.get("pce_negpref_t098_evidence_signed"),
-				"recdw_sum_0_90_raman_veto_evidence_signed": features.get("recdw_sum_0_90_raman_veto_evidence_signed"),
-			})
+			primary_record = _primary_ss4_record(
+				int(prepared_seg.y),
+				int(prepared_seg.x),
+				int(prepared_seg.peak_index),
+				int(prepared_seg.start),
+				int(prepared_seg.end),
+				features,
+			)
+			ss4_candidate_metrics_by_pixel.setdefault((int(prepared_seg.y), int(prepared_seg.x)), []).append(primary_record)
 			if not np.isfinite(v):
 				missing += 1
 				continue
 			if v >= 0.5:
 				key = (int(prepared_seg.y), int(prepared_seg.x), int(prepared_seg.peak_index), int(prepared_seg.start), int(prepared_seg.end))
-				ss4_selected_metadata[key] = {
-					"ss4": float(v),
-					"ss4_reason": features.get("ss4_reason"),
-					"ss4_decision": features.get("ss4_decision"),
-					"ss4_rve_feature": features.get("ss4_rve_feature"),
-					"spike_score_v1": features.get("spike_score_v1"),
-					"pce_negpref_t098_evidence_signed": features.get("pce_negpref_t098_evidence_signed"),
-					"recdw_sum_0_90_raman_veto_evidence_signed": features.get("recdw_sum_0_90_raman_veto_evidence_signed"),
-				}
+				ss4_selected_metadata[key] = dict(primary_record)
 				selected.append(prepared_seg)
 		_save_ss4_primary_histograms(records)
 		print(
@@ -711,53 +730,27 @@ def run(cfg: Dict[str, Any]) -> None:
 		if not segs:
 			return []
 		n = int(raw.shape[2])
-		peaks: List[int] = []
-		lefts: List[int] = []
-		rights: List[int] = []
 		grad_sig = overlays["gradient"][int(y), int(x), :].astype(float) if "gradient" in overlays else None
-		for s in segs:
-			pi = int(np.clip(s.peak_index, 0, n - 1))
-			si = int(np.clip(s.start, 0, n - 1))
-			ei = int(np.clip(s.end, 0, n - 1))
-			if bool(cfg.get("feature_expand_to_gradient_foot", True)) and grad_sig is not None:
-				si, ei = expand_interval_to_signal_foot(
-					sig=grad_sig,
-					left=si,
-					right=ei,
-					peak=pi,
-					enabled=True,
-					k_mad=float(cfg.get("feature_foot_k_mad", 2.0)),
-					min_run=int(cfg.get("feature_foot_min_run", 2)),
-					method=cfg.get("feature_window_method", "mad_run"),
-					erosion_se_size=int(cfg.get("feature_erosion_se_size", 5)),
-				)
-			peaks.append(pi)
-			lefts.append(int(si))
-			rights.append(int(ei))
-
 		bsrc = str(cfg.get("boundary_minimum_source", "gradient")).strip().lower()
 		if bsrc == "gradient" and grad_sig is not None:
 			boundary_sig = grad_sig
 		else:
 			boundary_sig = raw[int(y), int(x), :].astype(float)
-		lefts, rights = enforce_shared_boundaries_by_minima(
-			peaks=peaks,
-			lefts=lefts,
-			rights=rights,
-			signal=boundary_sig,
+		return prepare_primary_ss4_segments(
+			y=int(y),
+			x=int(x),
+			segs=segs,
+			feature_signal=(grad_sig if str(cfg.get("debug_feature_signal_source", "gradient")).strip().lower() != "raw" else raw[int(y), int(x), :].astype(float)),
+			boundary_signal=boundary_sig,
+			merge_signal=grad_sig,
+			feature_expand_to_gradient_foot=bool(cfg.get("feature_expand_to_gradient_foot", True)),
+			feature_foot_k_mad=float(cfg.get("feature_foot_k_mad", 2.0)),
+			feature_foot_min_run=int(cfg.get("feature_foot_min_run", 2)),
+			feature_window_method=cfg.get("feature_window_method", "mad_run"),
+			feature_erosion_se_size=int(cfg.get("feature_erosion_se_size", 5)),
+			merge_duplicate_segments=merge_dups,
+			merge_max_width_pts=int(cfg.get("max_width_pts", 20)),
 		)
-		return [
-			SpikeSegment(
-				y=int(y),
-				x=int(x),
-				peak_index=int(peaks[i]),
-				start=int(lefts[i]),
-				end=int(rights[i]),
-				peak_height=float(segs[i].peak_height),
-				area=float(segs[i].area),
-			)
-			for i in range(len(segs))
-		]
 
 	decision_profile = str(cfg.get("decision_profile", "muon_rule_v3")).strip().lower()
 	if decision_profile == "legacy_v3":
@@ -808,11 +801,20 @@ def run(cfg: Dict[str, Any]) -> None:
 				start = int(sp.get("start", sp.get("feature_window_start", -1)))
 				end = int(sp.get("end", sp.get("feature_window_end", -1)))
 				ss4_candidate_metrics_by_pixel.setdefault((yv, xv), []).append({
+					"candidate_id": _primary_candidate_id(yv, xv, peak, start, end),
+					"parent_id": _primary_candidate_id(yv, xv, peak, start, end),
 					"y": yv,
 					"x": xv,
 					"peak_index": peak,
 					"start": start,
 					"end": end,
+					"primary_ss4": sp.get("ss4"),
+					"primary_ss4_reason": sp.get("ss4_reason"),
+					"primary_ss4_decision": sp.get("ss4_decision"),
+					"primary_ss4_rve_feature": sp.get("ss4_rve_feature"),
+					"primary_spike_score_v1": sp.get("spike_score_v1"),
+					"primary_pce_negpref_t098_evidence_signed": sp.get("pce_negpref_t098_evidence_signed"),
+					"primary_recdw_sum_0_90_raman_veto_evidence_signed": sp.get("recdw_sum_0_90_raman_veto_evidence_signed"),
 					"ss4": sp.get("ss4"),
 					"ss4_reason": sp.get("ss4_reason"),
 					"ss4_decision": sp.get("ss4_decision"),
@@ -832,6 +834,15 @@ def run(cfg: Dict[str, Any]) -> None:
 					continue
 				if bool(v >= 0.5):
 					ss4_selected_metadata[(yv, xv, peak, start, end)] = {
+						"candidate_id": _primary_candidate_id(yv, xv, peak, start, end),
+						"parent_id": _primary_candidate_id(yv, xv, peak, start, end),
+						"primary_ss4": float(v),
+						"primary_ss4_reason": sp.get("ss4_reason"),
+						"primary_ss4_decision": sp.get("ss4_decision"),
+						"primary_ss4_rve_feature": sp.get("ss4_rve_feature"),
+						"primary_spike_score_v1": sp.get("spike_score_v1"),
+						"primary_pce_negpref_t098_evidence_signed": sp.get("pce_negpref_t098_evidence_signed"),
+						"primary_recdw_sum_0_90_raman_veto_evidence_signed": sp.get("recdw_sum_0_90_raman_veto_evidence_signed"),
 						"ss4": float(v),
 						"ss4_reason": sp.get("ss4_reason"),
 						"ss4_decision": sp.get("ss4_decision"),

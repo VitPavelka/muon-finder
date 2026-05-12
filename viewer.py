@@ -147,22 +147,22 @@ def show_hover_map(
 	}
 	despike_diag_by_pixel: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
 	contact_parent_by_pixel: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
+	def _num_from(row: Dict[str, object], *keys: str) -> float:
+		for key in keys:
+			if key in row and row.get(key) is not None:
+				try:
+					return float(row.get(key))
+				except Exception:
+					continue
+		return float("nan")
+
 	def _dedupe_ss4_rows(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
-		by_peak: Dict[int, Dict[str, object]] = {}
+		by_id: Dict[object, Dict[str, object]] = {}
 
 		def _row_rank(row: Dict[str, object]) -> Tuple[float, float, float]:
-			try:
-				ss4_v = float(row.get("ss4", np.nan))
-			except Exception:
-				ss4_v = float("nan")
-			try:
-				ss1_v = float(row.get("spike_score_v1", np.nan))
-			except Exception:
-				ss1_v = float("nan")
-			try:
-				pce_v = float(row.get("pce_negpref_t098_evidence_signed", np.nan))
-			except Exception:
-				pce_v = float("nan")
+			ss4_v = _num_from(row, "primary_ss4", "ss4")
+			ss1_v = _num_from(row, "primary_spike_score_v1", "spike_score_v1")
+			pce_v = _num_from(row, "primary_pce_negpref_t098_evidence_signed", "pce_negpref_t098_evidence_signed")
 			return (
 				ss4_v if np.isfinite(ss4_v) else -1.0,
 				ss1_v if np.isfinite(ss1_v) else -1.0,
@@ -171,13 +171,17 @@ def show_hover_map(
 
 		for row in rows:
 			try:
-				peak = int(row.get("peak_index"))
+				row_id: object = row.get("candidate_id") or (
+					int(row.get("peak_index")),
+					int(row.get("start")),
+					int(row.get("end")),
+				)
 			except Exception:
 				continue
-			prev = by_peak.get(peak)
+			prev = by_id.get(row_id)
 			if prev is None or _row_rank(row) > _row_rank(prev):
-				by_peak[peak] = row
-		return [by_peak[k] for k in sorted(by_peak)]
+				by_id[row_id] = row
+		return sorted(by_id.values(), key=lambda r: (int(r.get("peak_index", -1)), int(r.get("start", -1)), int(r.get("end", -1))))
 
 	def _dedupe_contact_parents(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
 		out: List[Dict[str, object]] = []
@@ -224,11 +228,31 @@ def show_hover_map(
 			except Exception:
 				continue
 			contact_parent_by_pixel.setdefault((py, px), []).append(parent)
+			primary_row = {
+				"candidate_id": parent.get("candidate_id"),
+				"parent_id": parent.get("parent_id"),
+				"y": py,
+				"x": px,
+				"peak_index": parent.get("parent_apex"),
+				"start": parent.get("parent_start"),
+				"end": parent.get("parent_end"),
+				"primary_ss4": parent.get("primary_ss4", parent.get("parent_ss4_value")),
+				"primary_ss4_decision": parent.get("primary_ss4_decision"),
+				"primary_ss4_reason": parent.get("primary_ss4_reason", parent.get("parent_ss4_reason")),
+				"primary_ss4_rve_feature": parent.get("primary_ss4_rve_feature", parent.get("parent_edge_feature")),
+				"primary_spike_score_v1": parent.get("primary_spike_score_v1", parent.get("parent_ss1")),
+				"primary_pce_negpref_t098_evidence_signed": parent.get("primary_pce_negpref_t098_evidence_signed", parent.get("parent_pce")),
+				"primary_recdw_sum_0_90_raman_veto_evidence_signed": parent.get("primary_recdw_sum_0_90_raman_veto_evidence_signed", parent.get("parent_edge")),
+			}
+			ss4_metrics_by_pixel.setdefault((py, px), []).append(primary_row)
 			compact_pix = source_to_compact.get((py, px))
 			if compact_pix is not None and compact_pix != (py, px):
 				contact_parent_by_pixel.setdefault(compact_pix, []).append(parent)
+				ss4_metrics_by_pixel.setdefault(compact_pix, []).append(primary_row)
 		for pix, parents in list(contact_parent_by_pixel.items()):
 			contact_parent_by_pixel[pix] = _dedupe_contact_parents(parents)
+		for pix, rows in list(ss4_metrics_by_pixel.items()):
+			ss4_metrics_by_pixel[pix] = _dedupe_ss4_rows(rows)
 	for (sy, sx), vals in list(ss4_metrics_by_pixel.items()):
 		compact_pix = source_to_compact.get((int(sy), int(sx)))
 		if compact_pix is not None and compact_pix != (int(sy), int(sx)):
@@ -731,6 +755,9 @@ def show_hover_map(
 				return True
 		return False
 
+	def _primary_value(row: Dict[str, object], primary_key: str, legacy_key: str) -> object:
+		return row.get(primary_key, row.get(legacy_key))
+
 	def _pixel_ss4_metrics(y: int, x: int) -> List[Dict[str, object]]:
 		return list(ss4_metrics_by_pixel.get((int(y), int(x)), []))
 
@@ -771,7 +798,10 @@ def show_hover_map(
 		if row is None:
 			return False
 		try:
-			return bool(float(row.get("ss4", np.nan)) >= 0.5)
+			decision = str(_primary_value(row, "primary_ss4_decision", "ss4_decision") or "")
+			if decision:
+				return decision == "spike"
+			return bool(float(_primary_value(row, "primary_ss4", "ss4")) >= 0.5)
 		except Exception:
 			return False
 
@@ -1474,14 +1504,32 @@ def show_hover_map(
 							"fontsize": 7.0,
 							"alpha": 0.85,
 						})
-					if bool(metric_checked.get("show_secondary_ss4_labels", False)) and bool(cell.get("secondary_ss4_ran", False)):
+					if (
+							bool(metric_checked.get("show_secondary_ss4_labels", False))
+							and bool(cell.get("secondary_ss4_ran", False))
+							and str(cell.get("secondary_final_source", "")) == "secondary_ss4"
+					):
 						yy = float(np.nanmin(raw_sig[left:right + 1])) if np.any(np.isfinite(raw_sig[left:right + 1])) else float(raw_sig[left])
+						edge_value = cell.get("secondary_recdw_sum_0_90_raman_veto_evidence_signed")
+						edge_label = "edge"
+						try:
+							if not np.isfinite(float(edge_value)):
+								edge_value = cell.get("secondary_rve_value_used_for_ss4", cell.get("secondary_edge_rve_proxy"))
+								edge_label = "edge*"
+						except Exception:
+							edge_value = cell.get("secondary_rve_value_used_for_ss4", cell.get("secondary_edge_rve_proxy"))
+							edge_label = "edge*"
 						guide_specs.append({
 							"metric": "show_secondary_ss4_labels",
 							"kind": "text",
 							"x": float(x_axis[left]),
 							"y": yy,
-							"text": f"secondary\nss1={_fmt_num(cell.get('secondary_ss1'), 2)}\npce={_fmt_num(cell.get('secondary_pce'), 2)}\nedge={_fmt_num(cell.get('secondary_edge'), 2)}",
+							"text": (
+								f"secondary\n"
+								f"ss1={_fmt_num(cell.get('secondary_spike_score_v1', cell.get('secondary_ss1')), 2)}\n"
+								f"pce={_fmt_num(cell.get('secondary_pce_negpref_t098_evidence_signed', cell.get('secondary_pce')), 2)}\n"
+								f"{edge_label}={_fmt_num(edge_value, 2)}"
+							),
 							"color": "#333333",
 							"fontsize": 7.0,
 							"alpha": 0.90,
@@ -1521,7 +1569,11 @@ def show_hover_map(
 					ap = int(np.clip(int(cand.get("peak_index")), 0, N - 1))
 				except Exception:
 					continue
-				is_spike = bool(float(cand.get("ss4", np.nan)) >= 0.5) if cand.get("ss4") is not None else False
+				try:
+					primary_decision = str(_primary_value(cand, "primary_ss4_decision", "ss4_decision") or "")
+					is_spike = primary_decision == "spike" if primary_decision else bool(float(_primary_value(cand, "primary_ss4", "ss4")) >= 0.5)
+				except Exception:
+					is_spike = False
 				color = "#d62728" if is_spike else "#1f77b4"
 				offset_i = int(label_counts_by_peak.get(ap, 0))
 				label_counts_by_peak[ap] = offset_i + 1
@@ -1536,11 +1588,11 @@ def show_hover_map(
 					"x": float(x_axis[ap]),
 					"y": yy,
 					"text": (
-						f"primary i={ap}\nss4={_fmt_num(cand.get('ss4'))}\n"
-						f"ss1={_fmt_num(cand.get('spike_score_v1'))}\n"
-						f"pce={_fmt_num(cand.get('pce_negpref_t098_evidence_signed'))}\n"
-						f"edge={_fmt_num(cand.get('recdw_sum_0_90_raman_veto_evidence_signed'))}\n"
-						f"{cand.get('ss4_reason', '')}"
+						f"primary i={ap}\nss4={_fmt_num(_primary_value(cand, 'primary_ss4', 'ss4'))}\n"
+						f"ss1={_fmt_num(_primary_value(cand, 'primary_spike_score_v1', 'spike_score_v1'))}\n"
+						f"pce={_fmt_num(_primary_value(cand, 'primary_pce_negpref_t098_evidence_signed', 'pce_negpref_t098_evidence_signed'))}\n"
+						f"edge={_fmt_num(_primary_value(cand, 'primary_recdw_sum_0_90_raman_veto_evidence_signed', 'recdw_sum_0_90_raman_veto_evidence_signed'))}\n"
+						f"{_primary_value(cand, 'primary_ss4_reason', 'ss4_reason') or ''}"
 					),
 					"color": color,
 					"fontsize": 7.5,
@@ -2328,15 +2380,16 @@ def show_hover_map(
 		rights: List[int]
 		if need_segment_diagnostics:
 			segs, lefts, rights = _prepare_pixel_segments(y, x, raw_segs)
-			segment_decisions = _classify_prepared_segments(y, x, segs)
+			segment_decisions = []
 		else:
 			segs, lefts, rights = list(raw_segs), [], []
 			segment_decisions = []
 		need_segments = bool(segs)
 		prepared_candidate_count = len(segs) if need_segment_diagnostics else (len(_prepare_pixel_segments(y, x, raw_segs)[0]) if raw_segs else 0)
 
-		if need_spike_overlays and need_segments and lefts and rights:
-			for idx, s in enumerate(segs):
+		if need_spike_overlays and ((need_segments and lefts and rights) or contact_parent_by_pixel.get((int(y), int(x)))):
+			drawn_primary_peaks: set[int] = set()
+			for idx, s in enumerate(segs if (need_segments and lefts and rights) else []):
 				pi = int(np.clip(s.peak_index, 0, len(x_axis) - 1))
 				si = int(np.clip(lefts[idx], 0, len(x_axis) - 1))
 				ei = int(np.clip(rights[idx], 0, len(x_axis) - 1))
@@ -2361,6 +2414,19 @@ def show_hover_map(
 				if spike_overlay_checked['spike_peaks']:
 					lp = ax_spec.axvline(x_peak, linestyle="--", linewidth=1, color=decision_color, alpha=0.9)
 					spike_peak_lines.append(lp)
+					if is_primary_ss4:
+						drawn_primary_peaks.add(int(pi))
+			if spike_overlay_checked['spike_peaks']:
+				for parent in contact_parent_by_pixel.get((int(y), int(x)), []):
+					try:
+						pi = int(np.clip(int(parent.get("parent_apex")), 0, len(x_axis) - 1))
+					except Exception:
+						continue
+					if pi in drawn_primary_peaks:
+						continue
+					lp = ax_spec.axvline(float(x_axis[pi]), linestyle="--", linewidth=1.25, color="#d62728", alpha=0.95)
+					spike_peak_lines.append(lp)
+					drawn_primary_peaks.add(pi)
 
 		has_contact_diag = bool(contact_parent_by_pixel.get((int(y), int(x)), []))
 		has_primary_metrics = bool(ss4_metrics_by_pixel.get((int(y), int(x)), []))
@@ -2454,12 +2520,9 @@ def show_hover_map(
 			else:
 				lead = max(segs, key=lambda sp: float(getattr(sp, "peak_height", 0.0)))
 				lead_idx = int(segs.index(lead))
-				lead_decision = segment_decisions[lead_idx] if lead_idx < len(segment_decisions) else {}
 				metric_info = (
 					f"cand={lead_idx} primary_ss4=not_selected | "
-					f"legacy_v3={lead_decision.get('muon_rule_v3_decision', 'no_muon')} "
-					f"spike_score_v1={_fmt_num(lead_decision.get('spike_score_v1'))} "
-					f"pce_t098={_fmt_num(lead_decision.get('pce_negpref_t098_evidence_signed'))}"
+					"pipeline primary record unavailable"
 				)
 		active_diag = [
 			name for name in (

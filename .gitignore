@@ -17,7 +17,7 @@ Thumbs.db
 *.csv
 elektroferogramy pro vitu/
 plots/
-ss4_histograms
+ss4_histograms/
 
 # IDEs
 .vscode/
@@ -29,6 +29,8 @@ debug.json
 config*
 stats*
 debug2.json
+debugAll.json
+despike_debugAll.json
 ball.json
 configAll.json
 corr_rule_tmp.json
@@ -52,3 +54,8 @@ stats100raw.json
 muon_finder_backup.py
 correlation_hover_gui.py
 pyqt_viewer.py
+
+# debugs
+debug_trace_candidate_mapping.py
+debug_candidate_mapping_y8_x134.csv
+debug_candidate_mapping_y8_x134.json
