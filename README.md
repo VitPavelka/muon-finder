@@ -53,6 +53,13 @@ Per-spike debug fields include shape descriptors computed primarily from morphol
 `top_pixels` and `per_spectrum[*].n_spikes` are now based on the same de-duplicated spike view (`start/end` duplicates merged). 
 `n_spikes_total_raw` is also reported for reference.
 
+Additional anti-false-positive descriptors are available per spike (focused on distinguishing narrow true Raman peaks vs impulsive artifacts):
+- support after core removal: `support_after_core_removal_ratio`, `residual_area_after_core_removal`, `residual_component_count_after_core`
+- curvature support: `curv2_support_width`, `curv2_abs_integral`, `curv2_apex_to_surround_ratio`, `curv2_component_count`
+- multi-scale top-hat: `multiscale_tophat_area_small`, `multiscale_tophat_area_medium`, `multiscale_tophat_area_large`, `multiscale_tophat_decay_ratio`, `multiscale_tophat_persistence`
+- residual/component: `residual_component_count`, `residual_component_spacing`, `gradient_component_count`, `gradient_support_width`
+- optional foot-shape ratios: `foot_width_ratio_left_30_70`, `foot_width_ratio_right_30_70`
+
 You can switch feature extraction signal source for debug report via:
 - `debug_feature_signal_source`: `"gradient"` (default) or  `"raw"`
 - `merge_duplicate_segments`: `true/false` (applies to both debug report and viewer spike overlay merge)
@@ -92,6 +99,10 @@ Many spectra as panels (each panel shows all candidates of one spectrum):
 python debug_explorer.py --report path/to/debug_report.json --mode multi_spectra_panels --param muon_score --x-axis candidate_index
 ```
 
+```bash
+python debug_explorer.py --report path/to/debug_report.json --mode multi_spectra_panels --params rise_slope_z,fall_slope_z,prominence_slope_z --x-axis candidate-index
+```
+
 To chunk panel visualization:
 ```bash
 python debug_explorer.py --report path/to/debug_report.json --mode multi_spectra_panels --param muon_score --max-spectra 25 --start-index 50
@@ -114,6 +125,11 @@ Viewer spike overlays
 - segment edges (`spike_edges`) are dashed green vertical lines
 - segment span (`spike_band`) is a light green background band rendered behind curves
 - all of the above can be toggled via checkboxes in viewer
+- optional overlay `interest_metrics` prints per-spike labels at peak positions for:
+- `pcse` = `peak_curvature_extreme`
+- `mtdr` = `multiscale tophat_decay_ratio`
+- `c2w` = `curv2_support_width`
+- viewer now also supports `gradient_d1` and `gradient_d2` curves (first/second derivative of gradient), `raw_d2` (second derivative of raw), `raw_d3` (third derivative of raw), and the curvature overlays `pcs_d2` and `pcse`, all off by default
 
 ### Correlation helper for labeled candidates
 Prepare labels CSV columns: `y,x,peak_index,is_muon`
@@ -148,6 +164,11 @@ Optional modeling flags:
 - `--mi-bins 10` sets quantile-bin count for mutual information estimate
 - `--plots-dir out/plots --top-k 12` writes ranking plot (`feature_auc_ranking.png`)
 - `--bootstrap-iters 1000 --bootstrap-seed 42` adds bootstrap AUC CI and plot (`feature_auc_bootstrap_ci.png`)
+- `--plots-dir ...` also writes `features_auc_mi_scatter.png` (2D map: AUC vs mutual information)
+- `--interactive-scatter` opens interactive hover scatter with highlighted hovered feature
+- `--plot-features rise_slope_z,fall_slope_z` writes logistic regression curve PNG files for selected features
+- by default weak legacy features are hidden from ranking; use `--include-all-features` to include all numeric features
+- `--plots-dir ...` also writes feature redundancy heatmaps: `feature_corr_pearson.png`, `feature_corr_spearman.png`
 
 `debug_stats.py` now reports for each feature:
 - Pearson and Spearman correlation to `is_muon`
@@ -157,7 +178,70 @@ Optional modeling flags:
 - `mutual_info_bits` (discretized mutual information estimate)
 - `logreg` block with univariate logistic regression coefficients and diagnostics (`auc_logreg`, `mcfadden_r2`, `status`)
 - bootstrap AUC interval fields (`auc_boot_mean`, `auc_boot_ci_lo`, `auc_boot_ci_hi`)
+- `feature_correlation` block with pairwise Pearson/Spearman matrices for naked features
 
 `debug_report` now also includes versioned score:
 - `spike_score_v1` from weighted normalized components
   - `rise_slope_z` (0.36), `gradient_max_z` (0.18), `area_z` (0.10)
+
+### Interactive correlation hover maps (Pearson + Spearman)
+For interactive inspection of feature-feature correlation matrices from `corr.json`:
+
+```bash
+python correlation_hover_gui.py --corr-json corr.json --layout two-panels
+```
+
+Behavior:
+- two panels: Pearson a Spearman side by side
+- axis ticks show metric/feature names on both axes for direct pair comparison
+- hover mouse over any matrix cell to see a tooltip with:
+  - matrix type
+  - row/column feature name + feature `AUC_oriented` (if present in `corr.json`)
+  - correlation coefficient and correlation-strength category
+- tooltip color if strength-coded by `|corr|`:
+  - 0.0-0.2 orthogonal (green)
+  - 0.2-0.4 weak (blue)
+  - 0.4-0.6 medium (orange)
+  - 0.6-0.8 strong (light purple)
+  - 0.8-1.0 redundant (red)
+
+Optional:
+- `--layout single --single-matrix pearson` opens one panel
+- in single mode press `t` to toggle Pearson/Spearman
+- right mouse click on a cell toggles a persistent pinned note (click same cell again to remove)
+- each right-click selection is also printed to console
+- `--zero-emphasis` switches coloring to `1-|corr|` so near-zero correlations are visually strongest
+- `--annotate-diag` draws `1.00` on diagonal (small matrices)
+
+### Interactive metric threshold viewer (no/maybe/ok)
+Inspect one metric directly on raw spectra for coordinates present in `labels.csv`
+
+```bash
+python metric_threshold_viewer.py --input map.wdf --report path/to/debug_report.json --labels-csv labels.csv --metric spike_score_v1 --corr-json corr.json
+```
+
+What it does:
+- loads spectra from `.wdf`/`.npz` for all `(y,x)` present in `labels.csv` (including spectra with zero labeled candidates)
+- classifies each candidate peak by two thresholds of selected metric:
+  - `< low` = `no-muon` (blue)
+  - `low..high` = `maybe-muon` (orange)
+  - `>= high` = `ok-muon` (red)
+- prints thresholds to console
+- overlays colored peak lines + per-peak metric value labels
+- histogram is split by labels (`muon` vs `non-muon`) to show overlap
+- Right/Left arrows (or `n`/`p`) browse spectra
+
+Thresholds:
+- optional manual: `--threshold-low ... --threshold-high ...`
+- if omitted, thresholds are auto-estimated from metric distribution using 1D k-means (`k=3`)
+
+### Interactive spike score tuner GUI
+Tune a weighted test score against labels interactively:
+```bash
+python score_tuner_gui.py --report path/to/debug_report.json --labels-csv labels.csv --features rise_slope_z,fall_slope_z,gradient_max_z,prominence_local_z,area_z
+```
+The GUI shows:
+- ROC curve and weighted-score AUC
+- histogram split by labels (`is_muon`)
+- live Pearson/Spearman/logreg-AUC readout
+- per-feature sliders + numeric boxes (0..slider-max) with normalized internal weights

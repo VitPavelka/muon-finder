@@ -9,32 +9,35 @@ from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
+from candidate_labels import LABEL_CLASS_COLORS, binary_from_label_class, label_class_from_row
 from wdf_io import load_dataset
 
 
-def _load_existing_labels(path: Optional[Path]) -> Dict[Tuple[int, int, int], int]:
+def _load_existing_labels(path: Optional[Path]) -> Dict[Tuple[int, int, int], str]:
 	if path is None or not path.exists():
 		return {}
-	out: Dict[Tuple[int, int, int], int] = {}
+	out: Dict[Tuple[int, int, int], str] = {}
 	with path.open("r", encoding="utf-8", newline="") as f:
 		r = csv.DictReader(f)
 		for row in r:
 			k = (int(row["y"]), int(row["x"]), int(row['peak_index']))
-			out[k] = 1 if int(row['is_muon']) else 0
+			out[k] = label_class_from_row(row)
 	return out
 
 
-def _save_labels(path: Path, rows: List[Dict], selected: Dict[Tuple[int, int, int], bool]) -> None:
+def _save_labels(path: Path, rows: List[Dict], selected: Dict[Tuple[int, int, int], str]) -> None:
 	path.parent.mkdir(parents=True, exist_ok=True)
 	with path.open("w", encoding="utf-8", newline="") as f:
 		w = csv.writer(f)
-		w.writerow(["y", "x", "peak_index", "is_muon"])
+		w.writerow(["y", "x", "peak_index", "is_muon", "label_class", "reviewed", "comment"])
 		for spec in rows:
 			y = int(spec['y'])
 			x = int(spec['x'])
 			for sp in spec.get("spikes", []):
 				p = int(sp['peak_index'])
-				w.writerow([y, x, p, 1 if selected.get((y, x, p), False) else 0])
+				cls = str(selected.get((y, x, p), "unknown")).strip().lower() or "unknown"
+				is_muon = binary_from_label_class(cls)
+				w.writerow([y, x, p, "" if is_muon is None else int(is_muon), cls, 1 if cls != "unknown" else 0, ""])
 
 
 def main() -> None:
@@ -64,10 +67,7 @@ def main() -> None:
 	raw = ds.spectra
 
 	pre = _load_existing_labels(args.existing_labels_csv)
-	selected: Dict[Tuple[int, int, int], bool] = {
-		k: bool(v)
-		for k, v in pre.items()
-	}
+	selected: Dict[Tuple[int, int, int], str] = {k: str(v) for k, v in pre.items()}
 
 	state = {"i": 0}
 	fig, ax = plt.subplots(1, 1, figsize=(11, 5))
@@ -91,21 +91,23 @@ def main() -> None:
 			s = int(sp.get('start', p))
 			e = int(sp.get('end', p))
 			key = (y, x, p)
-			is_on = bool(selected.get(key, False))
-			pcol = "red" if is_on else "#7f7f7f"
-			alpha = 0.95 if is_on else 0.55
+			cls = str(selected.get(key, "unknown")).lower()
+			pcol = LABEL_CLASS_COLORS.get(cls, "#7f7f7f")
+			alpha = 0.95 if cls != "unknown" else 0.55
 			ax.axvline(float(x_axis[p]), linestyle="--", linewidth=1.4, color=pcol, alpha=alpha)
 			if 0 <= s < x_axis.size and 0 <= e < x_axis.size:
 				x0 = min(float(x_axis[s]), float(x_axis[e]))
 				x1 = max(float(x_axis[s]), float(x_axis[e]))
 				ax.axvspan(x0, x1, color="green", alpha=0.07, zorder=0)
 
-		n_sel = sum(
+		n_mu = sum(
 			1 for sp in spikes
-			if selected.get((y, x, int(sp['peak_index'])), False)
+			if selected.get((y, x, int(sp['peak_index'])), "unknown") == "muon"
 		)
+		n_raman = sum(1 for sp in spikes if selected.get((y, x, int(sp['peak_index'])), "unknown") == "raman")
+		n_noise = sum(1 for sp in spikes if selected.get((y, x, int(sp['peak_index'])), "unknown") == "noise")
 		ax.set_title(
-			f"Labeler | idx{i+1}/{len(rows)} | y={y} x={x} | candidates={len(spikes)} | selected_muons={n_sel}",
+			f"Labeler | idx{i+1}/{len(rows)} | y={y} x={x} | candidates={len(spikes)} | muon/raman/noise={n_mu}/{n_raman}/{n_noise}",
 		)
 		ax.set_xlabel("Raman shift/cm$^{-1}$")
 		ax.set_ylabel("Intensity")
@@ -116,7 +118,7 @@ def main() -> None:
 			ax.set_ylim(ylim_prev)
 		fig.canvas.draw_idle()
 
-	def _toggle_nearest(click_x: float) -> None:
+	def _set_nearest(click_x: float, label_class: str, *, toggle: bool = True) -> None:
 		i = int(state['i'])
 		spec = rows[i]
 		y = int(spec['y'])
@@ -132,7 +134,8 @@ def main() -> None:
 			return
 		p = int(spikes[j]['peak_index'])
 		k = (y, x, p)
-		selected[k] = not bool(selected.get(k, False))
+		current = str(selected.get(k, "unknown")).lower()
+		selected[k] = "unknown" if (toggle and current == label_class) else label_class
 		_draw(preserve_view=True)
 
 	def _next() -> None:
@@ -146,17 +149,29 @@ def main() -> None:
 	def on_click(event) -> None:
 		if event.inaxes != ax or event.xdata is None:
 			return
-		_toggle_nearest(float(event.xdata))
+		button = int(getattr(event, "button", 1) or 1)
+		if button == 1:
+			_set_nearest(float(event.xdata), "muon")
+		elif button == 3:
+			_set_nearest(float(event.xdata), "raman")
+		elif button == 2:
+			_set_nearest(float(event.xdata), "noise")
 
 	def on_key(event) -> None:
 		key = (event.key or "").lower()
-		if key in ("n", "right"):
+		if key == "n" and getattr(event, "xdata", None) is not None and event.inaxes == ax:
+			_set_nearest(float(event.xdata), "noise")
+		elif key in ("right",):
 			_next()
 		elif key in ("p", "left"):
 			_prev()
 		elif key == "s":
 			_save_labels(args.out_csv, rows, selected)
 			print(f"Saved labels -> {args.out_csv}")
+		elif key == "u" and getattr(event, "xdata", None) is not None and event.inaxes == ax:
+			_set_nearest(float(event.xdata), "unknown", toggle=False)
+		elif key == "c" and getattr(event, "xdata", None) is not None and event.inaxes == ax:
+			_set_nearest(float(event.xdata), "unknown", toggle=False)
 		elif key == "q":
 			_save_labels(args.out_csv, rows, selected)
 			print(f"Saved labels -> {args.out_csv}")
@@ -166,7 +181,7 @@ def main() -> None:
 	fig.canvas.mpl_connect("key_press_event", on_key)
 	_draw()
 
-	print("Controls: click near a candidate line to toggle label; n/p = next/prev; s = save; q = save+quit")
+	print("Controls: left click=muon, right click=raman, middle click or n over candidate=noise, u/c over candidate=unknown; arrows/p=prev/next; s=save; q=save+quit")
 	plt.show()
 
 

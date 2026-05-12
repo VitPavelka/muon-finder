@@ -45,6 +45,12 @@ def main() -> None:
 	parser.add_argument("--report", type=Path, required=True, help="Path to the debug_report.json")
 	parser.add_argument("--param", type=str, default="muon_score", help="Spike parameter to plot")
 	parser.add_argument(
+		"--params",
+		type=str,
+		default="",
+		help="Comma-separated parameters for multi-line plot (panel mode)."
+	)
+	parser.add_argument(
 		"--x-axis",
 		type=str,
 		default="candidate_index",
@@ -147,22 +153,41 @@ def main() -> None:
 		ax = flat[i]
 		spikes = row.get("spikes", [])
 		if spikes:
-			y_vals = np.array([float(s.get(args.param, np.nan)) for s in spikes], dtype=float)
 			if args.x_axis == "candidate_index":
 				x_vals = np.arange(len(spikes), dtype=float)
 				x_label = "candidate idx"
 			else:
 				x_vals = np.array([float(s.get(args.x_axis, np.nan)) for s in spikes], dtype=float)
 				x_label = args.x_axis
-			_plot_series(
-				ax,
-				x_vals=x_vals,
-				y_vals=y_vals,
-				threshold_value=args.threshold_value,
-				threshold_mode=str(args.threshold_mode),
-			)
+
+			param_list = [t.strip() for t in str(args.params).split(",") if t.strip()]
+			if not param_list:
+				param_list = [str(args.param)]
+			for pi, prm in enumerate(param_list):
+				y_vals = np.array([float(s.get(prm, np.nan)) for s in spikes], dtype=float)
+				# if len(param_list) > 1:
+				# 	m = np.isfinite(y_vals)
+				# 	if np.any(m):
+				# 		lo = float(np.nanmin(y_vals[m]))
+				# 		hi = float(np.nanmax(y_vals[m]))
+				# 		if hi > lo:
+				# 			y_vals = (y_vals - lo) / (hi - lo)
+				# 		else:
+				# 			y_vals = np.zeros_like(y_vals, dtype=float)
+				if len(param_list) == 1:
+					_plot_series(
+						ax,
+						x_vals=x_vals,
+						y_vals=y_vals,
+						threshold_value=args.threshold_value,
+						threshold_mode=str(args.threshold_mode),
+					)
+				else:
+					ax.plot(x_vals, y_vals, marker="o", linestyle="-", markersize=2.5, linewidth=1.0, label=prm)
+			if len(param_list) > 1:
+				ax.legend(loc="best", fontsize=7)
 			ax.set_xlabel(x_label, fontsize=8)
-			ax.set_ylabel(args.param, fontsize=8)
+			ax.set_ylabel("value" if len(param_list) > 1 else args.param, fontsize=8)
 			if args.threshold_value is not None:
 				ax.axhline(
 					float(args.threshold_value),
@@ -180,7 +205,8 @@ def main() -> None:
 		flat[j].axis("off")
 
 	fig.suptitle(
-		f"All spectra panels: {args.param} | shown={n_pan} start={start}", fontsize=12
+		f"All spectra panels: {args.param if not str(args.params).strip() else args.params} | shown={n_pan} start={start}",
+		fontsize=12
 	)
 	# plt.tight_layout()
 	fig.subplots_adjust(left=0.09, right=0.985, bottom=0.09, top=0.92, wspace=0.35, hspace=0.55)

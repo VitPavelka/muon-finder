@@ -15,17 +15,40 @@ Thumbs.db
 *.wdf
 *.npz
 *.csv
+elektroferogramy pro vitu/
+plots/
+ss4_histograms
 
 # IDEs
 .vscode/
 .idea/
 
 # main
-muon_finder.py
-muon_finder_backup.py
 config.json
 debug.json
 config*
-plots/
 stats*
-debug*
+debug2.json
+ball.json
+configAll.json
+corr_rule_tmp.json
+corr_tmp_purity.json
+corrGWStrue.json
+corrT.json
+corr.json
+debugGWStrue.json
+debugNonM.json
+debugRAW.json
+despike_debug.json
+edge.json
+EFconfig.json
+EFdebug.json
+exp.json
+stats100gradient.json
+stats100NonM.json
+stats100raw.json
+
+# unused scripts
+muon_finder_backup.py
+correlation_hover_gui.py
+pyqt_viewer.py

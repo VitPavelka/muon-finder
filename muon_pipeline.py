@@ -66,7 +66,9 @@ def _split_group_into_peak_regions(indices: np.ndarray, signal: np.ndarray) -> L
 	regions: List[Tuple[int, int, int]] = []
 	for i, p in enumerate(peak_idx):
 		left = splits[i]
-		right = splits[i]
+		right = splits[i + 1]
+		if right < left:
+			left, right = right, left
 		regions.append((int(left), int(right), int(p)))
 
 	return regions

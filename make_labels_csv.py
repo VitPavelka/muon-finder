@@ -36,12 +36,12 @@ def main() -> None:
 
 	with args.out_csv.open(mode="w", encoding="utf-8", newline="") as csvfile:
 		w = csv.writer(csvfile)
-		w.writerow(["y", "x", "peak_index", "is_muon"])
+		w.writerow(["y", "x", "peak_index", "is_muon", "label_class", "reviewed", "comment"])
 		for y, x, peak in unique:
-			w.writerow([y, x, peak, ""])
+			w.writerow([y, x, peak, "", "unknown", 0, ""])
 
 	print(f"Wrote {len(unique)} candidate rows to {args.out_csv}")
-	print("Fill the last column (is muon) manually: 1=muon, 0=non-muon")
+	print("Fill is_muon for legacy binary labels or label_class with muon/raman/noise/unknown.")
 
 	
 if __name__ == "__main__":
