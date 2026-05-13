@@ -14,6 +14,7 @@ from candidate_labels import LABEL_CLASS_COLORS, load_binary_labels, load_label_
 from feature_discrimination import GWS_SOURCE_PREFIX_BY_MODE
 from wdf_io import load_dataset
 from muon_decision import annotate_feature_dict_with_muon_rule_v3
+from muon_decision import annotate_feature_dict_with_spike_score_v5
 from muon_decision import get_muon_rule_v3_metric_thresholds
 
 
@@ -250,6 +251,8 @@ def _ensure_metric_available(spike: Optional[Dict[str, object]], metric: str) ->
 		return row
 	if str(metric).startswith("muon_rule_v3_"):
 		row.update(annotate_feature_dict_with_muon_rule_v3(row))
+	if str(metric).startswith("ss5") or str(metric) in {"spike_score_v5"}:
+		row.update(annotate_feature_dict_with_spike_score_v5(row))
 	return row
 
 

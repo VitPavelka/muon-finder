@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Any, Optional, Literal, Sequence
 import numpy as np
 
 from muon_pipeline import SpikeSegment
+from candidate_diagnostics import apply_global_metric_ranks, candidate_segment_id
 from primary_candidate_preparation import prepare_primary_ss4_segments
 from feature_window import expand_interval_to_signal_foot
 from feature_discrimination import (
@@ -57,6 +58,7 @@ from feature_discrimination import (
 from muon_decision import (
 	annotate_feature_dict_with_muon_rule_v3,
 	annotate_feature_dict_with_spike_score_v4,
+	annotate_feature_dict_with_spike_score_v5,
 )
 
 
@@ -78,6 +80,11 @@ def build_debug_report(
 		feature_foot_min_run: int = 2,
 		feature_window_method: Literal["mad_run", "erosion_touch"] = "mad_run",
 		feature_erosion_se_size: int = 5,
+		ss5_ss1_threshold: float = 0.95,
+		ss5_pce_spike_min: float = 0.8,
+		ss5_edge_spike_max: float = -0.4,
+		candidate_prefilter_rows_by_pixel: Optional[Dict[Tuple[int, int], List[Dict[str, object]]]] = None,
+		candidate_prefilter_summary_by_pixel: Optional[Dict[Tuple[int, int], Dict[str, object]]] = None,
 		boundary_minimum_source: Literal["raw", "gradient"] = "gradient",
 		gws_split_overlapping_contexts: bool = GWS_SPLIT_OVERLAPPING_CONTEXTS,
 		gws_split_source: str = GWS_SPLIT_SOURCE,
@@ -107,6 +114,7 @@ def build_debug_report(
 		edge_mapping_max_width_jump_points: int = 8,
 		edge_mapping_fallback_to_old: bool = False,
 		edge_mapping_noise_guard_enabled: bool = False,
+		edge_robust_reference_enabled: bool = True,
 		recdw_evidence_enabled: bool = True,
 		recdw_evidence_metrics: Sequence[str] = ("recdw_sum_0_90",),
 		recdw_z_clip: float = 6.0,
@@ -128,6 +136,9 @@ def build_debug_report(
 		spike_score_v4_pce_red_min: float = 0.4,
 		spike_score_v4_edge_feature: str = "recdw_sum_0_90_raman_veto_evidence_signed",
 		spike_score_v4_edge_red_min: float = -0.1,
+		spike_score_v4_pce_dead_zone_enabled: bool = True,
+		spike_score_v4_pce_dead_zone_low: float = -0.8,
+		spike_score_v4_pce_dead_zone_high: float = -0.2,
 		spike_score_v4_missing_policy: str = "review",
 		ball_context_pad_pts: int = 20,
 		ball_context_min_pad_pts: int = 10,
@@ -232,7 +243,19 @@ def build_debug_report(
 			"recdw_sum_0_90_z",
 			"recdw_sum_0_90_support01",
 			"recdw_sum_0_90_raman_veto_evidence_signed",
+			"ss1_global_rank",
+			"pce_global_rank",
+			"edge_global_rank",
+			"edge_global_spike_rank",
 		}:
+			return True
+		if nm.startswith("candidate_noise_prefilter_"):
+			return True
+		if nm.startswith("candidate_noise_reference_") or nm.startswith("noise_reference_"):
+			return True
+		if name in {"candidate_noise_estimate_used", "noise_height_morph_range"}:
+			return True
+		if nm.startswith("edge_reference_") or name == "edge_robust_reference_enabled":
 			return True
 		if name in {
 			"rucdw_sum_0_90",
@@ -351,6 +374,8 @@ def build_debug_report(
 			for spike in spec.get("spikes", []):
 				if not isinstance(spike, dict):
 					continue
+				if str(spike.get("candidate_noise_prefilter_status", "kept")) == "rejected_noise":
+					continue
 				spike.update(
 					annotate_feature_dict_with_spike_score_v4(
 						spike,
@@ -359,7 +384,19 @@ def build_debug_report(
 						ss_red_min=float(spike_score_v4_ss_red_min),
 						pce_red_min=float(spike_score_v4_pce_red_min),
 						edge_red_min=float(spike_score_v4_edge_red_min),
+						pce_dead_zone_enabled=bool(spike_score_v4_pce_dead_zone_enabled),
+						pce_dead_zone_low=float(spike_score_v4_pce_dead_zone_low),
+						pce_dead_zone_high=float(spike_score_v4_pce_dead_zone_high),
 						missing_policy=str(spike_score_v4_missing_policy),
+					)
+				)
+				spike.update(
+					annotate_feature_dict_with_spike_score_v5(
+						spike,
+						edge_feature=str(spike_score_v4_edge_feature),
+						ss1_threshold=float(ss5_ss1_threshold),
+						pce_spike_min=float(ss5_pce_spike_min),
+						edge_spike_max=float(ss5_edge_spike_max),
 					)
 				)
 
@@ -498,6 +535,7 @@ def build_debug_report(
 			window_override: Optional[Tuple[int, int]] = None,
 			gws_context_info: Optional[Dict[str, object]] = None,
 			gws_context_infos_by_pad: Optional[Dict[int, Dict[str, object]]] = None,
+			prefilter_row: Optional[Dict[str, object]] = None,
 	) -> Dict[str, Any]:
 		out: Dict[str, Any] = {
 			"width_pts": int(max(0, s.end - s.start - 1)),
@@ -506,7 +544,12 @@ def build_debug_report(
 			"end": int(s.end),
 			"peak_height": float(s.peak_height),
 			"area": float(s.area),
+			"candidate_id": candidate_segment_id(s),
 		}
+		if isinstance(prefilter_row, dict):
+			for key, value in prefilter_row.items():
+				if str(key).startswith("candidate_noise_") or str(key) == "candidate_noise_estimate_used":
+					out[str(key)] = value
 		if raw_spectra is not None:
 			out['raw_peak_value'] = float(raw_spectra[int(y), int(x), int(s.peak_index)])
 		top_hat_full = None
@@ -572,6 +615,7 @@ def build_debug_report(
 		bg_med = float(np.median(bg))
 		bg_mad = float(np.median(np.abs(bg - bg_med)))
 		bg_mad = max(bg_mad, 1e-12)
+		out["candidate_noise_estimate_used"] = float(prefilter_row.get("candidate_noise_estimate_used", bg_mad)) if isinstance(prefilter_row, dict) and prefilter_row.get("candidate_noise_estimate_used") is not None else float(bg_mad)
 		out['rise_slope'] = rise_slope
 		out['fall_slope'] = fall_slope
 		out['rise_total_change'] = rise_total_change
@@ -697,6 +741,11 @@ def build_debug_report(
 		e_full = float(np.sum(np.maximum(segment, 0.0)))
 		e_core = float(np.sum(np.maximum(sig_spec[lpk:rpk + 1], 0.0)))
 		out['energy_core_ratio'] = float(e_core / max(e_full, 1e-12))
+		if str(out.get("candidate_noise_prefilter_status", "kept")) == "rejected_noise":
+			out['feature_source'] = src
+			out['feature_window_start'] = int(a)
+			out['feature_window_end'] = int(b)
+			return _filter_export_metrics(out)
 
 		edge_ctx_pad = int(edge_dense_context_pad_pts)
 		if edge_ctx_pad > 0:
@@ -724,8 +773,22 @@ def build_debug_report(
 				mapping_max_width_jump_points=float(edge_mapping_max_width_jump_points),
 				mapping_fallback_to_old=bool(edge_mapping_fallback_to_old),
 				mapping_noise_guard_enabled=bool(edge_mapping_noise_guard_enabled),
+				robust_reference_enabled=bool(edge_robust_reference_enabled),
+				robust_reference_noise=float(out["candidate_noise_estimate_used"]),
 			)
 			_add_edge_width_aliases(out, raw_edge_ctx_metrics, source_prefix="raw_edge_ctx", alias_prefix="recdw")
+			edge_debug = raw_edge_ctx_metrics.get("raw_edge_ctx_debug")
+			if isinstance(edge_debug, dict):
+				for dbg_key in (
+					"edge_robust_reference_enabled",
+					"edge_reference_original",
+					"edge_reference_robust",
+					"edge_reference_delta",
+					"edge_reference_noise_used",
+					"edge_reference_adjusted",
+					"edge_reference_reason",
+				):
+					out[dbg_key] = edge_debug.get(dbg_key)
 		if bool(rucdw_enabled) and raw_spectra is not None:
 			rucdw_metrics = compute_raw_upper_component_dense_width_metrics(
 				raw_full,
@@ -819,6 +882,13 @@ def build_debug_report(
 			"ss4_ss_zone": spike.get("ss4_ss_zone"),
 			"ss4_pce_zone": spike.get("ss4_pce_zone"),
 			"ss4_rve_zone": spike.get("ss4_rve_zone"),
+			"spike_score_v5": spike.get("spike_score_v5", spike.get("ss5")),
+			"ss5": spike.get("ss5"),
+			"ss5_decision": spike.get("ss5_decision"),
+			"ss5_reason": spike.get("ss5_reason"),
+			"ss5_ss1_vote": spike.get("ss5_ss1_vote"),
+			"ss5_pce_vote": spike.get("ss5_pce_vote"),
+			"ss5_edge_vote": spike.get("ss5_edge_vote"),
 			"spike_score_v4_decision": spike.get("spike_score_v4_decision"),
 			"spike_score_v4_reason": spike.get("spike_score_v4_reason"),
 			"spike_score_v4_ss_zone": spike.get("spike_score_v4_ss_zone"),
@@ -928,6 +998,9 @@ def build_debug_report(
 				progress_bar = None
 		for y, x in iter_coords:
 			prepared_segs = list(merged_spikes_by_pixel.get((int(y), int(x)), []))
+			prefilter_rows = list((candidate_prefilter_rows_by_pixel or {}).get((int(y), int(x)), []))
+			prefilter_by_id = {str(row.get("candidate_id")): dict(row) for row in prefilter_rows if isinstance(row, dict)}
+			prefilter_summary = dict((candidate_prefilter_summary_by_pixel or {}).get((int(y), int(x)), {}))
 			spikes = []
 			for idx, s in enumerate(prepared_segs):
 				progress_done += 1
@@ -938,6 +1011,7 @@ def build_debug_report(
 					int(x),
 					s,
 					window_override=(int(s.start), int(s.end)),
+					prefilter_row=prefilter_by_id.get(candidate_segment_id(s)),
 				)
 				if isinstance(row, dict) and row:
 					spikes.append(row)
@@ -963,6 +1037,14 @@ def build_debug_report(
 					"is_candidate": bool(candidate_mask[int(y), int(x)]),
 					"score": float(score_map[int(y), int(x)]),
 					"n_spikes": int(len(spikes)),
+					"n_candidates_before_noise_prefilter": int(prefilter_summary.get("n_candidates_before_noise_prefilter", len(prepared_segs))),
+					"n_candidates_after_noise_prefilter": int(prefilter_summary.get("n_candidates_after_noise_prefilter", len(spikes))),
+					"n_candidates_rejected_by_noise_prefilter": int(prefilter_summary.get("n_candidates_rejected_by_noise_prefilter", 0)),
+					"noise_prefilter_mode_used": prefilter_summary.get("noise_prefilter_mode_used"),
+					"noise_height_morph_range": prefilter_summary.get("noise_height_morph_range"),
+					"noise_reference_n_points": prefilter_summary.get("noise_reference_n_points"),
+					"noise_reference_status": prefilter_summary.get("noise_reference_status"),
+					"noise_reference_method": prefilter_summary.get("noise_reference_method"),
 					"spikes": spikes,
 				}
 			)
@@ -970,7 +1052,28 @@ def build_debug_report(
 			progress_bar.close()
 		_add_recdw_evidence(per_spec)
 		_add_spike_score_v4(per_spec)
+		all_spikes = [spike for spec in per_spec for spike in spec.get("spikes", []) if isinstance(spike, dict)]
+		apply_global_metric_ranks(all_spikes)
 		report['per_spectrum'] = per_spec
+		report["candidate_noise_prefilter_summary"] = {
+			"n_candidates_before_noise_prefilter": int(sum(int(spec.get("n_candidates_before_noise_prefilter", 0)) for spec in per_spec)),
+			"n_candidates_after_noise_prefilter": int(sum(int(spec.get("n_candidates_after_noise_prefilter", 0)) for spec in per_spec)),
+			"n_candidates_rejected_by_noise_prefilter": int(sum(int(spec.get("n_candidates_rejected_by_noise_prefilter", 0)) for spec in per_spec)),
+			"n_spectra_noise_reference_ok": int(sum(1 for spec in per_spec if str(spec.get("noise_reference_status")) == "ok")),
+			"n_spectra_noise_reference_insufficient": int(sum(1 for spec in per_spec if str(spec.get("noise_reference_status")) != "ok")),
+			"noise_height_morph_range_median": float(np.nanmedian(np.asarray([
+				(np.nan if spec.get("noise_height_morph_range") is None else float(spec.get("noise_height_morph_range")))
+				for spec in per_spec
+			], dtype=float))),
+		}
+		report["ss4_pce_dead_zone_summary"] = {
+			"enabled": bool(spike_score_v4_pce_dead_zone_enabled),
+			"n_changed_by_dead_zone": int(sum(1 for sp in all_spikes if str(sp.get("ss4_reason", "")) == "ss_orange_pce_dead_zone_reject")),
+		}
+		report["edge_robust_reference_summary"] = {
+			"enabled": bool(edge_robust_reference_enabled),
+			"n_adjusted": int(sum(1 for sp in all_spikes if bool(sp.get("edge_reference_adjusted", False)))),
+		}
 		if labels_by_candidate is not None:
 			report["muon_rule_v3_summary"] = _build_muon_rule_v3_summary(per_spec)
 

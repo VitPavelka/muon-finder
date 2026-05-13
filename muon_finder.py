@@ -33,8 +33,20 @@ from results_io import save_result_npz, save_spikes_csv, save_viewer_cache
 from debug_report import build_debug_report, save_debug_report_json
 from preprocess import resample_axis_and_spectra
 from feature_discrimination import compute_edge_width_metrics, compute_peak_curvature_features, compute_spike_score_v2_features
-from muon_decision import annotate_feature_dict_with_spike_score_v4, classify_segment_with_muon_rule_v3
+from muon_decision import (
+	annotate_feature_dict_with_spike_score_v4,
+	annotate_feature_dict_with_spike_score_v5,
+	classify_segment_with_muon_rule_v3,
+)
 from primary_candidate_preparation import prepare_primary_ss4_segments
+from candidate_diagnostics import (
+	SmallMorphologyBundle,
+	apply_global_metric_ranks,
+	candidate_segment_id,
+	candidate_segment_key,
+	evaluate_candidate_noise_prefilter,
+	get_or_compute_small_morphology,
+)
 
 DEFAULT_CONFIG: Dict[str, Any] = {
 	"input_path": "",
@@ -78,6 +90,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"feature_foot_min_run": 2,
 	"feature_window_method": "mad_run",  # mad_run | erosion_touch
 	"feature_erosion_se_size": 5,
+	"candidate_noise_prefilter_enabled": True,
+	"candidate_noise_prefilter_mode": "morph_range_chord",
+	"candidate_noise_prefilter_sensitivity": 1.0,
+	"candidate_noise_height_factor": 3.0,
 	"boundary_minimum_source": "gradient",
 	"gws_split_overlapping_contexts": False,
 	"gws_split_source": "gradient",
@@ -115,6 +131,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"edge_mapping_max_width_jump_points": 8,
 	"edge_mapping_fallback_to_old": False,
 	"edge_mapping_noise_guard_enabled": False,
+	"edge_robust_reference_enabled": True,
 	"recdw_evidence_enabled": True,
 	"recdw_evidence_metrics": ["recdw_sum_0_90"],
 	"recdw_z_clip": 6.0,
@@ -140,8 +157,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"ss4_ss_red_min": 0.9999,
 	"ss4_pce_red_min": 0.4,
 	"ss4_rve_feature": "recdw_sum_0_90_raman_veto_evidence_signed",
+	"ss4_pce_dead_zone_enabled": True,
+	"ss4_pce_dead_zone_low": -0.8,
+	"ss4_pce_dead_zone_high": -0.2,
 	"ss4_rve_red_max": -0.1,
 	"ss4_missing_policy": "review",
+	"ss5_ss1_threshold": 0.95,
+	"ss5_pce_spike_min": 0.8,
+	"ss5_edge_spike_max": -0.4,
 	"spike_score_v4_enabled": True,
 	"spike_score_v4_ss_blue_max": 0.95,
 	"spike_score_v4_ss_red_min": 0.9999,
@@ -195,6 +218,10 @@ def load_config(config_path: Optional[Path]) -> Dict[str, Any]:
 	path = Path(config_path)
 	user_cfg = json.loads(path.read_text(encoding="utf-8"))
 	cfg.update(user_cfg)
+	if "debug_feature_report_enabled" not in user_cfg and "debug_report_enabled" in user_cfg:
+		cfg["debug_feature_report_enabled"] = bool(user_cfg["debug_report_enabled"])
+	if "debug_feature_report_path" not in user_cfg and "debug_report_path" in user_cfg:
+		cfg["debug_feature_report_path"] = user_cfg["debug_report_path"]
 	return cfg
 
 
@@ -359,6 +386,64 @@ def _compute_ss4_decision_for_row(
 		edge_red_min=float(rve_red_max),
 		missing_policy=str(missing_policy),
 	)
+
+
+def _compute_ss5_decision_for_row(
+		row: Dict[str, object],
+		*,
+		ss1_threshold: float,
+		pce_spike_min: float,
+		edge_spike_max: float,
+) -> Dict[str, Any]:
+	features = {
+		"spike_score_v1": _metric_float(row, "spike_score_v1"),
+		"pce_negpref_t098_evidence_signed": _metric_float(row, "pce_negpref_t098_evidence_signed"),
+		"recdw_sum_0_90_raman_veto_evidence_signed": _metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed"),
+	}
+	return annotate_feature_dict_with_spike_score_v5(
+		features,
+		edge_feature="recdw_sum_0_90_raman_veto_evidence_signed",
+		ss1_threshold=float(ss1_threshold),
+		pce_spike_min=float(pce_spike_min),
+		edge_spike_max=float(edge_spike_max),
+	)
+
+
+def _summarize_ss4_ss5_overlap(rows_iter: Any) -> Dict[str, int]:
+	rows = [row for row in rows_iter]
+	ss4_spikes = 0
+	ss5_spikes = 0
+	both = 0
+	ss4_only = 0
+	ss5_only = 0
+	neither = 0
+	for row in rows:
+		try:
+			ss4_is = str(row.get("primary_ss4_decision", row.get("ss4_decision", ""))).strip().lower() == "spike"
+		except Exception:
+			ss4_is = False
+		try:
+			ss5_is = str(row.get("primary_ss5_decision", row.get("ss5_decision", ""))).strip().lower() == "spike"
+		except Exception:
+			ss5_is = False
+		ss4_spikes += int(ss4_is)
+		ss5_spikes += int(ss5_is)
+		if ss4_is and ss5_is:
+			both += 1
+		elif ss4_is:
+			ss4_only += 1
+		elif ss5_is:
+			ss5_only += 1
+		else:
+			neither += 1
+	return {
+		"ss4_spikes": int(ss4_spikes),
+		"ss5_spikes": int(ss5_spikes),
+		"accepted_by_both": int(both),
+		"accepted_by_ss4_only": int(ss4_only),
+		"accepted_by_ss5_only": int(ss5_only),
+		"rejected_by_both": int(neither),
+	}
 
 
 def _suggest_threshold_from_histogram(values: np.ndarray, current: float) -> float:
@@ -727,6 +812,10 @@ def run(cfg: Dict[str, Any]) -> None:
 	report: Optional[Dict[str, Any]] = None
 	ss4_selected_metadata: Dict[Tuple[int, int, int, int, int], Dict[str, Any]] = {}
 	ss4_candidate_metrics_by_pixel: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
+	candidate_prefilter_rows_by_pixel: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
+	candidate_prefilter_summary_by_pixel: Dict[Tuple[int, int], Dict[str, object]] = {}
+	primary_profile_overlap_summary: Dict[str, Any] = {}
+	small_morphology_cache: Dict[Tuple[int, int], SmallMorphologyBundle] = {}
 	debug_feature_report_enabled = bool(cfg.get("debug_feature_report_enabled", cfg.get("debug_report_enabled", False)))
 	debug_feature_report_path = cfg.get("debug_feature_report_path", cfg.get("debug_report_path"))
 	despike_debug_lite_enabled = bool(cfg.get("despike_debug_lite_enabled", True))
@@ -818,6 +907,20 @@ def run(cfg: Dict[str, Any]) -> None:
 			"primary_ss4_decision": features.get("ss4_decision"),
 			"primary_ss4_reason": features.get("ss4_reason"),
 			"primary_ss4_rve_feature": features.get("ss4_rve_feature"),
+			"primary_spike_score_v5": features.get("spike_score_v5", features.get("ss5")),
+			"primary_ss5": features.get("ss5"),
+			"primary_ss5_decision": features.get("ss5_decision"),
+			"primary_ss5_reason": features.get("ss5_reason"),
+			"primary_ss5_ss1_vote": features.get("ss5_ss1_vote"),
+			"primary_ss5_pce_vote": features.get("ss5_pce_vote"),
+			"primary_ss5_edge_vote": features.get("ss5_edge_vote"),
+			"primary_ss5_ss1_threshold": features.get("ss5_ss1_threshold"),
+			"primary_ss5_pce_spike_min": features.get("ss5_pce_spike_min"),
+			"primary_ss5_edge_spike_max": features.get("ss5_edge_spike_max"),
+			"primary_active_decision_profile": features.get("primary_active_decision_profile", "ss4"),
+			"primary_active_score": features.get("primary_active_score"),
+			"primary_active_decision": features.get("primary_active_decision"),
+			"primary_active_reason": features.get("primary_active_reason"),
 			# Legacy aliases are kept read-only for older debug/report consumers.
 			"spike_score_v1": features.get("spike_score_v1"),
 			"pce_negpref_t098_evidence_signed": features.get("pce_negpref_t098_evidence_signed"),
@@ -826,15 +929,22 @@ def run(cfg: Dict[str, Any]) -> None:
 			"ss4_decision": features.get("ss4_decision"),
 			"ss4_reason": features.get("ss4_reason"),
 			"ss4_rve_feature": features.get("ss4_rve_feature"),
+			"spike_score_v5": features.get("spike_score_v5", features.get("ss5")),
+			"ss5": features.get("ss5"),
+			"ss5_decision": features.get("ss5_decision"),
+			"ss5_reason": features.get("ss5_reason"),
+			"ss5_ss1_vote": features.get("ss5_ss1_vote"),
+			"ss5_pce_vote": features.get("ss5_pce_vote"),
+			"ss5_edge_vote": features.get("ss5_edge_vote"),
+			"ss5_ss1_threshold": features.get("ss5_ss1_threshold"),
+			"ss5_pce_spike_min": features.get("ss5_pce_spike_min"),
+			"ss5_edge_spike_max": features.get("ss5_edge_spike_max"),
 		}
 
-	def _iter_prepared_spikes_for_ss4() -> List[Tuple[SpikeSegment, SpikeSegment]]:
-		rows: List[Tuple[SpikeSegment, SpikeSegment]] = []
-		for (y, x), segs in spikes_by_pixel.items():
-			prepared = _prepare_decision_segments(int(y), int(x), list(segs))
-			for prepared_seg in prepared:
-				rows.append((prepared_seg, prepared_seg))
-		return rows
+	def _merge_candidate_rows(base: Dict[str, object], extra: Dict[str, object]) -> Dict[str, object]:
+		out = dict(base)
+		out.update(extra)
+		return out
 
 	def _minimal_ss4_base_features(raw_sig: np.ndarray, grad_sig: Optional[np.ndarray], seg: SpikeSegment) -> Dict[str, float]:
 		src = str(cfg.get("debug_feature_signal_source", "gradient")).strip().lower()
@@ -883,8 +993,9 @@ def run(cfg: Dict[str, Any]) -> None:
 		return out
 
 	def _ss4_selected_spikes_fast() -> List[SpikeSegment]:
+		nonlocal primary_profile_overlap_summary
 		t0 = time.time()
-		rows = _iter_prepared_spikes_for_ss4()
+		rows: List[SpikeSegment] = [seg for segs in ss4_input_candidates_by_pixel.values() for seg in segs]
 		print(f"[ss4-fast] computing minimal ss4 features for {len(rows)} candidates")
 		records: List[Dict[str, Any]] = []
 		recdw_population = str(cfg.get("ss4_fast_recdw_population", "needed")).strip().lower()
@@ -899,7 +1010,7 @@ def run(cfg: Dict[str, Any]) -> None:
 			except Exception:
 				progress_bar = None
 		iterable = progress_bar if progress_bar is not None else rows
-		for original, prepared_seg in iterable:
+		for prepared_seg in iterable:
 			yv = int(prepared_seg.y)
 			xv = int(prepared_seg.x)
 			raw_sig = raw[yv, xv, :].astype(float)
@@ -947,9 +1058,33 @@ def run(cfg: Dict[str, Any]) -> None:
 				mapping_max_width_jump_points=float(cfg.get("edge_mapping_max_width_jump_points", 8)),
 				mapping_fallback_to_old=bool(cfg.get("edge_mapping_fallback_to_old", False)),
 				mapping_noise_guard_enabled=bool(cfg.get("edge_mapping_noise_guard_enabled", False)),
+				robust_reference_enabled=bool(cfg.get("edge_robust_reference_enabled", True)),
+				robust_reference_noise=float(
+					next(
+						(
+							float(row.get("candidate_noise_estimate_used"))
+							for row in candidate_prefilter_rows_by_pixel.get((yv, xv), [])
+							if str(row.get("candidate_id")) == candidate_segment_id(prepared_seg)
+							and row.get("candidate_noise_estimate_used") is not None
+						),
+						raw_bg_mad,
+					)
+				),
 			)
 			features["recdw_sum_0_90"] = float(edge_metrics.get("raw_edge_ctx_dense_width_sum_0_90", np.nan))
-			records.append({"original": original, "prepared": prepared_seg, "features": features, "needs_edge": needs_edge})
+			edge_debug = edge_metrics.get("raw_edge_ctx_debug")
+			if isinstance(edge_debug, dict):
+				for dbg_key in (
+					"edge_robust_reference_enabled",
+					"edge_reference_original",
+					"edge_reference_robust",
+					"edge_reference_delta",
+					"edge_reference_noise_used",
+					"edge_reference_adjusted",
+					"edge_reference_reason",
+				):
+					features[dbg_key] = edge_debug.get(dbg_key)
+			records.append({"prepared": prepared_seg, "features": features, "needs_edge": needs_edge})
 		if progress_bar is not None:
 			progress_bar.close()
 		edge_needed_n = int(sum(1 for r in records if bool(r.get("needs_edge", False))))
@@ -983,10 +1118,33 @@ def run(cfg: Dict[str, Any]) -> None:
 					ss_red_min=float(cfg.get("ss4_ss_red_min", cfg.get("spike_score_v4_ss_red_min", 0.9999))),
 					pce_red_min=float(cfg.get("ss4_pce_red_min", cfg.get("spike_score_v4_pce_red_min", 0.4))),
 					edge_red_min=float(cfg.get("ss4_rve_red_max", cfg.get("spike_score_v4_edge_red_min", -0.1))),
+					pce_dead_zone_enabled=bool(cfg.get("ss4_pce_dead_zone_enabled", True)),
+					pce_dead_zone_low=float(cfg.get("ss4_pce_dead_zone_low", -0.8)),
+					pce_dead_zone_high=float(cfg.get("ss4_pce_dead_zone_high", -0.2)),
 					missing_policy=str(cfg.get("ss4_missing_policy", cfg.get("spike_score_v4_missing_policy", "review"))),
 				)
 			)
-			v = float(features.get("ss4", np.nan))
+			features.update(
+				annotate_feature_dict_with_spike_score_v5(
+					features,
+					edge_feature=str(cfg.get("ss4_rve_feature", cfg.get("spike_score_v4_edge_feature", "recdw_sum_0_90_raman_veto_evidence_signed"))),
+					ss1_threshold=float(cfg.get("ss5_ss1_threshold", 0.95)),
+					pce_spike_min=float(cfg.get("ss5_pce_spike_min", 0.8)),
+					edge_spike_max=float(cfg.get("ss5_edge_spike_max", -0.4)),
+				)
+			)
+			active_profile = "ss5" if str(decision_profile).strip().lower() == "ss5" else "ss4"
+			if active_profile == "ss5":
+				features["primary_active_decision_profile"] = "ss5"
+				features["primary_active_score"] = features.get("ss5")
+				features["primary_active_decision"] = features.get("ss5_decision")
+				features["primary_active_reason"] = features.get("ss5_reason")
+			else:
+				features["primary_active_decision_profile"] = "ss4"
+				features["primary_active_score"] = features.get("ss4")
+				features["primary_active_decision"] = features.get("ss4_decision")
+				features["primary_active_reason"] = features.get("ss4_reason")
+			v = float(features.get("primary_active_score", np.nan))
 			prepared_seg = rec["prepared"]
 			primary_record = _primary_ss4_record(
 				int(prepared_seg.y),
@@ -996,7 +1154,15 @@ def run(cfg: Dict[str, Any]) -> None:
 				int(prepared_seg.end),
 				features,
 			)
-			ss4_candidate_metrics_by_pixel.setdefault((int(prepared_seg.y), int(prepared_seg.x)), []).append(primary_record)
+			existing_rows = ss4_candidate_metrics_by_pixel.setdefault((int(prepared_seg.y), int(prepared_seg.x)), [])
+			merged = False
+			for idx, row in enumerate(existing_rows):
+				if str(row.get("candidate_id")) == primary_record["candidate_id"]:
+					existing_rows[idx] = _merge_candidate_rows(row, primary_record)
+					merged = True
+					break
+			if not merged:
+				existing_rows.append(primary_record)
 			if not np.isfinite(v):
 				missing += 1
 				continue
@@ -1004,9 +1170,40 @@ def run(cfg: Dict[str, Any]) -> None:
 				key = (int(prepared_seg.y), int(prepared_seg.x), int(prepared_seg.peak_index), int(prepared_seg.start), int(prepared_seg.end))
 				ss4_selected_metadata[key] = dict(primary_record)
 				selected.append(prepared_seg)
+		apply_global_metric_ranks(row for rows in ss4_candidate_metrics_by_pixel.values() for row in rows)
+		primary_profile_overlap_summary = _summarize_ss4_ss5_overlap(
+			row for rows in ss4_candidate_metrics_by_pixel.values() for row in rows
+		)
+		print(
+			"[primary-compare] "
+			f"ss4={primary_profile_overlap_summary.get('ss4_spikes', 0)} "
+			f"ss5={primary_profile_overlap_summary.get('ss5_spikes', 0)} "
+			f"both={primary_profile_overlap_summary.get('accepted_by_both', 0)} "
+			f"ss4_only={primary_profile_overlap_summary.get('accepted_by_ss4_only', 0)} "
+			f"ss5_only={primary_profile_overlap_summary.get('accepted_by_ss5_only', 0)} "
+			f"neither={primary_profile_overlap_summary.get('rejected_by_both', 0)}"
+		)
+		accepted_rows = [
+			row
+			for rows in ss4_candidate_metrics_by_pixel.values()
+			for row in rows
+			if str(row.get("primary_active_decision", row.get("primary_ss4_decision", row.get("ss4_decision", "")))).strip().lower() == "spike"
+		]
+		accepted_with_noise_ratio = 0
+		for row in accepted_rows:
+			try:
+				ratio_v = float(row.get("candidate_noise_height_ratio", np.nan))
+			except Exception:
+				ratio_v = float("nan")
+			if np.isfinite(ratio_v):
+				accepted_with_noise_ratio += 1
+		print(
+			f"[candidate-noise] accepted spikes with valid height ratio: "
+			f"{accepted_with_noise_ratio}/{len(accepted_rows)}"
+		)
 		_save_ss4_primary_histograms(records)
 		print(
-			f"[ss4-fast] selected {len(selected)} accepted spike candidates "
+			f"[{str(decision_profile).strip().lower()}-fast] selected {len(selected)} accepted spike candidates "
 			f"({missing} missing) in {time.time() - t0:.2f} seconds"
 		)
 		return selected
@@ -1015,7 +1212,7 @@ def run(cfg: Dict[str, Any]) -> None:
 		return build_debug_report(
 			score_map=score_map,
 			candidate_mask=candidate_mask,
-			spikes_by_pixel=spikes_by_pixel,
+			spikes_by_pixel=prepared_candidates_by_pixel,
 			threshold=float(thr),
 			target_coords=target_coords,
 			include_per_spectrum=bool(cfg['debug_include_per_spectrum']) if include_per_spectrum is None else bool(include_per_spectrum),
@@ -1030,6 +1227,11 @@ def run(cfg: Dict[str, Any]) -> None:
 			feature_foot_min_run=int(cfg.get("feature_foot_min_run", 2)),
 			feature_window_method=cfg.get("feature_window_method", "mad_run"),
 			feature_erosion_se_size=int(cfg.get("feature_erosion_se_size", 5)),
+			ss5_ss1_threshold=float(cfg.get("ss5_ss1_threshold", 0.95)),
+			ss5_pce_spike_min=float(cfg.get("ss5_pce_spike_min", 0.8)),
+			ss5_edge_spike_max=float(cfg.get("ss5_edge_spike_max", -0.4)),
+			candidate_prefilter_rows_by_pixel=candidate_prefilter_rows_by_pixel,
+			candidate_prefilter_summary_by_pixel=candidate_prefilter_summary_by_pixel,
 			boundary_minimum_source=cfg.get("boundary_minimum_source", "gradient"),
 			gws_split_overlapping_contexts=bool(cfg.get("gws_split_overlapping_contexts", False)),
 			gws_split_source=str(cfg.get("gws_split_source", "gradient")),
@@ -1059,6 +1261,7 @@ def run(cfg: Dict[str, Any]) -> None:
 			edge_mapping_max_width_jump_points=int(cfg.get("edge_mapping_max_width_jump_points", 8)),
 			edge_mapping_fallback_to_old=bool(cfg.get("edge_mapping_fallback_to_old", False)),
 			edge_mapping_noise_guard_enabled=bool(cfg.get("edge_mapping_noise_guard_enabled", False)),
+			edge_robust_reference_enabled=bool(cfg.get("edge_robust_reference_enabled", True)),
 			edge_enhanced_in_debug_report=bool(cfg.get("edge_enhanced_in_debug_report", True)),
 			recdw_evidence_enabled=bool(cfg.get("recdw_evidence_enabled", True)),
 			recdw_evidence_metrics=tuple(str(v) for v in cfg.get("recdw_evidence_metrics", ["recdw_sum_0_90"])),
@@ -1081,6 +1284,9 @@ def run(cfg: Dict[str, Any]) -> None:
 			spike_score_v4_pce_red_min=float(cfg.get("ss4_pce_red_min", cfg.get("spike_score_v4_pce_red_min", 0.4))),
 			spike_score_v4_edge_feature=str(cfg.get("ss4_rve_feature", cfg.get("spike_score_v4_edge_feature", "recdw_sum_0_90_raman_veto_evidence_signed"))),
 			spike_score_v4_edge_red_min=float(cfg.get("ss4_rve_red_max", cfg.get("spike_score_v4_edge_red_min", -0.1))),
+			spike_score_v4_pce_dead_zone_enabled=bool(cfg.get("ss4_pce_dead_zone_enabled", True)),
+			spike_score_v4_pce_dead_zone_low=float(cfg.get("ss4_pce_dead_zone_low", -0.8)),
+			spike_score_v4_pce_dead_zone_high=float(cfg.get("ss4_pce_dead_zone_high", -0.2)),
 			spike_score_v4_missing_policy=str(cfg.get("ss4_missing_policy", cfg.get("spike_score_v4_missing_policy", "review"))),
 			merge_max_width_pts=int(cfg.get("max_width_pts", 20)),
 			labels_by_candidate=labels_by_candidate,
@@ -1114,13 +1320,97 @@ def run(cfg: Dict[str, Any]) -> None:
 			merge_max_width_pts=int(cfg.get("max_width_pts", 20)),
 		)
 
+	prepared_candidates_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]] = {}
+	for (y, x), segs in spikes_by_pixel.items():
+		prepared = _prepare_decision_segments(int(y), int(x), list(segs))
+		if prepared:
+			prepared_candidates_by_pixel[(int(y), int(x))] = prepared
+
+	ss4_input_candidates_by_pixel: Dict[Tuple[int, int], List[SpikeSegment]] = {}
+	n_prefilter_before = 0
+	n_prefilter_after = 0
+	n_prefilter_rejected = 0
+	n_prefilter_ratio_kept_mismatch = 0
+	n_prefilter_ratio_rejected_mismatch = 0
+	n_prefilter_not_evaluated = 0
+	for (y, x), segs in prepared_candidates_by_pixel.items():
+		raw_sig = raw[int(y), int(x), :].astype(float)
+		small_morph = get_or_compute_small_morphology(
+			cache=small_morphology_cache,
+			raw_spectra=raw,
+			y=int(y),
+			x=int(x),
+			window_size=3,
+		)
+		rows, summary = evaluate_candidate_noise_prefilter(
+			y=int(y),
+			x=int(x),
+			segs=segs,
+			raw_signal=raw_sig,
+			small_morphology=small_morph,
+			enabled=bool(cfg.get("candidate_noise_prefilter_enabled", True)),
+			mode=str(cfg.get("candidate_noise_prefilter_mode", "morph_range_chord")),
+			height_factor=float(cfg.get("candidate_noise_height_factor", cfg.get("candidate_noise_prefilter_sensitivity", 3.0))),
+		)
+		if rows:
+			candidate_prefilter_rows_by_pixel[(int(y), int(x))] = [dict(row) for row in rows]
+			ss4_candidate_metrics_by_pixel[(int(y), int(x))] = [dict(row) for row in rows]
+		for row in rows:
+			status = str(row.get("candidate_noise_prefilter_status", "not_evaluated") or "not_evaluated")
+			try:
+				ratio_v = float(row.get("candidate_noise_height_ratio", np.nan))
+			except Exception:
+				ratio_v = float("nan")
+			try:
+				factor_v = float(row.get("candidate_noise_height_factor", np.nan))
+			except Exception:
+				factor_v = float("nan")
+			if status == "not_evaluated":
+				n_prefilter_not_evaluated += 1
+			elif np.isfinite(ratio_v) and np.isfinite(factor_v):
+				if ratio_v < factor_v and status == "kept":
+					n_prefilter_ratio_kept_mismatch += 1
+				elif ratio_v >= factor_v and status == "rejected_noise":
+					n_prefilter_ratio_rejected_mismatch += 1
+		candidate_prefilter_summary_by_pixel[(int(y), int(x))] = dict(summary)
+		kept: List[SpikeSegment] = []
+		row_by_id = {str(row.get("candidate_id")): row for row in rows}
+		for seg in segs:
+			row = row_by_id.get(candidate_segment_id(seg))
+			if row is None:
+				kept.append(seg)
+				continue
+			if str(row.get("candidate_noise_prefilter_status", "kept")) != "rejected_noise":
+				kept.append(seg)
+		if kept:
+			ss4_input_candidates_by_pixel[(int(y), int(x))] = kept
+		n_prefilter_before += int(summary.get("n_candidates_before_noise_prefilter", 0))
+		n_prefilter_after += int(summary.get("n_candidates_after_noise_prefilter", 0))
+		n_prefilter_rejected += int(summary.get("n_candidates_rejected_by_noise_prefilter", 0))
+	if n_prefilter_before:
+		sufficient_specs = int(sum(1 for s in candidate_prefilter_summary_by_pixel.values() if str(s.get("noise_reference_status")) == "ok"))
+		insufficient_specs = int(sum(1 for s in candidate_prefilter_summary_by_pixel.values() if str(s.get("noise_reference_status")) != "ok"))
+		noise_vals = np.asarray([float(s.get("noise_height_morph_range", np.nan)) for s in candidate_prefilter_summary_by_pixel.values()], dtype=float)
+		noise_vals = noise_vals[np.isfinite(noise_vals)]
+		print(
+			f"[candidate-noise] kept {n_prefilter_after}/{n_prefilter_before} prepared candidates "
+			f"({n_prefilter_rejected} rejected as noise) | "
+			f"spectra noise-ref ok={sufficient_specs} insufficient={insufficient_specs} | "
+			f"median morph-range noise={float(np.median(noise_vals)) if noise_vals.size else float('nan'):.4g}"
+		)
+		print(
+			f"[candidate-noise] ratio/status mismatches kept_below_factor={n_prefilter_ratio_kept_mismatch} "
+			f"rejected_at_or_above_factor={n_prefilter_ratio_rejected_mismatch} "
+			f"not_evaluated={n_prefilter_not_evaluated}"
+		)
+
 	decision_profile = str(cfg.get("decision_profile", "muon_rule_v3")).strip().lower()
 	if decision_profile == "legacy_v3":
 		decision_profile = "muon_rule_v3"
-	if decision_profile not in {"muon_rule_v3", "ss4"}:
+	if decision_profile not in {"muon_rule_v3", "ss4", "ss5"}:
 		raise ValueError(f"Unsupported decision_profile: {decision_profile!r}")
 	decision_action = str(cfg.get("despike_decision_action", "auto_only" if decision_profile == "muon_rule_v3" else "spike_only")).strip().lower()
-	if decision_profile == "ss4" and decision_action == "auto_only":
+	if decision_profile in {"ss4", "ss5"} and decision_action == "auto_only":
 		decision_action = "spike_only"
 	if decision_action not in {"auto_only", "auto_and_maybe", "none", "spike_only", "spike_and_review"}:
 		raise ValueError(f"Unsupported despike_decision_action: {decision_action!r}")
@@ -1142,6 +1432,7 @@ def run(cfg: Dict[str, Any]) -> None:
 
 	def _ss4_selected_spikes() -> List[SpikeSegment]:
 		nonlocal report
+		nonlocal primary_profile_overlap_summary
 		if bool(cfg.get("ss4_fast_selection", True)):
 			return _ss4_selected_spikes_fast()
 		if report is None:
@@ -1162,7 +1453,7 @@ def run(cfg: Dict[str, Any]) -> None:
 				peak = int(sp.get("peak_index", -1))
 				start = int(sp.get("start", sp.get("feature_window_start", -1)))
 				end = int(sp.get("end", sp.get("feature_window_end", -1)))
-				ss4_candidate_metrics_by_pixel.setdefault((yv, xv), []).append({
+				record = {
 					"candidate_id": _primary_candidate_id(yv, xv, peak, start, end),
 					"parent_id": _primary_candidate_id(yv, xv, peak, start, end),
 					"y": yv,
@@ -1174,6 +1465,10 @@ def run(cfg: Dict[str, Any]) -> None:
 					"primary_ss4_reason": sp.get("ss4_reason"),
 					"primary_ss4_decision": sp.get("ss4_decision"),
 					"primary_ss4_rve_feature": sp.get("ss4_rve_feature"),
+					"primary_spike_score_v5": sp.get("spike_score_v5", sp.get("ss5")),
+					"primary_ss5": sp.get("ss5"),
+					"primary_ss5_decision": sp.get("ss5_decision"),
+					"primary_ss5_reason": sp.get("ss5_reason"),
 					"primary_spike_score_v1": sp.get("spike_score_v1"),
 					"primary_pce_negpref_t098_evidence_signed": sp.get("pce_negpref_t098_evidence_signed"),
 					"primary_recdw_sum_0_90_raman_veto_evidence_signed": sp.get("recdw_sum_0_90_raman_veto_evidence_signed"),
@@ -1181,11 +1476,28 @@ def run(cfg: Dict[str, Any]) -> None:
 					"ss4_reason": sp.get("ss4_reason"),
 					"ss4_decision": sp.get("ss4_decision"),
 					"ss4_rve_feature": sp.get("ss4_rve_feature"),
+					"spike_score_v5": sp.get("spike_score_v5", sp.get("ss5")),
+					"ss5": sp.get("ss5"),
+					"ss5_decision": sp.get("ss5_decision"),
+					"ss5_reason": sp.get("ss5_reason"),
 					"spike_score_v1": sp.get("spike_score_v1"),
 					"pce_negpref_t098_evidence_signed": sp.get("pce_negpref_t098_evidence_signed"),
 					"recdw_sum_0_90_raman_veto_evidence_signed": sp.get("recdw_sum_0_90_raman_veto_evidence_signed"),
-				})
-				decision_value = sp.get(str(cfg.get("despike_decision_feature", "ss4")), sp.get("ss4"))
+					"primary_active_decision_profile": "ss5" if decision_profile == "ss5" else "ss4",
+					"primary_active_score": sp.get("ss5") if decision_profile == "ss5" else sp.get("ss4"),
+					"primary_active_decision": sp.get("ss5_decision") if decision_profile == "ss5" else sp.get("ss4_decision"),
+					"primary_active_reason": sp.get("ss5_reason") if decision_profile == "ss5" else sp.get("ss4_reason"),
+				}
+				existing_rows = ss4_candidate_metrics_by_pixel.setdefault((yv, xv), [])
+				merged = False
+				for idx, row in enumerate(existing_rows):
+					if str(row.get("candidate_id")) == record["candidate_id"]:
+						existing_rows[idx] = _merge_candidate_rows(row, record)
+						merged = True
+						break
+				if not merged:
+					existing_rows.append(record)
+				decision_value = sp.get("ss5") if decision_profile == "ss5" else sp.get(str(cfg.get("despike_decision_feature", "ss4")), sp.get("ss4"))
 				try:
 					v = float(decision_value)
 				except Exception:
@@ -1202,6 +1514,10 @@ def run(cfg: Dict[str, Any]) -> None:
 						"primary_ss4_reason": sp.get("ss4_reason"),
 						"primary_ss4_decision": sp.get("ss4_decision"),
 						"primary_ss4_rve_feature": sp.get("ss4_rve_feature"),
+						"primary_spike_score_v5": sp.get("spike_score_v5", sp.get("ss5")),
+						"primary_ss5": sp.get("ss5"),
+						"primary_ss5_reason": sp.get("ss5_reason"),
+						"primary_ss5_decision": sp.get("ss5_decision"),
 						"primary_spike_score_v1": sp.get("spike_score_v1"),
 						"primary_pce_negpref_t098_evidence_signed": sp.get("pce_negpref_t098_evidence_signed"),
 						"primary_recdw_sum_0_90_raman_veto_evidence_signed": sp.get("recdw_sum_0_90_raman_veto_evidence_signed"),
@@ -1209,6 +1525,14 @@ def run(cfg: Dict[str, Any]) -> None:
 						"ss4_reason": sp.get("ss4_reason"),
 						"ss4_decision": sp.get("ss4_decision"),
 						"ss4_rve_feature": sp.get("ss4_rve_feature"),
+						"spike_score_v5": sp.get("spike_score_v5", sp.get("ss5")),
+						"ss5": sp.get("ss5"),
+						"ss5_reason": sp.get("ss5_reason"),
+						"ss5_decision": sp.get("ss5_decision"),
+						"primary_active_decision_profile": "ss5" if decision_profile == "ss5" else "ss4",
+						"primary_active_score": sp.get("ss5") if decision_profile == "ss5" else float(v),
+						"primary_active_decision": sp.get("ss5_decision") if decision_profile == "ss5" else sp.get("ss4_decision"),
+						"primary_active_reason": sp.get("ss5_reason") if decision_profile == "ss5" else sp.get("ss4_reason"),
 						"spike_score_v1": sp.get("spike_score_v1"),
 						"pce_negpref_t098_evidence_signed": sp.get("pce_negpref_t098_evidence_signed"),
 						"recdw_sum_0_90_raman_veto_evidence_signed": sp.get("recdw_sum_0_90_raman_veto_evidence_signed"),
@@ -1224,15 +1548,28 @@ def run(cfg: Dict[str, Any]) -> None:
 							area=float(sp.get("area", 0.0)),
 						)
 					)
+		apply_global_metric_ranks(row for rows in ss4_candidate_metrics_by_pixel.values() for row in rows)
+		primary_profile_overlap_summary = _summarize_ss4_ss5_overlap(
+			row for rows in ss4_candidate_metrics_by_pixel.values() for row in rows
+		)
 		if missing:
 			print(f"[despike:ss4] skipped {missing} candidates with missing/non-finite ss4 decision value")
-		print(f"[despike:ss4] selected {len(selected)} accepted spike candidates")
+		print(
+			"[primary-compare] "
+			f"ss4={primary_profile_overlap_summary.get('ss4_spikes', 0)} "
+			f"ss5={primary_profile_overlap_summary.get('ss5_spikes', 0)} "
+			f"both={primary_profile_overlap_summary.get('accepted_by_both', 0)} "
+			f"ss4_only={primary_profile_overlap_summary.get('accepted_by_ss4_only', 0)} "
+			f"ss5_only={primary_profile_overlap_summary.get('accepted_by_ss5_only', 0)} "
+			f"neither={primary_profile_overlap_summary.get('rejected_by_both', 0)}"
+		)
+		print(f"[despike:{decision_profile}] selected {len(selected)} accepted spike candidates")
 		return selected
 
 	contact_parent_spikes: List[SpikeSegment] = []
 	despike_contact_analysis: Optional[Dict[str, Any]] = None
 	if bool(cfg.get("despike_contact_analysis_enabled", True)):
-		if decision_profile == "ss4":
+		if decision_profile in {"ss4", "ss5"}:
 			contact_parent_spikes = _ss4_selected_spikes() if decision_action in {"spike_only", "spike_and_review"} else []
 		else:
 			contact_parent_spikes = [
@@ -1245,6 +1582,7 @@ def run(cfg: Dict[str, Any]) -> None:
 			erosion=overlays["erosion"],
 			dilation=overlays["dilation"],
 			gradient=overlays.get("gradient"),
+			small_morphology_by_pixel=small_morphology_cache,
 			parents=contact_parent_spikes,
 			parent_metadata=ss4_selected_metadata,
 			context_pad_pts=int(cfg.get("despike_contact_context_pad_pts", 4)),
@@ -1258,6 +1596,7 @@ def run(cfg: Dict[str, Any]) -> None:
 			ss4_rve_red_max=float(cfg.get("ss4_rve_red_max", cfg.get("spike_score_v4_edge_red_min", -0.1))),
 			ss4_missing_policy=str(cfg.get("ss4_missing_policy", cfg.get("spike_score_v4_missing_policy", "review"))),
 			secondary_edge_rescue_ss_min=float(cfg.get("secondary_edge_rescue_ss_min", 0.85)),
+			candidate_noise_height_factor=float(cfg.get("candidate_noise_height_factor", cfg.get("candidate_noise_prefilter_sensitivity", 3.0))),
 		)
 		corrected = apply_contact_cell_despike_chords(raw, despike_contact_analysis)
 		if report is not None:
@@ -1275,7 +1614,7 @@ def run(cfg: Dict[str, Any]) -> None:
 	if bool(cfg['despike_enabled']) and despike_contact_analysis is None:
 		if decision_action == "none":
 			despike_spikes: List[SpikeSegment] = []
-		elif decision_profile == "ss4":
+		elif decision_profile in {"ss4", "ss5"}:
 			despike_spikes = list(contact_parent_spikes) if contact_parent_spikes else (_ss4_selected_spikes() if decision_action in {"spike_only", "spike_and_review"} else [])
 		elif decision_action == "auto_and_maybe":
 			despike_spikes = [
@@ -1343,6 +1682,7 @@ def run(cfg: Dict[str, Any]) -> None:
 				"diagnostics_count": int(len(despike_diagnostics)),
 				"applied_count": int(sum(1 for d in despike_diagnostics if not str(d.get("skipped_reason", "")).strip())),
 				"fallback_count": int(sum(1 for d in despike_diagnostics if bool(d.get("fallback_used", False)))),
+				"primary_profile_comparison": dict(primary_profile_overlap_summary),
 			}
 
 	despike = time.time()
@@ -1354,7 +1694,7 @@ def run(cfg: Dict[str, Any]) -> None:
 	view_score = score_map
 	view_mask = candidate_mask
 	view_overlays = overlays
-	view_spikes_by_pixel = spikes_by_pixel
+	view_spikes_by_pixel = prepared_candidates_by_pixel
 	source_coords_map = None
 	has_corrected = bool(cfg['despike_enabled']) or despike_contact_analysis is not None
 	view_corrected = corrected if has_corrected else None

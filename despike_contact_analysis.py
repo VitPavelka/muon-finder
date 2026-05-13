@@ -264,6 +264,27 @@ def _line_between(raw: np.ndarray, left: int, right: int) -> np.ndarray:
 	return np.linspace(float(raw[left]), float(raw[right]), int(right - left + 1))
 
 
+def _chord_y_at_index(raw: np.ndarray, left: int, right: int, apex: int) -> float:
+	if right <= left:
+		return float("nan")
+	t = float((int(apex) - int(left)) / max(int(right) - int(left), 1))
+	return float((1.0 - t) * float(raw[int(left)]) + t * float(raw[int(right)]))
+
+
+def _cell_height_above_chord(raw: np.ndarray, left: int, right: int, apex: int) -> Tuple[float, float]:
+	chord_y = _chord_y_at_index(raw, left, right, apex)
+	if not np.isfinite(chord_y):
+		return float("nan"), float("nan")
+	return float(raw[int(apex)] - chord_y), float(chord_y)
+
+
+def _has_only_trivial_binary_norm(values: List[float]) -> bool:
+	finite = sorted(set(float(v) for v in values if np.isfinite(v)))
+	if not finite:
+		return False
+	return all(any(abs(v - ref) <= 1e-9 for ref in (0.0, 1.0)) for v in finite)
+
+
 def _chord_stats(raw: np.ndarray, left: int, right: int, chord: np.ndarray, eps: float) -> Dict[str, Any]:
 	seg = np.asarray(raw[left:right + 1], dtype=float)
 	overshoot = np.asarray(chord, dtype=float) - seg
@@ -433,6 +454,7 @@ def analyze_erosion_dilation_contact_cells(
 		erosion: np.ndarray,
 		dilation: np.ndarray,
 		gradient: Optional[np.ndarray] = None,
+		small_morphology_by_pixel: Optional[Mapping[Tuple[int, int], Any]] = None,
 		parents: Iterable[SpikeSegment],
 		parent_metadata: Optional[Mapping[Tuple[int, int, int, int, int], Mapping[str, Any]]] = None,
 		context_pad_pts: int = 4,
@@ -446,6 +468,7 @@ def analyze_erosion_dilation_contact_cells(
 		ss4_rve_red_max: float = -0.1,
 		ss4_missing_policy: str = "review",
 		secondary_edge_rescue_ss_min: float = 0.85,
+		candidate_noise_height_factor: float = 3.0,
 ) -> Dict[str, Any]:
 	"""Build diagnostic erosion-contact cells for already accepted parent spikes."""
 	parent_metadata = parent_metadata or {}
@@ -459,8 +482,13 @@ def analyze_erosion_dilation_contact_cells(
 		if not (0 <= y < h and 0 <= x < w):
 			continue
 		raw = raw_spectra[y, x, :].astype(float)
-		ero = erosion[y, x, :].astype(float)
-		dil = dilation[y, x, :].astype(float)
+		bundle = None if small_morphology_by_pixel is None else small_morphology_by_pixel.get((int(y), int(x)))
+		if bundle is not None and hasattr(bundle, "erosion") and hasattr(bundle, "dilation"):
+			ero = np.asarray(bundle.erosion, dtype=float)
+			dil = np.asarray(bundle.dilation, dtype=float)
+		else:
+			ero = erosion[y, x, :].astype(float)
+			dil = dilation[y, x, :].astype(float)
 		grad = gradient[y, x, :].astype(float) if gradient is not None and np.asarray(gradient).shape == raw_spectra.shape else None
 		start = int(np.clip(parent.start, 0, n - 1))
 		end = int(np.clip(parent.end, 0, n - 1))
@@ -468,17 +496,51 @@ def analyze_erosion_dilation_contact_cells(
 		if start > end:
 			start, end = end, start
 		parent_id = f"primary:{int(y)}:{int(x)}:{int(apex)}:{int(start)}:{int(end)}"
-		cl = max(0, start - pad)
-		cr = min(n - 1, end + pad)
+		key = (y, x, apex, start, end)
+		meta = dict(parent_metadata.get(key, {}))
+		cl0 = max(0, start - pad)
+		cr0 = min(n - 1, end + pad)
+		all_erosion_contacts = None
+		all_dilation_contacts = None
+		if bundle is not None and hasattr(bundle, "erosion_contacts") and hasattr(bundle, "dilation_contacts"):
+			all_erosion_contacts = np.asarray(bundle.erosion_contacts, dtype=int)
+			all_dilation_contacts = np.asarray(bundle.dilation_contacts, dtype=int)
+		cl = int(cl0)
+		cr = int(cr0)
+		left_candidates = np.asarray([], dtype=int)
+		right_candidates = np.asarray([], dtype=int)
+		if all_erosion_contacts is not None and all_erosion_contacts.size:
+			left_candidates = all_erosion_contacts[all_erosion_contacts < int(apex)]
+			right_candidates = all_erosion_contacts[all_erosion_contacts > int(apex)]
+			if left_candidates.size and left_candidates[-1] < cl:
+				cl = int(max(0, int(left_candidates[-1])))
+			elif left_candidates.size == 0:
+				cl = 0
+			if right_candidates.size and right_candidates[0] > cr:
+				cr = int(min(n - 1, int(right_candidates[0])))
+			elif right_candidates.size == 0:
+				cr = n - 1
 		raw_ctx = raw[cl:cr + 1]
 		local_noise = _mad(np.diff(raw_ctx)) / math.sqrt(2.0) if raw_ctx.size >= 3 else _mad(raw_ctx)
 		local_noise = local_noise if np.isfinite(local_noise) and local_noise > 1e-12 else 1.0
-		if bool(strict_equal):
+		if all_erosion_contacts is not None and all_dilation_contacts is not None:
+			erosion_contacts = all_erosion_contacts[(all_erosion_contacts >= cl) & (all_erosion_contacts <= cr)].astype(int)
+			dilation_contacts = all_dilation_contacts[(all_dilation_contacts >= cl) & (all_dilation_contacts <= cr)].astype(int)
+		elif bool(strict_equal):
 			erosion_contacts = (np.flatnonzero(raw[cl:cr + 1] == ero[cl:cr + 1]) + cl).astype(int)
 			dilation_contacts = (np.flatnonzero(raw[cl:cr + 1] == dil[cl:cr + 1]) + cl).astype(int)
 		else:
 			erosion_contacts = (np.flatnonzero(np.isclose(raw[cl:cr + 1], ero[cl:cr + 1])) + cl).astype(int)
 			dilation_contacts = (np.flatnonzero(np.isclose(raw[cl:cr + 1], dil[cl:cr + 1])) + cl).astype(int)
+		parent_left_foot_found = bool(np.any(erosion_contacts < int(apex)))
+		parent_right_foot_found = bool(np.any(erosion_contacts > int(apex)))
+		parent_used_spectrum_edge_as_foot = bool((not parent_left_foot_found and cl == 0) or (not parent_right_foot_found and cr == n - 1))
+		if not parent_left_foot_found and cl == 0:
+			erosion_contacts = np.unique(np.concatenate([np.asarray([0], dtype=int), erosion_contacts.astype(int)])).astype(int)
+		if not parent_right_foot_found and cr == n - 1:
+			erosion_contacts = np.unique(np.concatenate([erosion_contacts.astype(int), np.asarray([n - 1], dtype=int)])).astype(int)
+		parent_left_foot_found = bool(np.any(erosion_contacts < int(apex))) or bool(cl == 0)
+		parent_right_foot_found = bool(np.any(erosion_contacts > int(apex))) or bool(cr == n - 1)
 		dilation_set = set(int(v) for v in dilation_contacts.tolist())
 		cells: List[Dict[str, Any]] = []
 		parent_apex_cell_index: Optional[int] = None
@@ -559,10 +621,19 @@ def analyze_erosion_dilation_contact_cells(
 			s_norm = _finite_minmax_norm([float(c.get("salience", np.nan)) for c in cells])
 			t_norm = _finite_minmax_norm([float(c.get("salience_total", np.nan)) for c in cells])
 			d_norm = _finite_minmax_norm([float(c.get("salience_density", np.nan)) for c in cells])
+			degenerate_context = bool(len(cells) <= 2 or _has_only_trivial_binary_norm(t_norm))
+			spectrum_noise_height = meta.get("noise_height_morph_range", meta.get("candidate_noise_estimate_used"))
+			try:
+				spectrum_noise_height = float(spectrum_noise_height)
+			except Exception:
+				spectrum_noise_height = float("nan")
+			if not np.isfinite(spectrum_noise_height) or float(spectrum_noise_height) <= 0.0:
+				spectrum_noise_height = float(local_noise)
 			for c, sv, tv, dv in zip(cells, s_norm, t_norm, d_norm):
 				c["salience_norm"] = sv
 				c["salience_total_norm"] = tv
 				c["salience_density_norm"] = dv
+				c["cell_low_t_degenerate_context"] = bool(degenerate_context)
 				dil_inside = [int(v) for v in c.get("dilation_contact_indices_inside_cell", []) or []]
 				if bool(c.get("contains_parent_apex", False)):
 					c["secondary_anchor_index"] = int(apex)
@@ -584,16 +655,56 @@ def analyze_erosion_dilation_contact_cells(
 				else:
 					pre = "uncertain"
 				c["secondary_preclassification"] = pre
+				anchor_idx = int(c.get("secondary_anchor_index", (int(c["cell_left"]) + int(c["cell_right"])) // 2))
+				cell_height, cell_chord_y = _cell_height_above_chord(raw, int(c["cell_left"]), int(c["cell_right"]), anchor_idx)
+				cell_noise_ratio = (
+					float(cell_height / spectrum_noise_height)
+					if np.isfinite(cell_height) and np.isfinite(spectrum_noise_height) and spectrum_noise_height > 0.0
+					else float("nan")
+				)
+				c["cell_height_above_chord"] = float(cell_height) if np.isfinite(cell_height) else float("nan")
+				c["cell_chord_y_at_anchor"] = float(cell_chord_y) if np.isfinite(cell_chord_y) else float("nan")
+				c["cell_height_ratio_to_noise"] = float(cell_noise_ratio) if np.isfinite(cell_noise_ratio) else float("nan")
+				c["cell_noise_height_threshold"] = float(candidate_noise_height_factor)
 				if pre == "definite_parent_spike":
 					c["secondary_final_class"] = "spike"
 					c["secondary_final_is_spike"] = True
 					c["secondary_final_source"] = "parent_apex"
 					c["secondary_ss4_ran"] = False
 				elif pre == "definite_noise":
-					c["secondary_final_class"] = "non_spike"
-					c["secondary_final_is_spike"] = False
-					c["secondary_final_source"] = "t_norm_noise"
-					c["secondary_ss4_ran"] = False
+					if bool(degenerate_context) and not bool(c.get("contains_parent_apex", False)):
+						if np.isfinite(cell_noise_ratio) and cell_noise_ratio >= float(candidate_noise_height_factor):
+							sec = _secondary_ss4_for_cell(
+								raw=raw,
+								gradient=grad,
+								left=int(c["cell_left"]),
+								right=int(c["cell_right"]),
+								preferred_apex=None,
+								dilation_contacts=[int(v) for v in c.get("dilation_contact_indices_inside_cell", []) or []],
+								local_noise=local_noise,
+								ss_blue_max=float(ss4_ss_blue_max),
+								ss_red_min=float(ss4_ss_red_min),
+								pce_red_min=float(ss4_pce_red_min),
+								rve_red_max=float(ss4_rve_red_max),
+								missing_policy=str(ss4_missing_policy),
+								edge_rescue_ss_min=float(secondary_edge_rescue_ss_min),
+							)
+							sec["secondary_ss4_reason_for_run"] = "degenerate_t_low_cell_above_noise"
+							c.update(sec)
+							is_spike = bool(str(sec.get("secondary_ss4_decision", "")) == "spike" and float(sec.get("secondary_ss4", np.nan)) == 1.0)
+							c["secondary_final_class"] = "spike" if is_spike else "non_spike"
+							c["secondary_final_is_spike"] = is_spike
+							c["secondary_final_source"] = "secondary_ss4"
+						else:
+							c["secondary_final_class"] = "non_spike"
+							c["secondary_final_is_spike"] = False
+							c["secondary_final_source"] = "degenerate_t_noise_height"
+							c["secondary_ss4_ran"] = False
+					else:
+						c["secondary_final_class"] = "non_spike"
+						c["secondary_final_is_spike"] = False
+						c["secondary_final_source"] = "t_norm_noise"
+						c["secondary_ss4_ran"] = False
 				elif pre == "definite_spike":
 					c["secondary_final_class"] = "spike"
 					c["secondary_final_is_spike"] = True
@@ -711,8 +822,6 @@ def analyze_erosion_dilation_contact_cells(
 			island_left = None
 			island_right = None
 			island_reason = "no_parent_apex_cell"
-		key = (y, x, apex, start, end)
-		meta = dict(parent_metadata.get(key, {}))
 		primary_ss4 = meta.get("primary_ss4", meta.get("ss4", 1.0))
 		primary_ss4_reason = meta.get("primary_ss4_reason", meta.get("ss4_reason"))
 		primary_ss4_decision = meta.get("primary_ss4_decision", meta.get("ss4_decision"))
@@ -720,6 +829,13 @@ def analyze_erosion_dilation_contact_cells(
 		primary_pce = meta.get("primary_pce_negpref_t098_evidence_signed", meta.get("pce_negpref_t098_evidence_signed"))
 		primary_edge = meta.get("primary_recdw_sum_0_90_raman_veto_evidence_signed", meta.get("recdw_sum_0_90_raman_veto_evidence_signed"))
 		primary_edge_feature = meta.get("primary_ss4_rve_feature", meta.get("ss4_rve_feature"))
+		primary_ss5 = meta.get("primary_ss5", meta.get("ss5"))
+		primary_ss5_reason = meta.get("primary_ss5_reason", meta.get("ss5_reason"))
+		primary_ss5_decision = meta.get("primary_ss5_decision", meta.get("ss5_decision"))
+		primary_active_profile = meta.get("primary_active_decision_profile", "ss4")
+		primary_active_score = meta.get("primary_active_score", primary_ss5 if str(primary_active_profile) == "ss5" else primary_ss4)
+		primary_active_decision = meta.get("primary_active_decision", primary_ss5_decision if str(primary_active_profile) == "ss5" else primary_ss4_decision)
+		primary_active_reason = meta.get("primary_active_reason", primary_ss5_reason if str(primary_active_profile) == "ss5" else primary_ss4_reason)
 		summary = {
 			"n_erosion_contacts": int(erosion_contacts.size),
 			"n_dilation_contacts": int(dilation_contacts.size),
@@ -742,6 +858,7 @@ def analyze_erosion_dilation_contact_cells(
 			"secondary_uncertain_cell_indices": secondary_uncertain_cells,
 			"secondary_final_spike_intervals": secondary_groups,
 			"final_despike_chords": final_chords,
+			"degenerate_salience_context": bool(len(cells) <= 2 or _has_only_trivial_binary_norm([float(c.get("salience_total_norm", np.nan)) for c in cells])),
 			"preliminary_island_cell_indices": island,
 			"preliminary_island_left": island_left,
 			"preliminary_island_right": island_right,
@@ -764,12 +881,28 @@ def analyze_erosion_dilation_contact_cells(
 			"primary_ss4_decision": primary_ss4_decision,
 			"primary_ss4_reason": primary_ss4_reason,
 			"primary_ss4_rve_feature": primary_edge_feature,
+			"primary_ss5": _clean_value(primary_ss5),
+			"primary_ss5_decision": primary_ss5_decision,
+			"primary_ss5_reason": primary_ss5_reason,
+			"primary_active_decision_profile": primary_active_profile,
+			"primary_active_score": _clean_value(primary_active_score),
+			"primary_active_decision": primary_active_decision,
+			"primary_active_reason": primary_active_reason,
 			"parent_ss4_value": _clean_value(primary_ss4),
 			"parent_ss4_reason": primary_ss4_reason,
 			"parent_ss1": _clean_value(primary_ss1),
 			"parent_pce": _clean_value(primary_pce),
 			"parent_edge": _clean_value(primary_edge),
 			"parent_edge_feature": primary_edge_feature,
+			"context_left_initial": int(cl0),
+			"context_right_initial": int(cr0),
+			"context_left_final": int(cl),
+			"context_right_final": int(cr),
+			"context_expanded_left_pts": int(max(0, cl0 - cl)),
+			"context_expanded_right_pts": int(max(0, cr - cr0)),
+			"parent_left_foot_found": bool(parent_left_foot_found),
+			"parent_right_foot_found": bool(parent_right_foot_found),
+			"parent_used_spectrum_edge_as_foot": bool(parent_used_spectrum_edge_as_foot),
 			"context_left": int(cl),
 			"context_right": int(cr),
 			"local_noise": float(local_noise),
@@ -844,11 +977,16 @@ def build_despike_contact_debug_payload(
 			"secondary_ss4": cell.get("secondary_ss4"),
 			"secondary_ss4_decision": cell.get("secondary_ss4_decision"),
 			"secondary_ss4_reason": cell.get("secondary_ss4_reason"),
+			"secondary_ss4_reason_for_run": cell.get("secondary_ss4_reason_for_run"),
 			"secondary_ss1": cell.get("secondary_ss1"),
 			"secondary_pce": cell.get("secondary_pce"),
 			"secondary_edge": cell.get("secondary_edge"),
 			"secondary_anchor_index": cell.get("secondary_anchor_index"),
 			"secondary_anchor_source": cell.get("secondary_anchor_source"),
+			"cell_low_t_degenerate_context": cell.get("cell_low_t_degenerate_context"),
+			"cell_height_above_chord": cell.get("cell_height_above_chord"),
+			"cell_height_ratio_to_noise": cell.get("cell_height_ratio_to_noise"),
+			"cell_noise_height_threshold": cell.get("cell_noise_height_threshold"),
 		}
 		if mode_norm == "full":
 			for key, value in cell.items():
@@ -913,6 +1051,15 @@ def build_despike_contact_debug_payload(
 			"parent_pce": parent.get("parent_pce"),
 			"parent_edge": parent.get("parent_edge"),
 			"parent_edge_feature": parent.get("parent_edge_feature"),
+			"context_left_initial": parent.get("context_left_initial"),
+			"context_right_initial": parent.get("context_right_initial"),
+			"context_left_final": parent.get("context_left_final"),
+			"context_right_final": parent.get("context_right_final"),
+			"context_expanded_left_pts": parent.get("context_expanded_left_pts"),
+			"context_expanded_right_pts": parent.get("context_expanded_right_pts"),
+			"parent_left_foot_found": parent.get("parent_left_foot_found"),
+			"parent_right_foot_found": parent.get("parent_right_foot_found"),
+			"parent_used_spectrum_edge_as_foot": parent.get("parent_used_spectrum_edge_as_foot"),
 			"context_left": parent.get("context_left"),
 			"context_right": parent.get("context_right"),
 			"n_erosion_contacts": summary.get("n_erosion_contacts"),
@@ -925,7 +1072,7 @@ def build_despike_contact_debug_payload(
 			for key, value in parent.items():
 				if key in parent_row:
 					continue
-				if not store_arrays and key in {"erosion_contact_x", "erosion_contact_y", "dilation_contact_x", "dilation_contact_y", "erosion_contacts", "dilation_contacts"}:
+				if not store_arrays and key in {"erosion_contact_x", "erosion_contact_y", "dilation_contact_x", "dilation_contact_y"}:
 					continue
 				parent_row[key] = value
 		parents_out.append(parent_row)

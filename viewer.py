@@ -173,6 +173,29 @@ def show_hover_map(
 				pce_v if np.isfinite(pce_v) else -1.0,
 			)
 
+		def _merge_rows(preferred: Dict[str, object], other: Dict[str, object]) -> Dict[str, object]:
+			out = dict(other)
+			out.update(preferred)
+			for key, value in other.items():
+				if key not in out or out.get(key) is None:
+					out[key] = value
+					continue
+				if str(key).startswith("candidate_noise_") or key in {
+					"noise_height_morph_range",
+					"noise_reference_status",
+					"noise_reference_method",
+					"noise_reference_n_points",
+					"noise_reference_spans",
+				}:
+					cur = out.get(key)
+					if cur is None:
+						out[key] = value
+					elif isinstance(cur, str) and not cur.strip() and value not in (None, ""):
+						out[key] = value
+					elif isinstance(cur, list) and not cur and value:
+						out[key] = value
+			return out
+
 		for row in rows:
 			try:
 				row_id: object = row.get("candidate_id") or (
@@ -183,8 +206,13 @@ def show_hover_map(
 			except Exception:
 				continue
 			prev = by_id.get(row_id)
-			if prev is None or _row_rank(row) > _row_rank(prev):
+			if prev is None:
 				by_id[row_id] = row
+				continue
+			if _row_rank(row) > _row_rank(prev):
+				by_id[row_id] = _merge_rows(row, prev)
+			else:
+				by_id[row_id] = _merge_rows(prev, row)
 		return sorted(by_id.values(), key=lambda r: (int(r.get("peak_index", -1)), int(r.get("start", -1)), int(r.get("end", -1))))
 
 	def _dedupe_contact_parents(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -244,9 +272,16 @@ def show_hover_map(
 				"primary_ss4_decision": parent.get("primary_ss4_decision"),
 				"primary_ss4_reason": parent.get("primary_ss4_reason", parent.get("parent_ss4_reason")),
 				"primary_ss4_rve_feature": parent.get("primary_ss4_rve_feature", parent.get("parent_edge_feature")),
+				"primary_ss5": parent.get("primary_ss5"),
+				"primary_ss5_decision": parent.get("primary_ss5_decision"),
+				"primary_ss5_reason": parent.get("primary_ss5_reason"),
 				"primary_spike_score_v1": parent.get("primary_spike_score_v1", parent.get("parent_ss1")),
 				"primary_pce_negpref_t098_evidence_signed": parent.get("primary_pce_negpref_t098_evidence_signed", parent.get("parent_pce")),
 				"primary_recdw_sum_0_90_raman_veto_evidence_signed": parent.get("primary_recdw_sum_0_90_raman_veto_evidence_signed", parent.get("parent_edge")),
+				"primary_active_decision_profile": parent.get("primary_active_decision_profile"),
+				"primary_active_score": parent.get("primary_active_score"),
+				"primary_active_decision": parent.get("primary_active_decision"),
+				"primary_active_reason": parent.get("primary_active_reason"),
 			}
 			ss4_metrics_by_pixel.setdefault((py, px), []).append(primary_row)
 			compact_pix = source_to_compact.get((py, px))
@@ -275,8 +310,8 @@ def show_hover_map(
 	fig.canvas.manager.set_window_title("Muon finder - hover viewer")
 	if viewer_status_text:
 		fig.text(0.5, 0.965, str(viewer_status_text), ha="center", va="center", color="#a63603", fontsize=10, alpha=0.95)
-	median_window_choices = (5, 9, 15, 31, 61, 81, 101, 125)
-	mean_window_choices = (5, 9, 15, 31, 61, 81, 101, 125)
+	median_window_choices = (3, 5, 9, 15, 31, 61, 81, 101, 125)
+	mean_window_choices = (3, 5, 9, 15, 31, 61, 81, 101, 125)
 	opening_window_choices = (81, 101, 125)
 	top_hat_window_choices = (3, 7, 9, 11)
 	diag_state = {"median_window": 81, "mean_window": 81, "opening_window": 81}
@@ -364,7 +399,7 @@ def show_hover_map(
 		"gradient": "#e377c2",
 		"raw_d2": "#17becf",
 		"raw_d3": "#8c564b",
-		"median": "#4daf4a",
+		"median": "C1",
 		"median_residual": "#00a7c7",
 		"mean": "#377eb8",
 		"mean_residual": "#984ea3",
@@ -514,6 +549,8 @@ def show_hover_map(
 		"show_contact_cell_chords": False,
 		"secondary_spike_peaks": False,
 		"show_secondary_ss4_labels": False,
+		"noise_filter": False,
+		"show_noise_reference": False,
 		"despike_chords": False,
 		"located_muon": False,
 		"primal_metrics": False,
@@ -764,8 +801,13 @@ def show_hover_map(
 				return True
 		return False
 
-	def _primary_value(row: Dict[str, object], primary_key: str, legacy_key: str) -> object:
-		return row.get(primary_key, row.get(legacy_key))
+	def _primary_value(row: Dict[str, object], primary_key: str, *fallback_keys: str) -> object:
+		if primary_key in row and row.get(primary_key) is not None:
+			return row.get(primary_key)
+		for key in fallback_keys:
+			if key in row and row.get(key) is not None:
+				return row.get(key)
+		return row.get(primary_key)
 
 	def _line_between_indices(sig: np.ndarray, left_idx: int, right_idx: int) -> Tuple[np.ndarray, np.ndarray]:
 		li = int(np.clip(left_idx, 0, max(0, sig.size - 1)))
@@ -815,15 +857,21 @@ def show_hover_map(
 				best_dist = dist
 		return best
 
+	def _candidate_noise_status(y: int, x: int, peak: int, left: int, right: int) -> str:
+		row = _primary_ss4_metric_for_candidate(y, x, peak, left, right)
+		if row is None:
+			return "kept"
+		return str(row.get("candidate_noise_prefilter_status", "kept") or "kept")
+
 	def _is_primary_ss4_candidate(y: int, x: int, peak: int, left: int, right: int) -> bool:
 		row = _primary_ss4_metric_for_candidate(y, x, peak, left, right)
 		if row is None:
 			return False
 		try:
-			decision = str(_primary_value(row, "primary_ss4_decision", "ss4_decision") or "")
+			decision = str(_primary_value(row, "primary_active_decision", "primary_ss4_decision", "ss4_decision") or "")
 			if decision:
 				return decision == "spike"
-			return bool(float(_primary_value(row, "primary_ss4", "ss4")) >= 0.5)
+			return bool(float(_primary_value(row, "primary_active_score", "primary_ss4", "ss4")) >= 0.5)
 		except Exception:
 			return False
 
@@ -1393,7 +1441,7 @@ def show_hover_map(
 			int(curv_variant_state["i"]),
 			str(_current_gws_scale()),
 			tuple(sorted((str(k), bool(v)) for k, v in checked.items() if str(k).startswith("gws_") or str(k).startswith("mdws510_"))),
-			tuple(sorted((str(k), bool(v)) for k, v in metric_checked.items() if str(k).startswith("gws_") or str(k).startswith("mdws510_") or str(k).startswith("pce_") or str(k).startswith("ls_") or str(k).startswith("mth_") or str(k).startswith("c2_") or str(k).startswith("show_") or str(k) in {"secondary_spike_peaks", "despike_chords", "primal_metrics"})),
+			tuple(sorted((str(k), bool(v)) for k, v in metric_checked.items() if str(k).startswith("gws_") or str(k).startswith("mdws510_") or str(k).startswith("pce_") or str(k).startswith("ls_") or str(k).startswith("mth_") or str(k).startswith("c2_") or str(k).startswith("show_") or str(k) in {"secondary_spike_peaks", "despike_chords", "primal_metrics", "noise_filter"})),
 			tuple((int(s.peak_index), int(lefts[i]), int(rights[i])) for i, s in enumerate(segs)),
 		)
 		if cache_key in interest_metric_cache:
@@ -1420,6 +1468,7 @@ def show_hover_map(
 				"show_contact_cell_chords",
 				"secondary_spike_peaks",
 				"show_secondary_ss4_labels",
+				"noise_filter",
 				"despike_chords",
 				"primal_metrics",
 			)
@@ -1531,11 +1580,12 @@ def show_hover_map(
 					if (
 							bool(metric_checked.get("show_secondary_ss4_labels", False))
 							and bool(cell.get("secondary_ss4_ran", False))
-							and str(cell.get("secondary_final_source", "")) == "secondary_ss4"
 					):
 						yy = float(np.nanmin(raw_sig[left:right + 1])) if np.any(np.isfinite(raw_sig[left:right + 1])) else float(raw_sig[left])
 						edge_value = cell.get("secondary_recdw_sum_0_90_raman_veto_evidence_signed")
 						edge_label = "edge"
+						run_reason = str(cell.get("secondary_ss4_reason_for_run", "") or "")
+						reason_tag = " | small_ctx" if run_reason == "degenerate_t_low_cell_above_noise" else ""
 						try:
 							if not np.isfinite(float(edge_value)):
 								edge_value = cell.get("secondary_rve_value_used_for_ss4", cell.get("secondary_edge_rve_proxy"))
@@ -1552,7 +1602,7 @@ def show_hover_map(
 								f"secondary\n"
 								f"ss1={_fmt_num(cell.get('secondary_spike_score_v1', cell.get('secondary_ss1')), 2)}\n"
 								f"pce={_fmt_num(cell.get('secondary_pce_negpref_t098_evidence_signed', cell.get('secondary_pce')), 2)}\n"
-								f"{edge_label}={_fmt_num(edge_value, 2)}"
+								f"{edge_label}={_fmt_num(edge_value, 2)}{reason_tag}"
 							),
 							"color": "#333333",
 							"fontsize": 7.0,
@@ -1598,10 +1648,22 @@ def show_hover_map(
 				except Exception:
 					continue
 				try:
-					primary_decision = str(_primary_value(cand, "primary_ss4_decision", "ss4_decision") or "")
-					is_spike = primary_decision == "spike" if primary_decision else bool(float(_primary_value(cand, "primary_ss4", "ss4")) >= 0.5)
+					active_val = float(_primary_value(cand, "primary_active_score", "primary_ss4", "ss4"))
+				except Exception:
+					active_val = float("nan")
+				try:
+					ss1_val = float(_primary_value(cand, "primary_spike_score_v1", "spike_score_v1"))
+				except Exception:
+					ss1_val = float("nan")
+				if not np.isfinite(active_val) and not np.isfinite(ss1_val):
+					continue
+				try:
+					primary_decision = str(_primary_value(cand, "primary_active_decision", "primary_ss4_decision", "ss4_decision") or "")
+					is_spike = primary_decision == "spike" if primary_decision else bool(active_val >= 0.5)
 				except Exception:
 					is_spike = False
+				active_profile = str(_primary_value(cand, "primary_active_decision_profile") or "ss4")
+				active_reason = _primary_value(cand, "primary_active_reason", "primary_ss4_reason", "ss4_reason") or ""
 				color = "#d62728" if is_spike else "#1f77b4"
 				offset_i = int(label_counts_by_peak.get(ap, 0))
 				label_counts_by_peak[ap] = offset_i + 1
@@ -1615,18 +1677,149 @@ def show_hover_map(
 					"kind": "text",
 					"x": float(x_axis[ap]),
 					"y": yy,
-					"text": (
-						f"primary i={ap}\nss4={_fmt_num(_primary_value(cand, 'primary_ss4', 'ss4'))}\n"
-						f"ss1={_fmt_num(_primary_value(cand, 'primary_spike_score_v1', 'spike_score_v1'))}\n"
-						f"pce={_fmt_num(_primary_value(cand, 'primary_pce_negpref_t098_evidence_signed', 'pce_negpref_t098_evidence_signed'))}\n"
-						f"edge={_fmt_num(_primary_value(cand, 'primary_recdw_sum_0_90_raman_veto_evidence_signed', 'recdw_sum_0_90_raman_veto_evidence_signed'))}\n"
-						f"{_primary_value(cand, 'primary_ss4_reason', 'ss4_reason') or ''}"
-					),
+						"text": (
+							f"primary i={ap}\n{active_profile}={_fmt_num(_primary_value(cand, 'primary_active_score', 'primary_ss4', 'ss4'))}\n"
+							f"ss1={_fmt_num(_primary_value(cand, 'primary_spike_score_v1', 'spike_score_v1'))}\n"
+							f"pce={_fmt_num(_primary_value(cand, 'primary_pce_negpref_t098_evidence_signed', 'pce_negpref_t098_evidence_signed'))}\n"
+							f"edge={_fmt_num(_primary_value(cand, 'primary_recdw_sum_0_90_raman_veto_evidence_signed', 'recdw_sum_0_90_raman_veto_evidence_signed'))}\n"
+							f"ss4={_fmt_num(_primary_value(cand, 'primary_ss4', 'ss4'))} ss5={_fmt_num(_primary_value(cand, 'primary_ss5', 'ss5'))}\n"
+							f"{active_reason}"
+						),
 					"color": color,
 					"fontsize": 7.5,
 					"alpha": 0.92,
 				})
 				guide_specs.append({"metric": "primal_metrics", "kind": "vline", "x": float(x_axis[ap]), "color": color, "alpha": 0.75, "linestyle": ":"})
+		if bool(metric_checked.get("noise_filter", False)):
+			noise_rows = sorted(_pixel_ss4_metrics(int(y), int(x)), key=lambda c: int(c.get("peak_index", -1)))
+			noise_candidate_ids = {
+				str(c.get("candidate_id"))
+				for c in noise_rows
+				if c.get("candidate_id") is not None
+			}
+			label_counts_by_apex: Dict[int, int] = {}
+			warned_missing_ids: set[str] = set()
+			for cand in noise_rows:
+				candidate_id = str(cand.get("candidate_id", "") or "")
+				try:
+					ap = int(np.clip(int(cand.get("candidate_noise_apex", cand.get("peak_index"))), 0, N - 1))
+				except Exception:
+					continue
+				if candidate_id and candidate_id not in noise_candidate_ids:
+					if candidate_id not in warned_missing_ids:
+						warned_missing_ids.add(candidate_id)
+						yy_warn = float(raw_sig[ap]) + max(abs(float(raw_sig[ap])) * 0.03, 1.0)
+						guide_specs.append({
+							"metric": "noise_filter",
+							"kind": "text",
+							"x": float(x_axis[ap]),
+							"y": yy_warn,
+							"text": "noise filter: missing candidate_id mapping",
+							"color": "#aa5500",
+							"fontsize": 7.0,
+							"alpha": 0.85,
+						})
+					continue
+				status = str(cand.get("candidate_noise_prefilter_status", "not_evaluated") or "not_evaluated")
+				reason = str(cand.get("candidate_noise_prefilter_reason", "") or "")
+				try:
+					left_foot = int(cand.get("candidate_noise_left_foot"))
+					right_foot = int(cand.get("candidate_noise_right_foot"))
+					has_feet = True
+				except Exception:
+					has_feet = False
+					left_foot = right_foot = -1
+				try:
+					h_val = float(cand.get("candidate_noise_height_above_chord", np.nan))
+				except Exception:
+					h_val = float("nan")
+				try:
+					thr_val = float(cand.get("candidate_noise_height_threshold", np.nan))
+				except Exception:
+					thr_val = float("nan")
+				try:
+					ratio_val = float(cand.get("candidate_noise_height_ratio", np.nan))
+				except Exception:
+					ratio_val = float("nan")
+				r_label = ratio_val if np.isfinite(ratio_val) else float("nan")
+				try:
+					chord_y = float(cand.get("candidate_noise_chord_y_at_apex", np.nan))
+				except Exception:
+					chord_y = float("nan")
+				color = "#555555" if status == "rejected_noise" else "#6a3d9a"
+				linestyle = "--" if status == "rejected_noise" else "-"
+				if has_feet and 0 <= left_foot < N and 0 <= right_foot < N and right_foot > left_foot:
+					cx, cy = _line_between_indices(raw_sig, left_foot, right_foot)
+					if cx.size >= 2 and cy.size == cx.size:
+						guide_specs.append({
+							"metric": "noise_filter",
+							"kind": "polyline",
+							"x": cx,
+							"y": cy,
+							"color": color,
+							"alpha": 0.85,
+							"linewidth": 1.0,
+							"linestyle": linestyle,
+						})
+						apex_x = float(x_axis[ap])
+						apex_y = float(raw_sig[ap])
+						if np.isfinite(chord_y):
+							guide_specs.append({
+								"metric": "noise_filter",
+								"kind": "polyline",
+								"x": np.asarray([apex_x, apex_x], dtype=float),
+								"y": np.asarray([chord_y, apex_y], dtype=float),
+								"color": color,
+								"alpha": 0.9,
+								"linewidth": 1.0,
+								"linestyle": linestyle,
+							})
+							offset_i = int(label_counts_by_apex.get(ap, 0))
+							label_counts_by_apex[ap] = offset_i + 1
+							local_left = max(0, ap - 4)
+							local_right = min(N - 1, ap + 4)
+							local_seg = raw_sig[local_left:local_right + 1]
+							local_range = float(np.nanmax(local_seg) - np.nanmin(local_seg)) if np.any(np.isfinite(local_seg)) else 0.0
+							yy = float(max(apex_y, chord_y)) + float(offset_i) * max(local_range * 0.16, 1.0)
+							label = f"h={_fmt_num(h_val, 3)} | r={_fmt_num(r_label, 2)}"
+							guide_specs.append({
+								"metric": "noise_filter",
+								"kind": "text",
+								"x": apex_x,
+								"y": yy,
+								"text": label,
+								"color": color,
+								"fontsize": 7.0,
+								"alpha": 0.92,
+							})
+						else:
+							offset_i = int(label_counts_by_apex.get(ap, 0))
+							label_counts_by_apex[ap] = offset_i + 1
+							yy = float(raw_sig[ap]) + float(offset_i) * max(abs(float(raw_sig[ap])) * 0.03, 1.0)
+							guide_specs.append({
+								"metric": "noise_filter",
+								"kind": "text",
+								"x": float(x_axis[ap]),
+								"y": yy,
+								"text": "noise filter: missing chord y",
+								"color": color,
+								"fontsize": 7.0,
+								"alpha": 0.85,
+							})
+					continue
+				offset_i = int(label_counts_by_apex.get(ap, 0))
+				label_counts_by_apex[ap] = offset_i + 1
+				yy = float(raw_sig[ap]) + float(offset_i) * max(abs(float(raw_sig[ap])) * 0.03, 1.0)
+				guide_specs.append({
+					"metric": "noise_filter",
+					"kind": "text",
+					"x": float(x_axis[ap]),
+					"y": yy,
+					"text": "noise filter: no feet" if reason == "missing_erosion_contact_feet" else "noise filter: n/a",
+					"color": color,
+					"fontsize": 7.0,
+					"alpha": 0.85,
+				})
 		if bool(metric_checked.get("show_despike_patch", False)):
 			for diag in despike_diag_by_pixel.get((int(y), int(x)), []):
 				reason = str(diag.get("skipped_reason", ""))
@@ -2400,7 +2593,8 @@ def show_hover_map(
 		metric_guide_artists.clear()
 
 		raw_segs = view_spikes_by_pixel.get((y, x), [])
-		need_spike_overlays = any(bool(v) for v in spike_overlay_checked.values())
+		raw_sig = np.asarray(spectra[int(y), int(x), :], dtype=float)
+		need_spike_overlays = any(bool(v) for v in spike_overlay_checked.values()) or bool(metric_checked.get("show_noise_reference", False))
 		metric_active = any(bool(metric_checked[k]) for k in metric_checked)
 		need_segment_diagnostics = bool(raw_segs) and (need_spike_overlays or metric_active)
 		segs: List[SpikeSegment]
@@ -2425,7 +2619,11 @@ def show_hover_map(
 				x_start = x_axis[si]
 				x_end = x_axis[ei]
 				is_primary_ss4 = _is_primary_ss4_candidate(int(y), int(x), int(pi), int(si), int(ei))
-				decision_color = "#d62728" if is_primary_ss4 else "#1f77b4"
+				candidate_noise_status = _candidate_noise_status(int(y), int(x), int(pi), int(si), int(ei))
+				if candidate_noise_status == "rejected_noise":
+					decision_color = "#7f7f7f"
+				else:
+					decision_color = "#d62728" if is_primary_ss4 else "#1f77b4"
 				boundary_color = "#2ca02c"
 
 				if spike_overlay_checked['spike_bands']:
@@ -2455,10 +2653,34 @@ def show_hover_map(
 					lp = ax_spec.axvline(float(x_axis[pi]), linestyle="--", linewidth=1.25, color="#d62728", alpha=0.95)
 					spike_peak_lines.append(lp)
 					drawn_primary_peaks.add(pi)
-
 		has_contact_diag = bool(contact_parent_by_pixel.get((int(y), int(x)), []))
 		has_primary_metrics = bool(ss4_metrics_by_pixel.get((int(y), int(x)), []))
 		metric_overlay, metric_guides = _build_metric_overlays(y, x, segs, lefts, rights, segment_decisions) if (metric_active and (segs or has_contact_diag or has_primary_metrics)) else (None, [])
+		if bool(metric_checked.get("show_noise_reference", False)):
+			rows = _pixel_ss4_metrics(int(y), int(x))
+			noise_row = next((row for row in rows if isinstance(row, dict) and row.get("noise_reference_spans") is not None), None)
+			if isinstance(noise_row, dict) and str(noise_row.get("noise_reference_status", "")) == "ok":
+				for span in noise_row.get("noise_reference_spans", []) or []:
+					if not isinstance(span, (list, tuple)) or len(span) != 2:
+						continue
+					try:
+						lv = int(span[0])
+						rv = int(span[1])
+					except Exception:
+						continue
+					li = int(np.clip(min(lv, rv), 0, N - 1))
+					ri = int(np.clip(max(lv, rv), 0, N - 1))
+					if ri < li:
+						continue
+					metric_guides.append({
+						"metric": "show_noise_reference",
+						"kind": "polyline",
+						"x": np.asarray(x_axis[li:ri + 1], dtype=float),
+						"y": np.asarray(raw_sig[li:ri + 1], dtype=float),
+						"color": "#000000",
+						"alpha": 0.9,
+						"linewidth": 1.2,
+					})
 		if metric_overlay is None:
 			ln_gws_residual.set_data([], [])
 			ln_gws_residual_all.set_data([], [])
@@ -2538,12 +2760,14 @@ def show_hover_map(
 			parents_here = contact_parent_by_pixel.get((int(y), int(x)), [])
 			if parents_here:
 				lead_parent = max(parents_here, key=lambda p: float(p.get("parent_peak_height", 0.0) or 0.0))
+				active_profile = str(lead_parent.get("primary_active_decision_profile", "ss4") or "ss4")
 				metric_info = (
-					f"primary_ss4={_fmt_num(lead_parent.get('parent_ss4_value'))} "
-					f"reason={lead_parent.get('parent_ss4_reason', '')} | "
+					f"primary_{active_profile}={_fmt_num(lead_parent.get('primary_active_score', lead_parent.get('parent_ss4_value')))} "
+					f"reason={lead_parent.get('primary_active_reason', lead_parent.get('parent_ss4_reason', ''))} | "
 					f"ss1={_fmt_num(lead_parent.get('parent_ss1'))} "
 					f"pce={_fmt_num(lead_parent.get('parent_pce'))} "
-					f"edge={_fmt_num(lead_parent.get('parent_edge'))}"
+					f"edge={_fmt_num(lead_parent.get('parent_edge'))} "
+					f"| ss4={_fmt_num(lead_parent.get('parent_ss4_value'))} ss5={_fmt_num(lead_parent.get('primary_ss5'))}"
 				)
 			else:
 				lead = max(segs, key=lambda sp: float(getattr(sp, "peak_height", 0.0)))
@@ -2558,7 +2782,7 @@ def show_hover_map(
 				"show_raw_edge_dense_ctx",
 				"show_erosion_contacts", "show_dilation_contacts", "show_contact_cells", "show_cell_salience_labels", "show_contact_cell_chords",
 				"secondary_spike_peaks", "show_secondary_ss4_labels",
-				"despike_chords", "located_muon", "primal_metrics",
+				"noise_filter", "despike_chords", "located_muon", "primal_metrics",
 			)
 			if bool(checked.get(name, False)) or bool(metric_checked.get(name, False))
 		]
@@ -2570,6 +2794,29 @@ def show_hover_map(
 			header = f"spectrum @ compact(y={y}, x={x}) -> source(y={src_y}, x={src_x}) | candidates={prepared_candidate_count}"
 		else:
 			header = f"spectrum @ (y={y}, x={x}) | candidates={prepared_candidate_count}"
+		if bool(metric_checked.get("noise_filter", False)):
+			noise_rows = [row for row in _pixel_ss4_metrics(int(y), int(x)) if isinstance(row, dict)]
+			noise_row = next((row for row in noise_rows if row.get("noise_height_morph_range") is not None or row.get("candidate_noise_estimate_used") is not None), None)
+			if isinstance(noise_row, dict):
+				try:
+					noise_h = float(noise_row.get("noise_height_morph_range", noise_row.get("candidate_noise_estimate_used", np.nan)))
+				except Exception:
+					noise_h = float("nan")
+				try:
+					factor = float(noise_row.get("candidate_noise_height_factor", np.nan))
+				except Exception:
+					factor = float("nan")
+				try:
+					threshold = float(noise_row.get("candidate_noise_height_threshold", np.nan))
+				except Exception:
+					threshold = float("nan")
+				status = str(noise_row.get("noise_reference_status", ""))
+				noise_info = (
+					f"noise_h={_fmt_num(noise_h, 3)} | factor={_fmt_num(factor, 3)} | threshold={_fmt_num(threshold, 3)}"
+					if status == "ok" and np.isfinite(noise_h)
+					else "noise reference unavailable"
+				)
+				metric_info = f"{metric_info} || {noise_info}" if metric_info else noise_info
 		spec_info_head.set_text(header)
 		if need_segment_diagnostics and segs:
 			lead = max(segs, key=lambda sp: float(getattr(sp, "peak_height", 0.0)))
@@ -2665,7 +2912,7 @@ def show_hover_map(
 		"show_raw_edge_dense_ctx",
 		"show_erosion_contacts", "show_dilation_contacts", "show_contact_cells", "show_cell_salience_labels", "show_contact_cell_chords",
 		"secondary_spike_peaks", "show_secondary_ss4_labels",
-		"despike_chords", "located_muon", "primal_metrics",
+		"noise_filter", "show_noise_reference", "despike_chords", "located_muon", "primal_metrics",
 	]
 	all_actives = [
 		checked['raw'], checked['raw_d3'], checked['opening'], checked['erosion'], checked['dilation'], checked['top_hat'], checked['gradient'], checked['corrected'],
@@ -2675,7 +2922,7 @@ def show_hover_map(
 		metric_checked['show_raw_edge_dense_ctx'],
 		metric_checked['show_erosion_contacts'], metric_checked['show_dilation_contacts'], metric_checked['show_contact_cells'], metric_checked['show_cell_salience_labels'], metric_checked['show_contact_cell_chords'],
 		metric_checked['secondary_spike_peaks'], metric_checked['show_secondary_ss4_labels'],
-		metric_checked['despike_chords'], metric_checked['located_muon'], metric_checked['primal_metrics'],
+		metric_checked['noise_filter'], metric_checked['show_noise_reference'], metric_checked['despike_chords'], metric_checked['located_muon'], metric_checked['primal_metrics'],
 	]
 	chunk = int(np.ceil(len(all_labels) / 5))
 	check_axes = [ax_chk_1, ax_chk_2, ax_chk_3, ax_chk_4, ax_chk_5]

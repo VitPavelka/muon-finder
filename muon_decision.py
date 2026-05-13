@@ -112,6 +112,9 @@ def compute_ss4(
 		ss_red_min: float = 0.9999,
 		pce_red_min: float = 0.4,
 		rve_red_max: float = -0.1,
+		pce_dead_zone_enabled: bool = False,
+		pce_dead_zone_low: float = -0.8,
+		pce_dead_zone_high: float = -0.2,
 		missing_policy: str = "review",
 ) -> Dict[str, Any]:
 	"""
@@ -160,6 +163,13 @@ def compute_ss4(
 	if pce_zone == "red":
 		reason = "ss_orange_pce_red" if ss_zone == "orange" else "ss_red_pce_red"
 		return _score_payload(1.0, "spike", reason, ss_zone, pce_zone, rve_zone)
+	if (
+		bool(pce_dead_zone_enabled)
+		and ss_zone == "orange"
+		and pce_zone == "blue"
+		and float(pce_dead_zone_low) <= float(pce) <= float(pce_dead_zone_high)
+	):
+		return _score_payload(0.0, "non_spike", "ss_orange_pce_dead_zone_reject", ss_zone, pce_zone, rve_zone)
 	if not rve_ok:
 		return _score_payload(float("nan"), "review", "review_missing", ss_zone, pce_zone, rve_zone)
 	if rve_zone == "red":
@@ -167,6 +177,52 @@ def compute_ss4(
 		return _score_payload(1.0, "spike", reason, ss_zone, pce_zone, rve_zone)
 	reason = "ss_orange_pce_blue_rve_blue" if ss_zone == "orange" else "ss_red_pce_blue_rve_blue"
 	return _score_payload(0.0, "non_spike", reason, ss_zone, pce_zone, rve_zone)
+
+
+def compute_ss5(
+		ss1: float,
+		pce: float,
+		edge: float,
+		*,
+		ss1_threshold: float = 0.95,
+		pce_spike_min: float = 0.8,
+		edge_spike_max: float = -0.4,
+) -> Dict[str, Any]:
+	ss1_vote = bool(_is_finite_number(ss1) and float(ss1) >= float(ss1_threshold))
+	pce_vote = bool(_is_finite_number(pce) and float(pce) >= float(pce_spike_min))
+	edge_vote = bool(_is_finite_number(edge) and float(edge) <= float(edge_spike_max))
+	if not ss1_vote:
+		reason = "ss5_ss1_below_threshold"
+		score = 0.0
+		decision = "non_spike"
+	elif pce_vote and edge_vote:
+		reason = "ss5_ss1_pce_edge_red"
+		score = 1.0
+		decision = "spike"
+	elif pce_vote:
+		reason = "ss5_ss1_pce_red"
+		score = 1.0
+		decision = "spike"
+	elif edge_vote:
+		reason = "ss5_ss1_edge_red"
+		score = 1.0
+		decision = "spike"
+	else:
+		reason = "ss5_ss1_red_pce_edge_blue"
+		score = 0.0
+		decision = "non_spike"
+	return {
+		"spike_score_v5": float(score),
+		"ss5": float(score),
+		"ss5_decision": str(decision),
+		"ss5_reason": str(reason),
+		"ss5_ss1_vote": float(ss1_vote),
+		"ss5_pce_vote": float(pce_vote),
+		"ss5_edge_vote": float(edge_vote),
+		"ss5_ss1_threshold": float(ss1_threshold),
+		"ss5_pce_spike_min": float(pce_spike_min),
+		"ss5_edge_spike_max": float(edge_spike_max),
+	}
 
 
 def compute_spike_score_v4_three_friends(*args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -186,6 +242,9 @@ def annotate_feature_dict_with_spike_score_v4(
 		pce_red_min: float = 0.4,
 		rve_red_max: float = -0.1,
 		edge_red_min: Optional[float] = None,
+		pce_dead_zone_enabled: bool = False,
+		pce_dead_zone_low: float = -0.8,
+		pce_dead_zone_high: float = -0.2,
 		missing_policy: str = "review",
 ) -> Dict[str, Any]:
 	if edge_feature is not None:
@@ -203,10 +262,37 @@ def annotate_feature_dict_with_spike_score_v4(
 		ss_red_min=ss_red_min,
 		pce_red_min=pce_red_min,
 		rve_red_max=rve_red_max,
+		pce_dead_zone_enabled=pce_dead_zone_enabled,
+		pce_dead_zone_low=pce_dead_zone_low,
+		pce_dead_zone_high=pce_dead_zone_high,
 		missing_policy=missing_policy,
 	)
 	out["ss4_rve_feature"] = str(rve_feature)
 	out["ss4_rve_value"] = rve
+	return out
+
+
+def annotate_feature_dict_with_spike_score_v5(
+		features: Mapping[str, Any],
+		*,
+		edge_feature: str = "recdw_sum_0_90_raman_veto_evidence_signed",
+		ss1_threshold: float = 0.95,
+		pce_spike_min: float = 0.8,
+		edge_spike_max: float = -0.4,
+) -> Dict[str, Any]:
+	ss1 = float(features.get("spike_score_v1", np.nan))
+	pce = float(features.get("pce_negpref_t098_evidence_signed", np.nan))
+	edge = float(features.get(str(edge_feature), np.nan))
+	out = compute_ss5(
+		ss1,
+		pce,
+		edge,
+		ss1_threshold=ss1_threshold,
+		pce_spike_min=pce_spike_min,
+		edge_spike_max=edge_spike_max,
+	)
+	out["ss5_edge_feature"] = str(edge_feature)
+	out["ss5_edge_value"] = edge
 	return out
 
 
@@ -271,6 +357,14 @@ def get_muon_rule_v3_metric_thresholds(metric_name: str) -> Optional[tuple[float
 		return (float(MUON_RULE_V3_SCORE_LOW), float(MUON_RULE_V3_SCORE_HIGH), False)
 	if name == "muon_rule_v3_value":
 		return (float(MUON_RULE_V3_VALUE_LOW), float(MUON_RULE_V3_VALUE_HIGH), False)
+	if name in {"ss5", "spike_score_v5"}:
+		return (0.5, 0.5, False)
+	if name == "ss5_ss1_vote":
+		return (0.5, 0.5, False)
+	if name == "ss5_pce_vote":
+		return (0.5, 0.5, False)
+	if name == "ss5_edge_vote":
+		return (0.5, 0.5, True)
 	return None
 
 
