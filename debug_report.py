@@ -979,4 +979,5 @@ def build_debug_report(
 
 def save_debug_report_json(path: Path, report: Dict[str, Any]) -> None:
 	path = Path(path)
+	path.parent.mkdir(parents=True, exist_ok=True)
 	path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

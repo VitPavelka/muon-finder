@@ -22,9 +22,14 @@ from muon_pipeline import (
 	SpikeSegment
 )
 from despike import apply_despike
-from despike_contact_analysis import analyze_erosion_dilation_contact_cells, apply_contact_cell_despike_chords, save_despike_contact_debug_json
+from despike_contact_analysis import (
+	analyze_erosion_dilation_contact_cells,
+	apply_contact_cell_despike_chords,
+	build_despike_contact_debug_payload,
+	save_despike_contact_debug_json,
+)
 from viewer import show_hover_map
-from results_io import save_result_npz, save_spikes_csv
+from results_io import save_result_npz, save_spikes_csv, save_viewer_cache
 from debug_report import build_debug_report, save_debug_report_json
 from preprocess import resample_axis_and_spectra
 from feature_discrimination import compute_edge_width_metrics, compute_peak_curvature_features, compute_spike_score_v2_features
@@ -58,7 +63,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"save_corrected_in_npz": True,
 	"save_overlays_in_npz": True,
 	"debug_report_path": None,
-	"debug_report_enabled": True,
+	"debug_report_enabled": False,
+	"debug_feature_report_enabled": False,
+	"debug_feature_report_path": "outputs/debug_feature_report.json",
 	"labels_csv": None,
 	"debug_include_per_spectrum": True,
 	"debug_progress": True,
@@ -167,6 +174,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"secondary_uncertain_thr": 0.5,
 	"secondary_edge_rescue_ss_min": 0.85,
 	"despike_debug_json_path": "despike_debug.json",
+	"despike_debug_lite_enabled": True,
+	"despike_debug_lite_path": "outputs/despike_debug_lite.json",
+	"despike_debug_full_enabled": False,
+	"despike_debug_full_path": "outputs/despike_debug_full.json",
+	"debug_store_arrays": False,
+	"save_viewer_cache": True,
+	"viewer_cache_path": "outputs/viewer_cache.npz",
+	"threshold_calibration_enabled": True,
+	"threshold_calibration_dir": "outputs/threshold_calibration",
+	"threshold_calibration_make_plots": True,
+	"threshold_calibration_suggest_thresholds": True,
 }
 
 
@@ -276,6 +294,341 @@ def build_compact_subset(
 	return raw_compact, score_compact, cand_compact, overlay_compact, spikes_compact, coord_map, corr_compact
 
 
+def _ensure_parent_dir(path_like: Optional[Any]) -> Optional[Path]:
+	if path_like in (None, ""):
+		return None
+	path = Path(str(path_like))
+	path.parent.mkdir(parents=True, exist_ok=True)
+	return path
+
+
+def _invert_coord_map(coord_map: Optional[Dict[Tuple[int, int], Tuple[int, int]]]) -> Dict[Tuple[int, int], Tuple[int, int]]:
+	out: Dict[Tuple[int, int], Tuple[int, int]] = {}
+	for compact, source in (coord_map or {}).items():
+		out[(int(source[0]), int(source[1]))] = (int(compact[0]), int(compact[1]))
+	return out
+
+
+def _flatten_ss4_candidate_rows(metrics_by_pixel: Dict[Tuple[int, int], List[Dict[str, object]]]) -> List[Dict[str, object]]:
+	rows: List[Dict[str, object]] = []
+	seen: set[Tuple[int, int, int, int, int]] = set()
+	for (y, x), items in metrics_by_pixel.items():
+		for item in items:
+			row = dict(item)
+			row["y"] = int(row.get("y", y))
+			row["x"] = int(row.get("x", x))
+			row["peak_index"] = int(row.get("peak_index", -1))
+			row["start"] = int(row.get("start", -1))
+			row["end"] = int(row.get("end", -1))
+			row["candidate_id"] = str(row.get("candidate_id", f"{row['y']}:{row['x']}:{row['peak_index']}:{row['start']}:{row['end']}"))
+			key = (row["y"], row["x"], row["peak_index"], row["start"], row["end"])
+			if key in seen:
+				continue
+			seen.add(key)
+			rows.append(row)
+	return rows
+
+
+def _metric_float(row: Dict[str, object], key: str) -> float:
+	try:
+		return float(row.get(key, np.nan))
+	except Exception:
+		return float("nan")
+
+
+def _compute_ss4_decision_for_row(
+		row: Dict[str, object],
+		*,
+		ss_blue_max: float,
+		ss_red_min: float,
+		pce_red_min: float,
+		rve_red_max: float,
+		missing_policy: str,
+) -> Dict[str, Any]:
+	features = {
+		"spike_score_v1": _metric_float(row, "spike_score_v1"),
+		"pce_negpref_t098_evidence_signed": _metric_float(row, "pce_negpref_t098_evidence_signed"),
+		"recdw_sum_0_90_raman_veto_evidence_signed": _metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed"),
+	}
+	return annotate_feature_dict_with_spike_score_v4(
+		features,
+		edge_feature="recdw_sum_0_90_raman_veto_evidence_signed",
+		ss_blue_max=float(ss_blue_max),
+		ss_red_min=float(ss_red_min),
+		pce_red_min=float(pce_red_min),
+		edge_red_min=float(rve_red_max),
+		missing_policy=str(missing_policy),
+	)
+
+
+def _suggest_threshold_from_histogram(values: np.ndarray, current: float) -> float:
+	x = np.asarray(values, dtype=float)
+	x = x[np.isfinite(x)]
+	if x.size < 32 or not np.isfinite(current):
+		return float(current)
+	vmin = float(np.min(x))
+	vmax = float(np.max(x))
+	if vmax <= vmin + 1e-12:
+		return float(current)
+	bins = min(180, max(48, int(np.sqrt(x.size) * 3)))
+	counts, edges = np.histogram(x, bins=bins, range=(vmin, vmax))
+	if counts.size < 5:
+		return float(current)
+	kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=float)
+	smooth = np.convolve(counts.astype(float), kernel / np.sum(kernel), mode="same")
+	centers = 0.5 * (edges[:-1] + edges[1:])
+	local_min = []
+	for i in range(1, smooth.size - 1):
+		if smooth[i] <= smooth[i - 1] and smooth[i] <= smooth[i + 1]:
+			local_min.append(i)
+	if not local_min:
+		return float(current)
+	best_i = min(local_min, key=lambda i: abs(float(centers[i]) - float(current)))
+	return float(centers[best_i])
+
+
+def _write_simple_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	with path.open("w", encoding="utf-8", newline="") as f:
+		writer = csv.DictWriter(f, fieldnames=fieldnames)
+		writer.writeheader()
+		for row in rows:
+			writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def _run_threshold_calibration(
+		*,
+		rows: List[Dict[str, object]],
+		cfg: Dict[str, Any],
+		base_dir: Path,
+) -> None:
+	if not bool(cfg.get("threshold_calibration_enabled", True)):
+		print("Threshold calibration disabled.")
+		return
+	if not rows:
+		print("Threshold calibration skipped: no SS4 candidate rows.")
+		return
+	base_dir.mkdir(parents=True, exist_ok=True)
+	make_plots = bool(cfg.get("threshold_calibration_make_plots", True))
+	suggest = bool(cfg.get("threshold_calibration_suggest_thresholds", True))
+	ss_blue = float(cfg.get("ss4_ss_blue_max", cfg.get("spike_score_v4_ss_blue_max", 0.95)))
+	ss_red = float(cfg.get("ss4_ss_red_min", cfg.get("spike_score_v4_ss_red_min", 0.9999)))
+	pce_red = float(cfg.get("ss4_pce_red_min", cfg.get("spike_score_v4_pce_red_min", 0.4)))
+	rve_red = float(cfg.get("ss4_rve_red_max", cfg.get("spike_score_v4_edge_red_min", -0.1)))
+	missing_policy = str(cfg.get("ss4_missing_policy", cfg.get("spike_score_v4_missing_policy", "review")))
+
+	metric_specs = [
+		("spike_score_v1", "spike_score_v1", [ss_blue, ss_red]),
+		("pce_negpref_t098_evidence_signed", "pce", [pce_red]),
+		("recdw_sum_0_90_raman_veto_evidence_signed", "edge_rve", [rve_red]),
+	]
+	suggestions: Dict[str, float] = {
+		"ss1_blue": ss_blue,
+		"ss1_red": ss_red,
+		"pce": pce_red,
+		"edge_rve": rve_red,
+	}
+
+	try:
+		import matplotlib.pyplot as plt
+	except Exception:
+		plt = None  # type: ignore[assignment]
+		make_plots = False
+
+	for metric_key, metric_slug, thresholds in metric_specs:
+		values = np.asarray([_metric_float(r, metric_key) for r in rows], dtype=float)
+		values = values[np.isfinite(values)]
+		if values.size == 0:
+			continue
+		if metric_slug == "pce" and suggest:
+			suggestions["pce"] = _suggest_threshold_from_histogram(values, pce_red)
+		elif metric_slug == "edge_rve" and suggest:
+			suggestions["edge_rve"] = _suggest_threshold_from_histogram(values, rve_red)
+		elif metric_slug == "spike_score_v1" and suggest:
+			suggestions["ss1_blue"] = _suggest_threshold_from_histogram(values, ss_blue)
+			suggestions["ss1_red"] = _suggest_threshold_from_histogram(values, ss_red)
+		counts, edges = np.histogram(values, bins=min(180, max(48, int(np.sqrt(values.size) * 3))))
+		_write_simple_csv(
+			base_dir / f"threshold_calibration_{metric_slug}_hist.csv",
+			["bin_left", "bin_right", "count"],
+			[
+				{"bin_left": float(edges[i]), "bin_right": float(edges[i + 1]), "count": int(counts[i])}
+				for i in range(len(counts))
+			],
+		)
+		if make_plots and plt is not None:
+			fig, ax = plt.subplots(figsize=(7.5, 4.5))
+			ax.hist(values, bins=min(180, max(48, int(np.sqrt(values.size) * 3))), color="#4c78a8", alpha=0.84)
+			for thr in thresholds:
+				ax.axvline(float(thr), color="#d62728", linestyle="--", linewidth=1.4)
+			if metric_slug == "pce":
+				ax.axvline(float(suggestions["pce"]), color="#2ca02c", linestyle=":", linewidth=1.5)
+			elif metric_slug == "edge_rve":
+				ax.axvline(float(suggestions["edge_rve"]), color="#2ca02c", linestyle=":", linewidth=1.5)
+			elif metric_slug == "spike_score_v1":
+				ax.axvline(float(suggestions["ss1_blue"]), color="#2ca02c", linestyle=":", linewidth=1.2)
+				ax.axvline(float(suggestions["ss1_red"]), color="#2ca02c", linestyle=":", linewidth=1.2)
+			ax.set_title(f"Threshold calibration: {metric_slug}")
+			ax.set_xlabel(metric_key)
+			ax.set_ylabel("count")
+			ax.grid(alpha=0.18)
+			fig.tight_layout()
+			fig.savefig(base_dir / f"threshold_calibration_{metric_slug}.png", dpi=150)
+			plt.close(fig)
+
+	def _scenario_decisions(name: str, *, ss_blue_thr: float, ss_red_thr: float, pce_thr: float, rve_thr: float) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+		changed_rows: List[Dict[str, Any]] = []
+		new_spikes = 0
+		old_spikes = 0
+		spike_to_non = 0
+		non_to_spike = 0
+		review_changes = 0
+		pce_rescued_by_edge = 0
+		edge_affected = 0
+		for row in rows:
+			old_ss4 = _metric_float(row, "ss4")
+			old_decision = str(row.get("ss4_decision", "review"))
+			new_info = _compute_ss4_decision_for_row(
+				row,
+				ss_blue_max=ss_blue_thr,
+				ss_red_min=ss_red_thr,
+				pce_red_min=pce_thr,
+				rve_red_max=rve_thr,
+				missing_policy=missing_policy,
+			)
+			new_ss4 = _metric_float(new_info, "ss4")
+			new_decision = str(new_info.get("ss4_decision", "review"))
+			if np.isfinite(old_ss4) and old_ss4 >= 0.5:
+				old_spikes += 1
+			if np.isfinite(new_ss4) and new_ss4 >= 0.5:
+				new_spikes += 1
+			if old_decision != new_decision or (np.isfinite(old_ss4) != np.isfinite(new_ss4)) or (np.isfinite(old_ss4) and np.isfinite(new_ss4) and (old_ss4 >= 0.5) != (new_ss4 >= 0.5)):
+				if old_decision == "spike" and new_decision != "spike":
+					spike_to_non += 1
+				elif old_decision != "spike" and new_decision == "spike":
+					non_to_spike += 1
+				elif old_decision != new_decision:
+					review_changes += 1
+				if old_decision == "spike" and new_decision == "spike" and _metric_float(row, "pce_negpref_t098_evidence_signed") < pce_thr and _metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed") <= rve_thr:
+					pce_rescued_by_edge += 1
+				if _metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed") != _metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed"):
+					pass
+				changed_rows.append(
+					{
+						"scenario": name,
+						"source_y": int(row["y"]),
+						"source_x": int(row["x"]),
+						"peak_index": int(row["peak_index"]),
+						"spike_score_v1": _metric_float(row, "spike_score_v1"),
+						"pce_negpref_t098_evidence_signed": _metric_float(row, "pce_negpref_t098_evidence_signed"),
+						"recdw_sum_0_90_raman_veto_evidence_signed": _metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed"),
+						"old_ss4": old_ss4,
+						"old_decision": old_decision,
+						"new_ss4": new_ss4,
+						"new_decision": new_decision,
+						"old_reason": row.get("ss4_reason"),
+						"new_reason": new_info.get("ss4_reason"),
+					}
+				)
+			if pce_thr != pce_red and old_decision != new_decision:
+				if _metric_float(row, "pce_negpref_t098_evidence_signed") >= min(pce_thr, pce_red) and _metric_float(row, "pce_negpref_t098_evidence_signed") < max(pce_thr, pce_red):
+					if new_decision == "spike" and _metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed") <= rve_thr:
+						pce_rescued_by_edge += 1
+			if rve_thr != rve_red and old_decision != new_decision:
+				edge_affected += 1
+		return (
+			{
+				"scenario": name,
+				"current_spike_count": int(old_spikes),
+				"suggested_spike_count": int(new_spikes),
+				"spike_to_non_spike": int(spike_to_non),
+				"non_spike_to_spike": int(non_to_spike),
+				"review_or_missing_changes": int(review_changes),
+				"pce_affected_but_rescued_by_edge": int(pce_rescued_by_edge),
+				"edge_affected": int(edge_affected),
+			},
+			changed_rows,
+		)
+
+	scenarios = [
+		("pce_threshold", ss_blue, ss_red, suggestions["pce"], rve_red),
+		("edge_rve_threshold", ss_blue, ss_red, pce_red, suggestions["edge_rve"]),
+		("ss1_blue_threshold", suggestions["ss1_blue"], ss_red, pce_red, rve_red),
+		("ss1_red_threshold", ss_blue, suggestions["ss1_red"], pce_red, rve_red),
+	]
+	summaries: List[Dict[str, Any]] = []
+	all_changed: List[Dict[str, Any]] = []
+	for scenario_name, ss_blue_thr, ss_red_thr, pce_thr, rve_thr in scenarios:
+		summary, changed_rows = _scenario_decisions(
+			scenario_name,
+			ss_blue_thr=float(ss_blue_thr),
+			ss_red_thr=float(ss_red_thr),
+			pce_thr=float(pce_thr),
+			rve_thr=float(rve_thr),
+		)
+		summary["current_threshold"] = {
+			"ss_blue_max": ss_blue,
+			"ss_red_min": ss_red,
+			"pce_red_min": pce_red,
+			"rve_red_max": rve_red,
+		}
+		summary["suggested_threshold"] = {
+			"ss_blue_max": float(ss_blue_thr),
+			"ss_red_min": float(ss_red_thr),
+			"pce_red_min": float(pce_thr),
+			"rve_red_max": float(rve_thr),
+		}
+		summaries.append(summary)
+		all_changed.extend(changed_rows)
+
+	_write_simple_csv(
+		base_dir / "threshold_calibration_counts.csv",
+		[
+			"scenario",
+			"current_spike_count",
+			"suggested_spike_count",
+			"spike_to_non_spike",
+			"non_spike_to_spike",
+			"review_or_missing_changes",
+			"pce_affected_but_rescued_by_edge",
+			"edge_affected",
+		],
+		summaries,
+	)
+	_write_simple_csv(
+		base_dir / "threshold_calibration_changed_candidates.csv",
+		[
+			"scenario",
+			"source_y",
+			"source_x",
+			"peak_index",
+			"spike_score_v1",
+			"pce_negpref_t098_evidence_signed",
+			"recdw_sum_0_90_raman_veto_evidence_signed",
+			"old_ss4",
+			"old_decision",
+			"new_ss4",
+			"new_decision",
+			"old_reason",
+			"new_reason",
+		],
+		all_changed,
+	)
+	(base_dir / "threshold_calibration_summary.json").write_text(
+		json.dumps(
+			{
+				"suggestions": suggestions,
+				"summaries": summaries,
+				"n_rows": len(rows),
+			},
+			indent=2,
+			ensure_ascii=False,
+		),
+		encoding="utf-8",
+	)
+	print(f"Threshold calibration written to {base_dir}")
+
+
 def run(cfg: Dict[str, Any]) -> None:
 
 	start = time.time()
@@ -374,6 +727,15 @@ def run(cfg: Dict[str, Any]) -> None:
 	report: Optional[Dict[str, Any]] = None
 	ss4_selected_metadata: Dict[Tuple[int, int, int, int, int], Dict[str, Any]] = {}
 	ss4_candidate_metrics_by_pixel: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
+	debug_feature_report_enabled = bool(cfg.get("debug_feature_report_enabled", cfg.get("debug_report_enabled", False)))
+	debug_feature_report_path = cfg.get("debug_feature_report_path", cfg.get("debug_report_path"))
+	despike_debug_lite_enabled = bool(cfg.get("despike_debug_lite_enabled", True))
+	despike_debug_lite_path = cfg.get("despike_debug_lite_path")
+	despike_debug_full_enabled = bool(cfg.get("despike_debug_full_enabled", False))
+	despike_debug_full_path = cfg.get("despike_debug_full_path")
+	debug_store_arrays = bool(cfg.get("debug_store_arrays", False))
+	save_viewer_cache_enabled = bool(cfg.get("save_viewer_cache", True))
+	viewer_cache_path = cfg.get("viewer_cache_path")
 
 	def _robust_center_scale(vals: np.ndarray) -> Tuple[float, float]:
 		x = np.asarray(vals, dtype=float)
@@ -898,13 +1260,11 @@ def run(cfg: Dict[str, Any]) -> None:
 			secondary_edge_rescue_ss_min=float(cfg.get("secondary_edge_rescue_ss_min", 0.85)),
 		)
 		corrected = apply_contact_cell_despike_chords(raw, despike_contact_analysis)
-		if cfg.get("despike_debug_json_path"):
-			save_despike_contact_debug_json(Path(cfg["despike_debug_json_path"]), despike_contact_analysis)
 		if report is not None:
 			report["despike_contact_analysis_summary"] = {
 				"method": despike_contact_analysis.get("method"),
 				"n_parent_segments": despike_contact_analysis.get("n_parent_segments"),
-				"debug_json_path": str(cfg.get("despike_debug_json_path", "")),
+				"debug_json_path": str(despike_debug_lite_path or ""),
 			}
 
 
@@ -1019,7 +1379,22 @@ def run(cfg: Dict[str, Any]) -> None:
 			corrected_spectra=view_corrected,
 		)
 
-	# 7) Save data and report
+	source_to_compact = _invert_coord_map(source_coords_map)
+	viewer_contact_analysis = (
+		build_despike_contact_debug_payload(
+			despike_contact_analysis,
+			mode="full",
+			store_arrays=False,
+			source_to_compact=source_to_compact,
+		)
+		if isinstance(despike_contact_analysis, dict)
+		else None
+	)
+	viewer_diagnostics: List[Dict[str, Any]] = []
+	if isinstance(report, dict):
+		viewer_diagnostics = list(report.get("despike_diagnostics", []) or [])
+
+	# 7) Save data and reports
 	if cfg.get("save_npz_path"):
 		save_result_npz(
 			out_path=Path(cfg['save_npz_path']),
@@ -1035,10 +1410,74 @@ def run(cfg: Dict[str, Any]) -> None:
 	if cfg.get("save_spikes_csv_path"):
 		save_spikes_csv(path=Path(cfg["save_spikes_csv_path"]), spikes=spikes)
 
-	if bool(cfg.get("debug_report_enabled", True)) and cfg.get("debug_report_path"):
+	if despike_debug_lite_enabled and despike_contact_analysis is not None and despike_debug_lite_path:
+		lite_path = _ensure_parent_dir(despike_debug_lite_path)
+		if lite_path is not None:
+			lite_payload = build_despike_contact_debug_payload(
+				despike_contact_analysis,
+				mode="lite",
+				store_arrays=False,
+				source_to_compact=source_to_compact,
+			)
+			save_despike_contact_debug_json(lite_path, lite_payload)
+			print(f"Lightweight despike debug written to {lite_path}")
+	else:
+		print("Lightweight despike debug disabled.")
+
+	if despike_debug_full_enabled and despike_contact_analysis is not None and despike_debug_full_path:
+		full_path = _ensure_parent_dir(despike_debug_full_path)
+		if full_path is not None:
+			full_payload = build_despike_contact_debug_payload(
+				despike_contact_analysis,
+				mode="full",
+				store_arrays=debug_store_arrays,
+				source_to_compact=source_to_compact,
+			)
+			save_despike_contact_debug_json(full_path, full_payload)
+			print(f"Full despike debug written to {full_path}")
+	else:
+		print("Full debug disabled.")
+
+	if debug_feature_report_enabled and debug_feature_report_path:
+		report_path = _ensure_parent_dir(debug_feature_report_path)
 		if report is None:
 			report = _build_current_report()
-		save_debug_report_json(Path(cfg['debug_report_path']), report)
+		if report_path is not None:
+			save_debug_report_json(report_path, report)
+			print(f"Debug feature report written to {report_path}")
+	else:
+		print("Debug feature report disabled.")
+
+	if save_viewer_cache_enabled and viewer_cache_path:
+		cache_path = _ensure_parent_dir(viewer_cache_path)
+		if cache_path is not None:
+			save_viewer_cache(
+				cache_path,
+				x_axis=view_x,
+				spectra=view_spectra,
+				score_map=view_score,
+				candidate_mask=view_mask,
+				spikes_by_pixel=view_spikes_by_pixel,
+				overlays=view_overlays,
+				corrected_spectra=view_corrected,
+				source_coords_map=source_coords_map,
+				despike_contact_analysis=viewer_contact_analysis,
+				ss4_candidate_metrics_by_pixel=ss4_candidate_metrics_by_pixel,
+				despike_diagnostics=viewer_diagnostics,
+				viewer_status_text="PREVIEW FROM CACHE - pipeline was not run now",
+			)
+			print(f"Viewer cache written to {cache_path}")
+	else:
+		print("Viewer cache disabled.")
+
+	calib_dir = cfg.get("threshold_calibration_dir")
+	if not calib_dir:
+		calib_dir = str(Path("outputs") / "threshold_calibration")
+	_run_threshold_calibration(
+		rows=_flatten_ss4_candidate_rows(ss4_candidate_metrics_by_pixel),
+		cfg=cfg,
+		base_dir=Path(str(calib_dir)),
+	)
 
 	show_hover_map(
 		x_axis=view_x,
@@ -1049,15 +1488,15 @@ def run(cfg: Dict[str, Any]) -> None:
 		overlays=view_overlays,
 		source_coords_map=source_coords_map,
 		corrected_spectra=view_corrected,
-		despike_diagnostics=report.get("despike_diagnostics") if isinstance(report, dict) else None,
-		despike_contact_analysis=despike_contact_analysis,
+		despike_diagnostics=viewer_diagnostics,
+		despike_contact_analysis=viewer_contact_analysis,
 		ss4_candidate_metrics_by_pixel=ss4_candidate_metrics_by_pixel,
 		initial_checked={
 			"raw": True,
-			"top_hat": True,
-			"gradient": True,
+			"top_hat": False,
+			"gradient": False,
 			"dilation_minus_opening": False,
-			"corrected": False,
+			"corrected": True,
 		},
 		merge_duplicate_segments=merge_dups,
 		feature_expand_to_gradient_foot=bool(cfg.get("feature_expand_to_gradient_foot", True)),

@@ -803,4 +803,135 @@ def analyze_erosion_dilation_contact_cells(
 
 
 def save_despike_contact_debug_json(path: Path, analysis: Mapping[str, Any]) -> None:
+	Path(path).parent.mkdir(parents=True, exist_ok=True)
 	Path(path).write_text(json.dumps(_clean_value(dict(analysis)), indent=2), encoding="utf-8")
+
+
+def build_despike_contact_debug_payload(
+		analysis: Mapping[str, Any],
+		*,
+		mode: str = "lite",
+		store_arrays: bool = False,
+		source_to_compact: Optional[Mapping[Tuple[int, int], Tuple[int, int]]] = None,
+) -> Dict[str, Any]:
+	mode_norm = str(mode).strip().lower()
+	base = _clean_value(dict(analysis))
+	if mode_norm not in {"lite", "full"}:
+		mode_norm = "lite"
+	if mode_norm == "full" and store_arrays:
+		return dict(base)
+
+	def _strip_cell(cell: Mapping[str, Any], parent_idx: int) -> Dict[str, Any]:
+		row = {
+			"parent_id": f"parent_{parent_idx}",
+			"cell_id": f"parent_{parent_idx}_cell_{int(cell.get('cell_index', -1))}",
+			"cell_index": cell.get("cell_index"),
+			"cell_left": cell.get("cell_left"),
+			"cell_right": cell.get("cell_right"),
+			"cell_width": cell.get("cell_width"),
+			"contains_parent_apex": cell.get("contains_parent_apex"),
+			"overlaps_parent_segment": cell.get("overlaps_parent_segment"),
+			"contains_dilation_contact": cell.get("contains_dilation_contact"),
+			"n_dilation_contacts_inside_cell": cell.get("n_dilation_contacts_inside_cell"),
+			"salience_norm": cell.get("salience_norm"),
+			"salience_total_norm": cell.get("salience_total_norm"),
+			"salience_density_norm": cell.get("salience_density_norm"),
+			"secondary_preclassification": cell.get("secondary_preclassification"),
+			"secondary_final_class": cell.get("secondary_final_class"),
+			"secondary_final_is_spike": cell.get("secondary_final_is_spike"),
+			"secondary_final_source": cell.get("secondary_final_source"),
+			"secondary_ss4_ran": cell.get("secondary_ss4_ran"),
+			"secondary_ss4": cell.get("secondary_ss4"),
+			"secondary_ss4_decision": cell.get("secondary_ss4_decision"),
+			"secondary_ss4_reason": cell.get("secondary_ss4_reason"),
+			"secondary_ss1": cell.get("secondary_ss1"),
+			"secondary_pce": cell.get("secondary_pce"),
+			"secondary_edge": cell.get("secondary_edge"),
+			"secondary_anchor_index": cell.get("secondary_anchor_index"),
+			"secondary_anchor_source": cell.get("secondary_anchor_source"),
+		}
+		if mode_norm == "full":
+			for key, value in cell.items():
+				if key in row:
+					continue
+				if not store_arrays and isinstance(value, list) and len(value) > 32:
+					continue
+				if not store_arrays and key in {"chord_x", "chord_y"}:
+					continue
+				row[key] = value
+		return row
+
+	def _strip_chord(chord: Mapping[str, Any], parent_idx: int, chord_idx: int) -> Dict[str, Any]:
+		row = {
+			"parent_id": f"parent_{parent_idx}",
+			"chord_id": f"parent_{parent_idx}_chord_{chord_idx}",
+			"cell_indices": chord.get("cell_indices"),
+			"chord_method": chord.get("chord_method"),
+			"fixed_side": chord.get("fixed_side"),
+			"original_left_edge": chord.get("original_left_edge"),
+			"original_right_edge": chord.get("original_right_edge"),
+			"final_left_edge": chord.get("final_left_edge"),
+			"final_right_edge": chord.get("final_right_edge"),
+			"touch_index": chord.get("touch_index"),
+			"max_overshoot_before": chord.get("max_overshoot_before"),
+			"max_overshoot_after": chord.get("max_overshoot_after"),
+			"crossing_count_before": chord.get("crossing_count_before"),
+			"crossing_count_after": chord.get("crossing_count_after"),
+		}
+		if mode_norm == "full":
+			for key, value in chord.items():
+				if key in row:
+					continue
+				if not store_arrays and key in {"chord_x", "chord_y", "chord_x_index"}:
+					continue
+				row[key] = value
+		return row
+
+	parents_out: List[Dict[str, Any]] = []
+	for parent_idx, parent in enumerate(base.get("parents", []) or []):
+		if not isinstance(parent, dict):
+			continue
+		py = int(parent.get("y", -1)) if parent.get("y") is not None else -1
+		px = int(parent.get("x", -1)) if parent.get("x") is not None else -1
+		compact = source_to_compact.get((py, px)) if source_to_compact is not None else None
+		summary = dict(parent.get("summary", {}) or {})
+		chords = [_strip_chord(ch, parent_idx, chord_idx) for chord_idx, ch in enumerate(summary.get("final_despike_chords", []) or []) if isinstance(ch, dict)]
+		summary["final_despike_chords"] = chords
+		parent_row: Dict[str, Any] = {
+			"parent_id": f"parent_{parent_idx}",
+			"source_y": py,
+			"source_x": px,
+			"compact_y": int(compact[0]) if compact is not None else None,
+			"compact_x": int(compact[1]) if compact is not None else None,
+			"parent_start": parent.get("parent_start"),
+			"parent_end": parent.get("parent_end"),
+			"parent_apex": parent.get("parent_apex"),
+			"parent_peak_height": parent.get("parent_peak_height"),
+			"parent_ss4_value": parent.get("parent_ss4_value"),
+			"parent_ss4_reason": parent.get("parent_ss4_reason"),
+			"parent_ss1": parent.get("parent_ss1"),
+			"parent_pce": parent.get("parent_pce"),
+			"parent_edge": parent.get("parent_edge"),
+			"parent_edge_feature": parent.get("parent_edge_feature"),
+			"context_left": parent.get("context_left"),
+			"context_right": parent.get("context_right"),
+			"n_erosion_contacts": summary.get("n_erosion_contacts"),
+			"n_dilation_contacts": summary.get("n_dilation_contacts"),
+			"n_cells": summary.get("n_cells"),
+			"summary": summary,
+			"cells": [_strip_cell(c, parent_idx) for c in (parent.get("cells", []) or []) if isinstance(c, dict)],
+		}
+		if mode_norm == "full":
+			for key, value in parent.items():
+				if key in parent_row:
+					continue
+				if not store_arrays and key in {"erosion_contact_x", "erosion_contact_y", "dilation_contact_x", "dilation_contact_y", "erosion_contacts", "dilation_contacts"}:
+					continue
+				parent_row[key] = value
+		parents_out.append(parent_row)
+	return {
+		"method": base.get("method"),
+		"n_parent_segments": base.get("n_parent_segments"),
+		"config": base.get("config", {}),
+		"parents": parents_out,
+	}

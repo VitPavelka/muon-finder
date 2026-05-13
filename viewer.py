@@ -1,6 +1,8 @@
 # viewer.py
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
 from typing import Dict, Tuple, List, Optional, Literal
 
 import numpy as np
@@ -60,6 +62,7 @@ from muon_decision import (
 	annotate_feature_dict_with_muon_rule_v3,
 	classify_segment_with_muon_rule_v3,
 )
+from results_io import load_viewer_cache
 
 
 def show_hover_map(
@@ -140,6 +143,7 @@ def show_hover_map(
 		despike_contact_candidates_enabled: bool = True,
 		despike_contact_context_pad_pts: int = 4,
 		merge_max_width_pts: Optional[int] = None,
+		viewer_status_text: Optional[str] = None,
 ) -> None:
 	view_spikes_by_pixel = {
 		pix: list(segs)
@@ -269,6 +273,8 @@ def show_hover_map(
 	fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(16.0, 9.0))
 	plt.subplots_adjust(left=0.06, right=0.98, top=0.88, bottom=0.25, wspace=0.18)
 	fig.canvas.manager.set_window_title("Muon finder - hover viewer")
+	if viewer_status_text:
+		fig.text(0.5, 0.965, str(viewer_status_text), ha="center", va="center", color="#a63603", fontsize=10, alpha=0.95)
 	median_window_choices = (5, 9, 15, 31, 61, 81, 101, 125)
 	mean_window_choices = (5, 9, 15, 31, 61, 81, 101, 125)
 	opening_window_choices = (81, 101, 125)
@@ -716,6 +722,9 @@ def show_hover_map(
 		fig.canvas.flush_events()
 
 	def _apply_signal_visibility() -> None:
+		raw_is_corrected_compare = bool(checked.get("corrected", False)) and corrected_spectra is not None
+		lines["raw"].set_color("#d62728" if raw_is_corrected_compare else line_colors["raw"])
+		lines["corrected"].set_color(line_colors["corrected"])
 		for nm, ln in lines.items():
 			if nm == "corrected" and corrected_spectra is None:
 				ln.set_visible(False)
@@ -757,6 +766,19 @@ def show_hover_map(
 
 	def _primary_value(row: Dict[str, object], primary_key: str, legacy_key: str) -> object:
 		return row.get(primary_key, row.get(legacy_key))
+
+	def _line_between_indices(sig: np.ndarray, left_idx: int, right_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+		li = int(np.clip(left_idx, 0, max(0, sig.size - 1)))
+		ri = int(np.clip(right_idx, 0, max(0, sig.size - 1)))
+		if ri < li:
+			li, ri = ri, li
+		xs = np.asarray(x_axis[li:ri + 1], dtype=float)
+		if xs.size == 0:
+			return np.asarray([], dtype=float), np.asarray([], dtype=float)
+		if ri == li:
+			return xs, np.asarray([float(sig[li])], dtype=float)
+		ys = np.linspace(float(sig[li]), float(sig[ri]), int(ri - li + 1), dtype=float)
+		return xs, ys
 
 	def _pixel_ss4_metrics(y: int, x: int) -> List[Dict[str, object]]:
 		return list(ss4_metrics_by_pixel.get((int(y), int(x)), []))
@@ -1482,6 +1504,8 @@ def show_hover_map(
 						try:
 							cx = np.asarray(cell.get("chord_x", []), dtype=float)
 							cy = np.asarray(cell.get("chord_y", []), dtype=float)
+							if not (cx.size >= 2 and cx.size == cy.size and np.all(np.isfinite(cx)) and np.all(np.isfinite(cy))):
+								cx, cy = _line_between_indices(raw_sig, left, right)
 							if cx.size >= 2 and cx.size == cy.size and np.all(np.isfinite(cx)) and np.all(np.isfinite(cy)):
 								guide_specs.append({"metric": "show_contact_cell_chords", "kind": "polyline", "x": cx, "y": cy, "color": "#6a3d9a", "alpha": 0.70, "linewidth": 1.0})
 						except Exception:
@@ -1549,6 +1573,10 @@ def show_hover_map(
 								continue
 							cx = np.asarray(chord.get("chord_x", []), dtype=float)
 							cy = np.asarray(chord.get("chord_y", []), dtype=float)
+							if cx.size < 2 or cx.size != cy.size or not np.all(np.isfinite(cx)) or not np.all(np.isfinite(cy)):
+								fl = int(np.clip(int(chord.get("final_left_edge")), 0, N - 1))
+								fr = int(np.clip(int(chord.get("final_right_edge")), 0, N - 1))
+								cx, cy = _line_between_indices(raw_sig, fl, fr)
 							if cx.size < 2 or cx.size != cy.size or not np.all(np.isfinite(cx)) or not np.all(np.isfinite(cy)):
 								continue
 							method = str(chord.get("chord_method", "ordinary"))
@@ -2774,3 +2802,36 @@ def show_hover_map(
 	_update(0, 0)
 	_sync_inputs()
 	plt.show()
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser(description="MuonFinder viewer")
+	parser.add_argument("--cache", type=Path, default=None, help="Open viewer from a previously saved viewer cache.")
+	args = parser.parse_args()
+	if args.cache is None:
+		raise SystemExit("viewer.py currently supports cache launch via --cache.")
+	cache = load_viewer_cache(Path(args.cache))
+	show_hover_map(
+		x_axis=cache["x_axis"],
+		spectra=cache["spectra"],
+		score_map=cache["score_map"],
+		candidate_mask=cache["candidate_mask"],
+		spikes_by_pixel=cache["spikes_by_pixel"],
+		overlays=cache["overlays"],
+		source_coords_map=cache.get("source_coords_map"),
+		corrected_spectra=cache.get("corrected_spectra"),
+		despike_contact_analysis=cache.get("despike_contact_analysis"),
+		ss4_candidate_metrics_by_pixel=cache.get("ss4_candidate_metrics_by_pixel"),
+		despike_diagnostics=cache.get("despike_diagnostics"),
+		viewer_status_text=cache.get("viewer_status_text") or "PREVIEW FROM CACHE - pipeline was not run now",
+		initial_checked={
+			"raw": True,
+			"top_hat": True,
+			"gradient": True,
+			"corrected": False,
+		},
+	)
+
+
+if __name__ == "__main__":
+	main()
