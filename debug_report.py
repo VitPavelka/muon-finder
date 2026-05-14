@@ -115,6 +115,8 @@ def build_debug_report(
 		edge_mapping_fallback_to_old: bool = False,
 		edge_mapping_noise_guard_enabled: bool = False,
 		edge_robust_reference_enabled: bool = True,
+		edge_noise_guard_enabled: bool = True,
+		edge_noise_guard_factor: float = 3.0,
 		recdw_evidence_enabled: bool = True,
 		recdw_evidence_metrics: Sequence[str] = ("recdw_sum_0_90",),
 		recdw_z_clip: float = 6.0,
@@ -775,18 +777,26 @@ def build_debug_report(
 				mapping_noise_guard_enabled=bool(edge_mapping_noise_guard_enabled),
 				robust_reference_enabled=bool(edge_robust_reference_enabled),
 				robust_reference_noise=float(out["candidate_noise_estimate_used"]),
+				edge_noise_guard_enabled=bool(edge_noise_guard_enabled),
+				edge_noise_guard_factor=float(edge_noise_guard_factor),
+				edge_noise_guard_value=float(out.get("noise_height_morph_range", np.nan)),
 			)
 			_add_edge_width_aliases(out, raw_edge_ctx_metrics, source_prefix="raw_edge_ctx", alias_prefix="recdw")
 			edge_debug = raw_edge_ctx_metrics.get("raw_edge_ctx_debug")
 			if isinstance(edge_debug, dict):
 				for dbg_key in (
 					"edge_robust_reference_enabled",
+					"edge_noise_guard_enabled",
+					"edge_noise_guard_factor",
+					"edge_noise_guard_value",
 					"edge_reference_original",
+					"edge_reference_noise_guarded",
 					"edge_reference_robust",
 					"edge_reference_delta",
 					"edge_reference_noise_used",
 					"edge_reference_adjusted",
 					"edge_reference_reason",
+					"edge_reference_adjustment_reason",
 				):
 					out[dbg_key] = edge_debug.get(dbg_key)
 		if bool(rucdw_enabled) and raw_spectra is not None:

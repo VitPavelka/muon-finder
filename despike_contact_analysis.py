@@ -8,12 +8,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 import numpy as np
 
 from feature_discrimination import (
+	compute_edge_width_metrics,
 	compute_peak_curvature_features,
 	compute_spike_score_v2_features,
 	estimate_background_mad,
 )
+from morph1d import dilation_1d, erosion_1d
 from muon_pipeline import SpikeSegment
-from muon_decision import compute_ss4
+from muon_decision import compute_ss4, compute_ss5
 
 
 def _clean_value(value: Any) -> Any:
@@ -258,6 +260,288 @@ def _secondary_ss4_for_cell(
 	}
 
 
+def _compute_local_morph_contacts(signal: np.ndarray, *, strict_equal: bool = True, window_size: int = 3) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+	raw = np.asarray(signal, dtype=float)
+	raw2 = raw.reshape(1, 1, -1)
+	ero = erosion_1d(raw2, int(window_size)).reshape(-1).astype(float)
+	dil = dilation_1d(raw2, int(window_size)).reshape(-1).astype(float)
+	if bool(strict_equal):
+		eq = raw == ero
+		dq = raw == dil
+	else:
+		eq = np.isclose(raw, ero)
+		dq = np.isclose(raw, dil)
+	if not np.any(eq):
+		eq = np.isclose(raw, ero)
+	if not np.any(dq):
+		dq = np.isclose(raw, dil)
+	return ero, dil, np.flatnonzero(eq).astype(int), np.flatnonzero(dq).astype(int)
+
+
+def _build_working_cells(
+		raw: np.ndarray,
+		*,
+		context_left: int,
+		context_right: int,
+		parent_start: int,
+		parent_end: int,
+		parent_apex: int,
+		strict_equal: bool,
+		local_noise: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]], Optional[int]]:
+	ctx = np.asarray(raw[int(context_left):int(context_right) + 1], dtype=float)
+	ero_ctx, dil_ctx, ero_local, dil_local = _compute_local_morph_contacts(ctx, strict_equal=bool(strict_equal))
+	erosion_contacts = (ero_local + int(context_left)).astype(int)
+	dilation_contacts = (dil_local + int(context_left)).astype(int)
+	dilation_set = set(int(v) for v in dilation_contacts.tolist())
+	cells: List[Dict[str, Any]] = []
+	parent_apex_cell_index: Optional[int] = None
+	if erosion_contacts.size >= 2:
+		for idx, (left, right) in enumerate(zip(erosion_contacts[:-1], erosion_contacts[1:])):
+			left = int(left)
+			right = int(right)
+			if right <= left:
+				continue
+			ys = raw[left:right + 1].astype(float)
+			chord = np.linspace(float(raw[left]), float(raw[right]), right - left + 1)
+			excess = ys - chord
+			above = np.maximum(excess, 0.0)
+			below = np.maximum(-excess, 0.0)
+			chord_area_above = float(np.nansum(above))
+			chord_height_above = float(np.nanmax(above)) if above.size else 0.0
+			chord_area_below = float(np.nansum(below))
+			chord_area_total = float(chord_area_above + chord_area_below)
+			height_abs = float(np.nanmax(np.abs(excess))) if excess.size else 0.0
+			width = int(right - left + 1)
+			height_z = chord_height_above / max(float(local_noise), 1e-12)
+			area_z = chord_area_above / max(float(local_noise) * max(width, 1), 1e-12)
+			salience = float(max(height_z, math.sqrt(max(area_z, 0.0))))
+			height_abs_z = float(height_abs / max(float(local_noise), 1e-12))
+			area_total_z = float(chord_area_total / max(float(local_noise) * max(width, 1), 1e-12))
+			salience_total = float(max(height_abs_z, math.sqrt(max(area_total_z, 0.0))))
+			salience_density = float(salience_total / math.sqrt(max(width, 1)))
+			dil_inside = [int(v) for v in dilation_contacts.tolist() if left <= int(v) <= right]
+			contains_apex = bool(left <= int(parent_apex) <= right)
+			if contains_apex:
+				parent_apex_cell_index = int(idx)
+			cells.append({
+				"cell_index": int(idx),
+				"cell_left": int(left),
+				"cell_right": int(right),
+				"cell_width": int(width),
+				"contains_parent_apex": contains_apex,
+				"overlaps_parent_segment": bool(max(left, int(parent_start)) <= min(right, int(parent_end))),
+				"dilation_contact_indices_inside_cell": dil_inside,
+				"n_dilation_contacts_inside_cell": int(len(dil_inside)),
+				"contains_dilation_contact": bool(len(dil_inside) > 0),
+				"parent_apex_is_dilation_contact": bool(int(parent_apex) in dilation_set),
+				"chord_area_above": chord_area_above,
+				"chord_height_above": chord_height_above,
+				"chord_area_below": chord_area_below,
+				"chord_area_total": chord_area_total,
+				"height_abs": height_abs,
+				"height_z": float(height_z),
+				"area_z": float(area_z),
+				"salience": salience,
+				"height_abs_z": height_abs_z,
+				"area_total_z": area_total_z,
+				"salience_total": salience_total,
+				"salience_density": salience_density,
+				"chord_y": [float(v) for v in chord],
+			})
+	return ero_ctx, dil_ctx, erosion_contacts, dilation_contacts, cells, parent_apex_cell_index
+
+
+def _recdw_evidence_from_sum(value: float, *, center: float, scale: float, z_clip: float, support_z_scale: float) -> Tuple[float, float, float]:
+	if not (np.isfinite(value) and np.isfinite(center) and np.isfinite(scale) and float(scale) > 1e-12):
+		return float("nan"), float("nan"), float("nan")
+	z = float((float(value) - float(center)) / float(scale))
+	z_clipped = float(np.clip(z, -float(z_clip), float(z_clip)))
+	support = float(1.0 / (1.0 + math.exp(-z_clipped / max(float(support_z_scale), 1e-12))))
+	return z, support, float(2.0 * support - 1.0)
+
+
+def _evaluate_active_residual_candidate(
+		*,
+		raw: np.ndarray,
+		gradient: Optional[np.ndarray],
+		context_left: int,
+		context_right: int,
+		candidate_left: int,
+		candidate_right: int,
+		apex: int,
+		local_noise: float,
+		decision_profile: str,
+		ss4_ss_blue_max: float,
+		ss4_ss_red_min: float,
+		ss4_pce_red_min: float,
+		ss4_rve_red_max: float,
+		ss4_missing_policy: str,
+		ss5_ss1_threshold: float,
+		ss5_pce_spike_min: float,
+		ss5_edge_spike_max: float,
+		recdw_center: float,
+		recdw_scale: float,
+		recdw_z_clip: float,
+		recdw_support_z_scale: float,
+		edge_use_enhanced_spike_mapping: bool,
+		edge_mapping_levels_desc: Tuple[int, ...],
+		edge_mapping_refine_step_percent: int,
+		edge_mapping_min_level_percent: int,
+		edge_mapping_require_closed_interval: bool,
+		edge_mapping_use_apex_component: bool,
+		edge_mapping_enable_merge_guard: bool,
+		edge_mapping_max_width_jump_factor: float,
+		edge_mapping_max_width_jump_points: float,
+		edge_mapping_fallback_to_old: bool,
+		edge_mapping_noise_guard_enabled: bool,
+		edge_robust_reference_enabled: bool,
+		edge_noise_guard_enabled: bool,
+		edge_noise_guard_factor: float,
+		edge_noise_guard_value: float,
+) -> Dict[str, Any]:
+	n = int(raw.size)
+	a = int(np.clip(int(candidate_left), 0, n - 1))
+	b = int(np.clip(int(candidate_right), 0, n - 1))
+	if b < a:
+		a, b = b, a
+	apex = int(np.clip(int(apex), a, b))
+	raw_seg = np.asarray(raw[a:b + 1], dtype=float)
+	if raw_seg.size < 3:
+		return {"decision_score": float("nan"), "decision": "review", "reason": "candidate_too_short"}
+	if gradient is not None and np.asarray(gradient).size == n:
+		sig = np.asarray(gradient, dtype=float)
+	else:
+		sig = np.asarray(raw, dtype=float)
+	sig_seg = np.asarray(sig[a:b + 1], dtype=float)
+	apex_rel = int(np.clip(apex - a, 0, raw_seg.size - 1))
+	if sig_seg.size < 3 or not (0 < apex_rel < sig_seg.size - 1):
+		ss1 = float("nan")
+	else:
+		rise = np.diff(sig_seg)[: max(1, apex_rel)]
+		fall = np.diff(sig_seg)[max(1, apex_rel):]
+		rise_slope = float(np.nanmax(rise)) if rise.size else 0.0
+		fall_slope = float(np.nanmin(fall)) if fall.size else 0.0
+		bg = estimate_background_mad(sig, a, b)
+		bg = bg if np.isfinite(bg) and bg > 1e-12 else max(float(local_noise), 1e-12)
+		ss1 = float(0.5 * np.tanh((rise_slope / bg) / 6.0) + 0.5 * np.tanh((abs(fall_slope) / bg) / 6.0))
+	try:
+		bg = max(float(local_noise), 1e-12)
+		pce_features = compute_peak_curvature_features(sig_seg, bg, peak_rel=apex_rel)
+		tmp = dict(pce_features)
+		tmp["spike_score_v1"] = ss1
+		tmp.update(compute_spike_score_v2_features(tmp))
+		pce = float(tmp.get("pce_negpref_t098_evidence_signed", np.nan))
+	except Exception:
+		pce = float("nan")
+	edge_metrics = compute_edge_width_metrics(
+		raw,
+		detection_left=int(context_left),
+		detection_right=int(context_right),
+		prefix="raw_edge_ctx",
+		apex_idx=int(apex),
+		bg_mad=float(local_noise),
+		include_low_root_metrics=True,
+		low_root_noise_k_mad=1.0,
+		use_enhanced_spike_mapping=bool(edge_use_enhanced_spike_mapping),
+		mapping_levels_desc=tuple(int(v) for v in edge_mapping_levels_desc),
+		mapping_refine_step_percent=int(edge_mapping_refine_step_percent),
+		mapping_min_level_percent=int(edge_mapping_min_level_percent),
+		mapping_require_closed_interval=bool(edge_mapping_require_closed_interval),
+		mapping_use_apex_component=bool(edge_mapping_use_apex_component),
+		mapping_enable_merge_guard=bool(edge_mapping_enable_merge_guard),
+		mapping_max_width_jump_factor=float(edge_mapping_max_width_jump_factor),
+		mapping_max_width_jump_points=float(edge_mapping_max_width_jump_points),
+		mapping_fallback_to_old=bool(edge_mapping_fallback_to_old),
+		mapping_noise_guard_enabled=bool(edge_mapping_noise_guard_enabled),
+		robust_reference_enabled=bool(edge_robust_reference_enabled),
+		robust_reference_noise=float(local_noise),
+		edge_noise_guard_enabled=bool(edge_noise_guard_enabled),
+		edge_noise_guard_factor=float(edge_noise_guard_factor),
+		edge_noise_guard_value=float(edge_noise_guard_value),
+	)
+	recdw_sum_before_guard = float(edge_metrics.get("raw_edge_ctx_dense_width_sum_0_90", np.nan))
+	edge_debug = edge_metrics.get("raw_edge_ctx_debug")
+	dense_debug = edge_debug.get("dense_width_0_90", {}) if isinstance(edge_debug, dict) else {}
+	edge_noise_ratio = float(dense_debug.get("root_snr", np.nan)) if isinstance(dense_debug, dict) else float("nan")
+	edge_guard_passed = bool((not bool(edge_noise_guard_enabled)) or (np.isfinite(edge_noise_ratio) and edge_noise_ratio >= float(edge_noise_guard_factor)))
+	if not np.isfinite(recdw_sum_before_guard):
+		edge_guard_reason = "edge_value_missing"
+	elif not bool(edge_noise_guard_enabled):
+		edge_guard_reason = "guard_disabled"
+	elif not np.isfinite(edge_noise_ratio):
+		edge_guard_reason = "edge_noise_ratio_missing"
+	elif edge_guard_passed:
+		edge_guard_reason = "guard_passed"
+	else:
+		edge_guard_reason = "below_edge_noise_guard"
+	recdw_sum = float(recdw_sum_before_guard) if edge_guard_passed else float("nan")
+	edge_z, edge_support, edge_signed = _recdw_evidence_from_sum(
+		recdw_sum,
+		center=float(recdw_center),
+		scale=float(recdw_scale),
+		z_clip=float(recdw_z_clip),
+		support_z_scale=float(recdw_support_z_scale),
+	)
+	if str(decision_profile).strip().lower() == "ss5":
+		dec = compute_ss5(
+			ss1,
+			pce,
+			edge_signed,
+			ss1_threshold=float(ss5_ss1_threshold),
+			pce_spike_min=float(ss5_pce_spike_min),
+			edge_spike_max=float(ss5_edge_spike_max),
+		)
+		return {
+			"ss1": float(ss1),
+			"pce": float(pce),
+			"edge_raw_sum": float(recdw_sum),
+			"edge_noise_guard_factor": float(edge_noise_guard_factor),
+			"edge_noise_ratio": float(edge_noise_ratio) if np.isfinite(edge_noise_ratio) else float("nan"),
+			"edge_guard_passed": bool(edge_guard_passed),
+			"edge_guard_reason": str(edge_guard_reason),
+			"edge_value_before_guard": float(recdw_sum_before_guard) if np.isfinite(recdw_sum_before_guard) else float("nan"),
+			"edge_value_after_guard": float(recdw_sum) if np.isfinite(recdw_sum) else float("nan"),
+			"edge": float(edge_signed),
+			"edge_z": float(edge_z),
+			"edge_support01": float(edge_support),
+			"decision_profile": "ss5",
+			"decision_score": dec.get("ss5"),
+			"decision": dec.get("ss5_decision"),
+			"reason": dec.get("ss5_reason"),
+			"decision_debug": dec,
+		}
+	dec = compute_ss4(
+		ss1,
+		pce,
+		edge_signed,
+		ss_blue_max=float(ss4_ss_blue_max),
+		ss_red_min=float(ss4_ss_red_min),
+		pce_red_min=float(ss4_pce_red_min),
+		rve_red_max=float(ss4_rve_red_max),
+		missing_policy=str(ss4_missing_policy),
+	)
+	return {
+		"ss1": float(ss1),
+		"pce": float(pce),
+		"edge_raw_sum": float(recdw_sum),
+		"edge_noise_guard_factor": float(edge_noise_guard_factor),
+		"edge_noise_ratio": float(edge_noise_ratio) if np.isfinite(edge_noise_ratio) else float("nan"),
+		"edge_guard_passed": bool(edge_guard_passed),
+		"edge_guard_reason": str(edge_guard_reason),
+		"edge_value_before_guard": float(recdw_sum_before_guard) if np.isfinite(recdw_sum_before_guard) else float("nan"),
+		"edge_value_after_guard": float(recdw_sum) if np.isfinite(recdw_sum) else float("nan"),
+		"edge": float(edge_signed),
+		"edge_z": float(edge_z),
+		"edge_support01": float(edge_support),
+		"decision_profile": "ss4",
+		"decision_score": dec.get("ss4"),
+		"decision": dec.get("ss4_decision"),
+		"reason": dec.get("ss4_reason"),
+		"decision_debug": dec,
+	}
+
+
 def _line_between(raw: np.ndarray, left: int, right: int) -> np.ndarray:
 	if right <= left:
 		return np.asarray([float(raw[left])], dtype=float)
@@ -428,9 +712,7 @@ def apply_contact_cell_despike_chords(raw_spectra: np.ndarray, analysis: Mapping
 		for chord in (parent.get("summary", {}) or {}).get("final_despike_chords", []) or []:
 			try:
 				cell_indices = [int(v) for v in chord.get("cell_indices", [])]
-				if not cell_indices:
-					continue
-				if any(not bool(cells_by_index.get(int(ci), {}).get("secondary_final_is_spike", False)) for ci in cell_indices):
+				if cell_indices and any(not bool(cells_by_index.get(int(ci), {}).get("secondary_final_is_spike", False)) for ci in cell_indices):
 					continue
 				left = int(chord.get("final_left_edge"))
 				right = int(chord.get("final_right_edge"))
@@ -469,6 +751,33 @@ def analyze_erosion_dilation_contact_cells(
 		ss4_missing_policy: str = "review",
 		secondary_edge_rescue_ss_min: float = 0.85,
 		candidate_noise_height_factor: float = 3.0,
+		decision_profile: str = "ss4",
+		recdw_center: float = np.nan,
+		recdw_scale: float = np.nan,
+		recdw_z_clip: float = 6.0,
+		recdw_support_z_scale: float = 1.0,
+		ss5_ss1_threshold: float = 0.95,
+		ss5_pce_spike_min: float = 0.8,
+		ss5_edge_spike_max: float = -0.4,
+		despike_iterative_refinement_enabled: bool = True,
+		despike_iterative_max_removals_per_parent: int = 4,
+		despike_cluster_cleanup_enabled: bool = True,
+		despike_cluster_cleanup_max_passes: int = 1,
+		despike_residual_check_enabled: bool = True,
+		edge_use_enhanced_spike_mapping: bool = False,
+		edge_mapping_levels_desc: Sequence[int] = (95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 5),
+		edge_mapping_refine_step_percent: int = 1,
+		edge_mapping_min_level_percent: int = 1,
+		edge_mapping_require_closed_interval: bool = True,
+		edge_mapping_use_apex_component: bool = True,
+		edge_mapping_enable_merge_guard: bool = True,
+		edge_mapping_max_width_jump_factor: float = 2.5,
+		edge_mapping_max_width_jump_points: float = 8.0,
+		edge_mapping_fallback_to_old: bool = False,
+		edge_mapping_noise_guard_enabled: bool = False,
+		edge_robust_reference_enabled: bool = True,
+		edge_noise_guard_enabled: bool = True,
+		edge_noise_guard_factor: float = 3.0,
 ) -> Dict[str, Any]:
 	"""Build diagnostic erosion-contact cells for already accepted parent spikes."""
 	parent_metadata = parent_metadata or {}
@@ -616,46 +925,33 @@ def analyze_erosion_dilation_contact_cells(
 					"chord_x": [float(v) for v in xs],
 					"chord_y": [float(v) for v in chord],
 				})
-
+		spectrum_noise_height = meta.get("noise_height_morph_range", meta.get("candidate_noise_estimate_used"))
+		try:
+			spectrum_noise_height = float(spectrum_noise_height)
+		except Exception:
+			spectrum_noise_height = float("nan")
+		if not np.isfinite(spectrum_noise_height) or float(spectrum_noise_height) <= 0.0:
+			spectrum_noise_height = float(local_noise)
 		if cells:
 			s_norm = _finite_minmax_norm([float(c.get("salience", np.nan)) for c in cells])
 			t_norm = _finite_minmax_norm([float(c.get("salience_total", np.nan)) for c in cells])
 			d_norm = _finite_minmax_norm([float(c.get("salience_density", np.nan)) for c in cells])
-			degenerate_context = bool(len(cells) <= 2 or _has_only_trivial_binary_norm(t_norm))
-			spectrum_noise_height = meta.get("noise_height_morph_range", meta.get("candidate_noise_estimate_used"))
-			try:
-				spectrum_noise_height = float(spectrum_noise_height)
-			except Exception:
-				spectrum_noise_height = float("nan")
-			if not np.isfinite(spectrum_noise_height) or float(spectrum_noise_height) <= 0.0:
-				spectrum_noise_height = float(local_noise)
 			for c, sv, tv, dv in zip(cells, s_norm, t_norm, d_norm):
 				c["salience_norm"] = sv
 				c["salience_total_norm"] = tv
 				c["salience_density_norm"] = dv
-				c["cell_low_t_degenerate_context"] = bool(degenerate_context)
 				dil_inside = [int(v) for v in c.get("dilation_contact_indices_inside_cell", []) or []]
 				if bool(c.get("contains_parent_apex", False)):
-					c["secondary_anchor_index"] = int(apex)
-					c["secondary_anchor_source"] = "parent_apex"
+					anchor_idx = int(apex)
+					anchor_source = "parent_apex"
 				elif dil_inside:
-					c["secondary_anchor_index"] = int(max(dil_inside, key=lambda idx: float(raw[int(idx)])))
-					c["secondary_anchor_source"] = "dilation_contact_max_raw"
+					anchor_idx = int(max(dil_inside, key=lambda idx: float(raw[int(idx)])))
+					anchor_source = "dilation_contact_max_raw"
 				else:
-					c["secondary_anchor_index"] = int((int(c["cell_left"]) + int(c["cell_right"])) // 2)
-					c["secondary_anchor_source"] = "cell_center"
-				if bool(c.get("contains_parent_apex", False)):
-					pre = "definite_parent_spike"
-				elif not np.isfinite(tv):
-					pre = "uncertain"
-				elif tv < float(secondary_noise_thr):
-					pre = "definite_noise"
-				elif tv >= float(secondary_uncertain_thr):
-					pre = "definite_spike"
-				else:
-					pre = "uncertain"
-				c["secondary_preclassification"] = pre
-				anchor_idx = int(c.get("secondary_anchor_index", (int(c["cell_left"]) + int(c["cell_right"])) // 2))
+					anchor_idx = int((int(c["cell_left"]) + int(c["cell_right"])) // 2)
+					anchor_source = "cell_center"
+				c["secondary_anchor_index"] = int(anchor_idx)
+				c["secondary_anchor_source"] = str(anchor_source)
 				cell_height, cell_chord_y = _cell_height_above_chord(raw, int(c["cell_left"]), int(c["cell_right"]), anchor_idx)
 				cell_noise_ratio = (
 					float(cell_height / spectrum_noise_height)
@@ -666,71 +962,11 @@ def analyze_erosion_dilation_contact_cells(
 				c["cell_chord_y_at_anchor"] = float(cell_chord_y) if np.isfinite(cell_chord_y) else float("nan")
 				c["cell_height_ratio_to_noise"] = float(cell_noise_ratio) if np.isfinite(cell_noise_ratio) else float("nan")
 				c["cell_noise_height_threshold"] = float(candidate_noise_height_factor)
-				if pre == "definite_parent_spike":
-					c["secondary_final_class"] = "spike"
-					c["secondary_final_is_spike"] = True
-					c["secondary_final_source"] = "parent_apex"
-					c["secondary_ss4_ran"] = False
-				elif pre == "definite_noise":
-					if bool(degenerate_context) and not bool(c.get("contains_parent_apex", False)):
-						if np.isfinite(cell_noise_ratio) and cell_noise_ratio >= float(candidate_noise_height_factor):
-							sec = _secondary_ss4_for_cell(
-								raw=raw,
-								gradient=grad,
-								left=int(c["cell_left"]),
-								right=int(c["cell_right"]),
-								preferred_apex=None,
-								dilation_contacts=[int(v) for v in c.get("dilation_contact_indices_inside_cell", []) or []],
-								local_noise=local_noise,
-								ss_blue_max=float(ss4_ss_blue_max),
-								ss_red_min=float(ss4_ss_red_min),
-								pce_red_min=float(ss4_pce_red_min),
-								rve_red_max=float(ss4_rve_red_max),
-								missing_policy=str(ss4_missing_policy),
-								edge_rescue_ss_min=float(secondary_edge_rescue_ss_min),
-							)
-							sec["secondary_ss4_reason_for_run"] = "degenerate_t_low_cell_above_noise"
-							c.update(sec)
-							is_spike = bool(str(sec.get("secondary_ss4_decision", "")) == "spike" and float(sec.get("secondary_ss4", np.nan)) == 1.0)
-							c["secondary_final_class"] = "spike" if is_spike else "non_spike"
-							c["secondary_final_is_spike"] = is_spike
-							c["secondary_final_source"] = "secondary_ss4"
-						else:
-							c["secondary_final_class"] = "non_spike"
-							c["secondary_final_is_spike"] = False
-							c["secondary_final_source"] = "degenerate_t_noise_height"
-							c["secondary_ss4_ran"] = False
-					else:
-						c["secondary_final_class"] = "non_spike"
-						c["secondary_final_is_spike"] = False
-						c["secondary_final_source"] = "t_norm_noise"
-						c["secondary_ss4_ran"] = False
-				elif pre == "definite_spike":
-					c["secondary_final_class"] = "spike"
-					c["secondary_final_is_spike"] = True
-					c["secondary_final_source"] = "t_norm_spike"
-					c["secondary_ss4_ran"] = False
-				else:
-					sec = _secondary_ss4_for_cell(
-						raw=raw,
-						gradient=grad,
-						left=int(c["cell_left"]),
-						right=int(c["cell_right"]),
-						preferred_apex=(int(apex) if bool(c.get("contains_parent_apex", False)) else None),
-						dilation_contacts=[int(v) for v in c.get("dilation_contact_indices_inside_cell", []) or []],
-						local_noise=local_noise,
-						ss_blue_max=float(ss4_ss_blue_max),
-						ss_red_min=float(ss4_ss_red_min),
-						pce_red_min=float(ss4_pce_red_min),
-						rve_red_max=float(ss4_rve_red_max),
-						missing_policy=str(ss4_missing_policy),
-						edge_rescue_ss_min=float(secondary_edge_rescue_ss_min),
-					)
-					c.update(sec)
-					is_spike = bool(str(sec.get("secondary_ss4_decision", "")) == "spike" and float(sec.get("secondary_ss4", np.nan)) == 1.0)
-					c["secondary_final_class"] = "spike" if is_spike else "non_spike"
-					c["secondary_final_is_spike"] = is_spike
-					c["secondary_final_source"] = "secondary_ss4"
+				c["secondary_preclassification"] = "diagnostic_only"
+				c["secondary_final_class"] = "unknown"
+				c["secondary_final_is_spike"] = False
+				c["secondary_final_source"] = "iterative_despike_pending"
+				c["secondary_ss4_ran"] = False
 
 		cells_overlapping = [int(c["cell_index"]) for c in cells if bool(c["overlaps_parent_segment"])]
 		cells_inside = [int(c["cell_index"]) for c in cells if int(c["cell_left"]) >= start and int(c["cell_right"]) <= end]
@@ -739,54 +975,280 @@ def analyze_erosion_dilation_contact_cells(
 		candidate_spike = [int(c["cell_index"]) for c in cells if c["cell_label"] == "candidate_spike_cell"]
 		candidate_multi = [int(c["cell_index"]) for c in cells if c["cell_label"] == "candidate_multispike_cell"]
 		uncertain = [int(c["cell_index"]) for c in cells if c["cell_label"] == "mixed_or_uncertain_cell"]
-		secondary_spike_cells = [int(c["cell_index"]) for c in cells if bool(c.get("secondary_final_is_spike", False))]
-		secondary_uncertain_cells = [int(c["cell_index"]) for c in cells if str(c.get("secondary_preclassification", "")).startswith("uncertain")]
-		secondary_groups: List[Dict[str, Any]] = []
-		if secondary_spike_cells:
-			by_idx = {int(c["cell_index"]): c for c in cells}
-			cur: List[int] = []
-			for idx in sorted(secondary_spike_cells):
-				if not cur or idx == cur[-1] + 1:
-					cur.append(idx)
-				else:
-					group_cells = [by_idx[i] for i in cur if i in by_idx]
-					if group_cells:
-						secondary_groups.append({
-							"cell_indices": [int(i) for i in cur],
-							"left": int(min(int(c["cell_left"]) for c in group_cells)),
-							"right": int(max(int(c["cell_right"]) for c in group_cells)),
-							"merge_rule": "neighboring_spike_cells",
-						})
-					cur = [idx]
-			group_cells = [by_idx[i] for i in cur if i in by_idx]
-			if group_cells:
-				secondary_groups.append({
-					"cell_indices": [int(i) for i in cur],
-					"left": int(min(int(c["cell_left"]) for c in group_cells)),
-					"right": int(max(int(c["cell_right"]) for c in group_cells)),
-					"merge_rule": "neighboring_spike_cells",
-				})
+		stage_rows: List[Dict[str, Any]] = [{
+			"stage_index": 0,
+			"stage_name": "raw",
+			"removed_by": "none",
+			"working_stage_name": "raw",
+			"removed_regions": [],
+		}]
 		final_chords: List[Dict[str, Any]] = []
-		for group in secondary_groups:
+		removed_regions: List[Tuple[int, int]] = []
+		dirty_left = int(start)
+		dirty_right = int(end)
+		cells_by_index = {int(c["cell_index"]): c for c in cells}
+		parent_cell = cells_by_index.get(int(parent_apex_cell_index)) if parent_apex_cell_index is not None else None
+		if parent_cell is not None:
+			parent_left = int(parent_cell["cell_left"])
+			parent_right = int(parent_cell["cell_right"])
+		else:
+			left_ero = [int(v) for v in erosion_contacts.tolist() if int(v) < int(apex)]
+			right_ero = [int(v) for v in erosion_contacts.tolist() if int(v) > int(apex)]
+			parent_left = int(left_ero[-1]) if left_ero else int(start)
+			parent_right = int(right_ero[0]) if right_ero else int(end)
+		parent_chord = _build_final_chord(raw, parent_left, parent_right, required_indices=[int(apex)])
+		parent_chord.update({
+			"chord_id": f"{parent_id}:chord:{len(final_chords)}",
+			"parent_id": parent_id,
+			"cell_indices": ([] if parent_apex_cell_index is None else [int(parent_apex_cell_index)]),
+			"y": int(y),
+			"x": int(x),
+			"chord_x": [float(x_axis[int(v)]) for v in parent_chord.get("chord_x_index", [])],
+			"removed_by": "primary_parent",
+			"removed_reason": "primary_parent",
+			"removed_apex": int(apex),
+		})
+		final_chords.append(parent_chord)
+		removed_regions.append((int(parent_chord["final_left_edge"]), int(parent_chord["final_right_edge"])))
+		dirty_left = min(dirty_left, int(parent_chord["final_left_edge"]))
+		dirty_right = max(dirty_right, int(parent_chord["final_right_edge"]))
+		stage_rows.append({
+			"stage_index": 1,
+			"stage_name": "after_parent_removal",
+			"working_stage_name": "primary_parent",
+			"removed_by": "primary_parent",
+			"removed_interval_left": int(parent_chord["final_left_edge"]),
+			"removed_interval_right": int(parent_chord["final_right_edge"]),
+			"removed_apex": int(apex),
+			"removed_regions": [[int(lv), int(rv)] for lv, rv in removed_regions],
+		})
+		cluster_cleanup_applied = False
+		cluster_cleanup_passes = 0
+		iteration_rows: List[Dict[str, Any]] = []
+		active_profile = str(decision_profile).strip().lower()
+		iter_limit = max(1, int(despike_iterative_max_removals_per_parent))
+		if bool(despike_iterative_refinement_enabled):
+			for iter_idx in range(1, iter_limit):
+				working = raw.copy()
+				for chord in final_chords:
+					try:
+						fl = int(chord.get("final_left_edge"))
+						fr = int(chord.get("final_right_edge"))
+						chy = np.asarray(chord.get("chord_y", []), dtype=float)
+					except Exception:
+						continue
+					if chy.size == max(fr - fl + 1, 0):
+						working[fl:fr + 1] = chy
+				_, _, _, _, iter_cells, _ = _build_working_cells(
+					working,
+					context_left=int(cl),
+					context_right=int(cr),
+					parent_start=int(start),
+					parent_end=int(end),
+					parent_apex=int(apex),
+					strict_equal=bool(strict_equal),
+					local_noise=float(local_noise),
+				)
+				candidates_iter: List[Dict[str, Any]] = []
+				uncertain_dirty: List[Dict[str, Any]] = []
+				for cell in iter_cells:
+					left_i = int(cell["cell_left"])
+					right_i = int(cell["cell_right"])
+					if any(max(left_i, lv) < min(right_i, rv) for lv, rv in removed_regions):
+						continue
+					dil_inside = [int(v) for v in cell.get("dilation_contact_indices_inside_cell", []) or []]
+					if dil_inside:
+						apex_i = int(max(dil_inside, key=lambda idx: float(working[int(idx)])))
+					else:
+						apex_i = int(left_i + int(np.nanargmax(working[left_i:right_i + 1])))
+					height_above = float(cell.get("height_abs", np.nan))
+					height_ratio = float(height_above / max(float(spectrum_noise_height), 1e-12)) if np.isfinite(height_above) else float("nan")
+					base_row = {
+						"iteration_index": int(iter_idx),
+						"candidate_left": int(left_i),
+						"candidate_right": int(right_i),
+						"candidate_apex": int(apex_i),
+						"height_above_chord": float(height_above) if np.isfinite(height_above) else np.nan,
+						"height_ratio_to_noise": float(height_ratio) if np.isfinite(height_ratio) else np.nan,
+					}
+					if not np.isfinite(height_ratio) or height_ratio < float(candidate_noise_height_factor):
+						base_row["residual_status"] = "below_noise"
+						iteration_rows.append(base_row)
+						continue
+					decision_row = _evaluate_active_residual_candidate(
+						raw=working,
+						gradient=grad,
+						context_left=int(cl),
+						context_right=int(cr),
+						candidate_left=int(left_i),
+						candidate_right=int(right_i),
+						apex=int(apex_i),
+						local_noise=float(local_noise),
+						decision_profile=active_profile,
+						ss4_ss_blue_max=float(ss4_ss_blue_max),
+						ss4_ss_red_min=float(ss4_ss_red_min),
+						ss4_pce_red_min=float(ss4_pce_red_min),
+						ss4_rve_red_max=float(ss4_rve_red_max),
+						ss4_missing_policy=str(ss4_missing_policy),
+						ss5_ss1_threshold=float(ss5_ss1_threshold),
+						ss5_pce_spike_min=float(ss5_pce_spike_min),
+						ss5_edge_spike_max=float(ss5_edge_spike_max),
+						recdw_center=float(recdw_center),
+						recdw_scale=float(recdw_scale),
+						recdw_z_clip=float(recdw_z_clip),
+						recdw_support_z_scale=float(recdw_support_z_scale),
+						edge_use_enhanced_spike_mapping=bool(edge_use_enhanced_spike_mapping),
+						edge_mapping_levels_desc=tuple(int(v) for v in edge_mapping_levels_desc),
+						edge_mapping_refine_step_percent=int(edge_mapping_refine_step_percent),
+						edge_mapping_min_level_percent=int(edge_mapping_min_level_percent),
+						edge_mapping_require_closed_interval=bool(edge_mapping_require_closed_interval),
+						edge_mapping_use_apex_component=bool(edge_mapping_use_apex_component),
+						edge_mapping_enable_merge_guard=bool(edge_mapping_enable_merge_guard),
+						edge_mapping_max_width_jump_factor=float(edge_mapping_max_width_jump_factor),
+						edge_mapping_max_width_jump_points=float(edge_mapping_max_width_jump_points),
+						edge_mapping_fallback_to_old=bool(edge_mapping_fallback_to_old),
+						edge_mapping_noise_guard_enabled=bool(edge_mapping_noise_guard_enabled),
+						edge_robust_reference_enabled=bool(edge_robust_reference_enabled),
+						edge_noise_guard_enabled=bool(edge_noise_guard_enabled),
+						edge_noise_guard_factor=float(edge_noise_guard_factor),
+						edge_noise_guard_value=float(spectrum_noise_height),
+					)
+					decision_payload = {**base_row, **decision_row}
+					decision_payload["residual_status"] = "above_noise"
+					decision_payload["inside_dirty_region"] = bool(max(left_i, dirty_left) <= min(right_i, dirty_right))
+					iteration_rows.append(decision_payload)
+					if str(decision_row.get("decision", "")).strip().lower() == "spike":
+						candidates_iter.append(decision_payload)
+					elif bool(decision_payload["inside_dirty_region"]):
+						uncertain_dirty.append(decision_payload)
+				if candidates_iter:
+					best = max(candidates_iter, key=lambda row: float(row.get("height_ratio_to_noise", -np.inf)))
+					chord = _build_final_chord(raw, int(best["candidate_left"]), int(best["candidate_right"]), required_indices=[int(best["candidate_apex"])])
+					chord.update({
+						"chord_id": f"{parent_id}:chord:{len(final_chords)}",
+						"parent_id": parent_id,
+						"cell_indices": [],
+						"y": int(y),
+						"x": int(x),
+						"chord_x": [float(x_axis[int(v)]) for v in chord.get("chord_x_index", [])],
+						"removed_by": f"residual_{active_profile}",
+						"removed_reason": str(best.get("reason", "")),
+						"removed_apex": int(best["candidate_apex"]),
+					})
+					final_chords.append(chord)
+					removed_regions.append((int(chord["final_left_edge"]), int(chord["final_right_edge"])))
+					dirty_left = min(dirty_left, int(chord["final_left_edge"]))
+					dirty_right = max(dirty_right, int(chord["final_right_edge"]))
+					stage_rows.append({
+						"stage_index": int(len(stage_rows)),
+						"stage_name": f"after_residual_removal_{iter_idx}",
+						"working_stage_name": f"residual_{active_profile}",
+						"removed_by": f"residual_{active_profile}",
+						"removed_interval_left": int(chord["final_left_edge"]),
+						"removed_interval_right": int(chord["final_right_edge"]),
+						"removed_apex": int(best["candidate_apex"]),
+						"height_above_chord": best.get("height_above_chord"),
+						"height_ratio_to_noise": best.get("height_ratio_to_noise"),
+						"ss1": best.get("ss1"),
+						"pce": best.get("pce"),
+						"edge": best.get("edge"),
+						"decision_score": best.get("decision_score"),
+						"decision": best.get("decision"),
+						"reason": best.get("reason"),
+						"removed_regions": [[int(lv), int(rv)] for lv, rv in removed_regions],
+					})
+					continue
+				if bool(despike_cluster_cleanup_enabled) and int(cluster_cleanup_passes) < max(1, int(despike_cluster_cleanup_max_passes)) and uncertain_dirty:
+					cluster_left = min([int(v[0]) for v in removed_regions] + [int(r["candidate_left"]) for r in uncertain_dirty])
+					cluster_right = max([int(v[1]) for v in removed_regions] + [int(r["candidate_right"]) for r in uncertain_dirty])
+					chord = _build_final_chord(raw, int(cluster_left), int(cluster_right), required_indices=[int(apex)])
+					chord.update({
+						"chord_id": f"{parent_id}:chord:{len(final_chords)}",
+						"parent_id": parent_id,
+						"cell_indices": [],
+						"y": int(y),
+						"x": int(x),
+						"chord_x": [float(x_axis[int(v)]) for v in chord.get("chord_x_index", [])],
+						"removed_by": "cluster_cleanup",
+						"removed_reason": "uncertain_residual_inside_dirty_region",
+						"removed_apex": int(apex),
+					})
+					final_chords.append(chord)
+					removed_regions.append((int(chord["final_left_edge"]), int(chord["final_right_edge"])))
+					dirty_left = min(dirty_left, int(chord["final_left_edge"]))
+					dirty_right = max(dirty_right, int(chord["final_right_edge"]))
+					cluster_cleanup_applied = True
+					cluster_cleanup_passes += 1
+					stage_rows.append({
+						"stage_index": int(len(stage_rows)),
+						"stage_name": "after_cluster_cleanup",
+						"working_stage_name": "cluster_cleanup",
+						"removed_by": "cluster_cleanup",
+						"removed_interval_left": int(chord["final_left_edge"]),
+						"removed_interval_right": int(chord["final_right_edge"]),
+						"removed_apex": int(apex),
+						"removed_regions": [[int(lv), int(rv)] for lv, rv in removed_regions],
+					})
+				break
+		secondary_spike_cells = []
+		secondary_uncertain_cells = []
+		chord_cell_map: Dict[int, Dict[str, Any]] = {}
+		for chord_idx, chord in enumerate(final_chords):
+			chord["applied_to_corrected"] = True
 			try:
-				gl = int(group["left"])
-				gr = int(group["right"])
+				fl = int(chord.get("final_left_edge"))
+				fr = int(chord.get("final_right_edge"))
 			except Exception:
 				continue
-			required = [
-				int(c.get("secondary_anchor_index"))
-				for c in cells
-				if int(c.get("cell_index", -1)) in set(int(v) for v in group.get("cell_indices", []))
-				and c.get("secondary_anchor_index") is not None
-			]
-			chord = _build_final_chord(raw, gl, gr, required_indices=required)
-			chord["chord_id"] = f"{parent_id}:chord:{len(final_chords)}"
-			chord["parent_id"] = parent_id
-			chord["cell_indices"] = [int(v) for v in group.get("cell_indices", [])]
-			chord["y"] = int(y)
-			chord["x"] = int(x)
-			chord["chord_x"] = [float(x_axis[int(v)]) for v in chord.get("chord_x_index", [])]
-			final_chords.append(chord)
+			for cell in cells:
+				try:
+					left_i = int(cell["cell_left"])
+					right_i = int(cell["cell_right"])
+				except Exception:
+					continue
+				if max(left_i, fl) < min(right_i, fr):
+					cell_idx = int(cell["cell_index"])
+					if cell_idx not in chord_cell_map:
+						chord_cell_map[cell_idx] = {
+							"chord_index": int(chord_idx),
+							"chord_id": str(chord.get("chord_id", f"{parent_id}:chord:{chord_idx}")),
+							"final_interval_id": str(chord.get("chord_id", f"{parent_id}:chord:{chord_idx}")),
+							"removed_by": str(chord.get("removed_by", "")),
+							"chord_left": fl,
+							"chord_right": fr,
+						}
+		for cell in cells:
+			cell_idx = int(cell["cell_index"])
+			chord_info = chord_cell_map.get(cell_idx)
+			active_for_current_chord = bool(chord_info is not None)
+			cell["cell_classification"] = str(cell.get("secondary_preclassification", "diagnostic_only"))
+			cell["active_for_current_chord"] = bool(active_for_current_chord)
+			cell["final_interval_id"] = chord_info.get("final_interval_id") if chord_info is not None else None
+			cell["assigned_interval_id"] = cell.get("final_interval_id")
+			cell["chord_id"] = chord_info.get("chord_id") if chord_info is not None else None
+			cell["chord_left"] = chord_info.get("chord_left") if chord_info is not None else None
+			cell["chord_right"] = chord_info.get("chord_right") if chord_info is not None else None
+			cell["applied_to_corrected"] = bool(active_for_current_chord)
+			if active_for_current_chord:
+				cell["secondary_final_is_spike"] = True
+				cell["secondary_final_class"] = "spike"
+				cell["secondary_final_source"] = str(chord_info.get("removed_by", "final_chord"))
+				cell["skipped_reason"] = None
+				secondary_spike_cells.append(cell_idx)
+			else:
+				cell["secondary_final_is_spike"] = False
+				cell["secondary_final_class"] = "non_spike"
+				cell["secondary_final_source"] = "iterative_preserved"
+				cell["skipped_reason"] = "not_final_spike"
+		secondary_groups = [
+			{
+				"cell_indices": [],
+				"left": int(ch.get("final_left_edge")),
+				"right": int(ch.get("final_right_edge")),
+				"merge_rule": str(ch.get("removed_by", "iterative")),
+			}
+			for ch in final_chords
+		]
 		saliences = [float(c["salience"]) for c in cells]
 		parent_salience = None
 		if parent_apex_cell_index is not None:
@@ -822,6 +1284,46 @@ def analyze_erosion_dilation_contact_cells(
 			island_left = None
 			island_right = None
 			island_reason = "no_parent_apex_cell"
+		final_working = raw.copy()
+		for chord in final_chords:
+			try:
+				fl = int(chord.get("final_left_edge"))
+				fr = int(chord.get("final_right_edge"))
+				chy = np.asarray(chord.get("chord_y", []), dtype=float)
+			except Exception:
+				continue
+			if chy.size == max(fr - fl + 1, 0):
+				final_working[fl:fr + 1] = chy
+		residual_check_status = "not_run"
+		residual_check_n_above_noise = 0
+		residual_check_n_spike_like = 0
+		if bool(despike_residual_check_enabled):
+			_, _, _, _, final_cells_iter, _ = _build_working_cells(
+				final_working,
+				context_left=int(cl),
+				context_right=int(cr),
+				parent_start=int(start),
+				parent_end=int(end),
+				parent_apex=int(apex),
+				strict_equal=bool(strict_equal),
+				local_noise=float(local_noise),
+			)
+			for cell in final_cells_iter:
+				left_i = int(cell["cell_left"])
+				right_i = int(cell["cell_right"])
+				if any(max(left_i, lv) < min(right_i, rv) for lv, rv in removed_regions):
+					continue
+				height_ratio = float(cell.get("height_abs", np.nan) / max(float(spectrum_noise_height), 1e-12)) if np.isfinite(cell.get("height_abs", np.nan)) else float("nan")
+				if np.isfinite(height_ratio) and height_ratio >= float(candidate_noise_height_factor):
+					residual_check_n_above_noise += 1
+					if bool(cell.get("contains_dilation_contact", False)):
+						residual_check_n_spike_like += 1
+			if residual_check_n_above_noise == 0:
+				residual_check_status = "clean"
+			elif residual_check_n_spike_like > 0:
+				residual_check_status = "residual_spike_like_found"
+			else:
+				residual_check_status = "ambiguous_residual_manual_review"
 		primary_ss4 = meta.get("primary_ss4", meta.get("ss4", 1.0))
 		primary_ss4_reason = meta.get("primary_ss4_reason", meta.get("ss4_reason"))
 		primary_ss4_decision = meta.get("primary_ss4_decision", meta.get("ss4_decision"))
@@ -858,6 +1360,16 @@ def analyze_erosion_dilation_contact_cells(
 			"secondary_uncertain_cell_indices": secondary_uncertain_cells,
 			"secondary_final_spike_intervals": secondary_groups,
 			"final_despike_chords": final_chords,
+			"despike_stages": stage_rows,
+			"iteration_rows": iteration_rows,
+			"iterative_removals_count": int(max(0, len(final_chords) - 1)),
+			"cluster_cleanup_applied": bool(cluster_cleanup_applied),
+			"cluster_cleanup_passes": int(cluster_cleanup_passes),
+			"dirty_region_left": int(dirty_left),
+			"dirty_region_right": int(dirty_right),
+			"residual_check_status": str(residual_check_status),
+			"residual_check_n_above_noise": int(residual_check_n_above_noise),
+			"residual_check_n_spike_like": int(residual_check_n_spike_like),
 			"degenerate_salience_context": bool(len(cells) <= 2 or _has_only_trivial_binary_norm([float(c.get("salience_total_norm", np.nan)) for c in cells])),
 			"preliminary_island_cell_indices": island,
 			"preliminary_island_left": island_left,
@@ -894,6 +1406,7 @@ def analyze_erosion_dilation_contact_cells(
 			"parent_pce": _clean_value(primary_pce),
 			"parent_edge": _clean_value(primary_edge),
 			"parent_edge_feature": primary_edge_feature,
+			"decision_profile_used": active_profile,
 			"context_left_initial": int(cl0),
 			"context_right_initial": int(cr0),
 			"context_left_final": int(cl),
@@ -906,6 +1419,8 @@ def analyze_erosion_dilation_contact_cells(
 			"context_left": int(cl),
 			"context_right": int(cr),
 			"local_noise": float(local_noise),
+			"noise_height_morph_range": float(spectrum_noise_height),
+			"candidate_noise_height_factor": float(candidate_noise_height_factor),
 			"erosion_contacts": [int(v) for v in erosion_contacts.tolist()],
 			"erosion_contact_x": [float(x_axis[int(v)]) for v in erosion_contacts.tolist()],
 			"erosion_contact_y": [float(raw[int(v)]) for v in erosion_contacts.tolist()],
@@ -922,13 +1437,25 @@ def analyze_erosion_dilation_contact_cells(
 			"despike_contact_context_pad_pts": int(context_pad_pts),
 			"despike_contact_strict_equal": bool(strict_equal),
 			"despike_sensitivity": float(despike_sensitivity),
+			"decision_profile": str(decision_profile),
 			"secondary_noise_thr": float(secondary_noise_thr),
 			"secondary_uncertain_thr": float(secondary_uncertain_thr),
 			"ss4_ss_blue_max": float(ss4_ss_blue_max),
 			"ss4_ss_red_min": float(ss4_ss_red_min),
 			"ss4_pce_red_min": float(ss4_pce_red_min),
 			"ss4_rve_red_max": float(ss4_rve_red_max),
+			"ss5_ss1_threshold": float(ss5_ss1_threshold),
+			"ss5_pce_spike_min": float(ss5_pce_spike_min),
+			"ss5_edge_spike_max": float(ss5_edge_spike_max),
+			"despike_iterative_refinement_enabled": bool(despike_iterative_refinement_enabled),
+			"despike_iterative_max_removals_per_parent": int(despike_iterative_max_removals_per_parent),
+			"despike_cluster_cleanup_enabled": bool(despike_cluster_cleanup_enabled),
+			"despike_cluster_cleanup_max_passes": int(despike_cluster_cleanup_max_passes),
+			"despike_residual_check_enabled": bool(despike_residual_check_enabled),
 			"secondary_edge_rescue_ss_min": float(secondary_edge_rescue_ss_min),
+			"candidate_noise_height_factor": float(candidate_noise_height_factor),
+			"edge_noise_guard_enabled": bool(edge_noise_guard_enabled),
+			"edge_noise_guard_factor": float(edge_noise_guard_factor),
 		},
 		"parents": parent_rows,
 	}
@@ -970,9 +1497,18 @@ def build_despike_contact_debug_payload(
 			"salience_total_norm": cell.get("salience_total_norm"),
 			"salience_density_norm": cell.get("salience_density_norm"),
 			"secondary_preclassification": cell.get("secondary_preclassification"),
+			"cell_classification": cell.get("cell_classification"),
 			"secondary_final_class": cell.get("secondary_final_class"),
 			"secondary_final_is_spike": cell.get("secondary_final_is_spike"),
 			"secondary_final_source": cell.get("secondary_final_source"),
+			"active_for_current_chord": cell.get("active_for_current_chord"),
+			"skipped_reason": cell.get("skipped_reason"),
+			"final_interval_id": cell.get("final_interval_id"),
+			"assigned_interval_id": cell.get("assigned_interval_id"),
+			"chord_id": cell.get("chord_id"),
+			"chord_left": cell.get("chord_left"),
+			"chord_right": cell.get("chord_right"),
+			"applied_to_corrected": cell.get("applied_to_corrected"),
 			"secondary_ss4_ran": cell.get("secondary_ss4_ran"),
 			"secondary_ss4": cell.get("secondary_ss4"),
 			"secondary_ss4_decision": cell.get("secondary_ss4_decision"),
@@ -1000,9 +1536,10 @@ def build_despike_contact_debug_payload(
 		return row
 
 	def _strip_chord(chord: Mapping[str, Any], parent_idx: int, chord_idx: int) -> Dict[str, Any]:
+		chord_id = chord.get("chord_id", f"parent_{parent_idx}_chord_{chord_idx}")
 		row = {
 			"parent_id": f"parent_{parent_idx}",
-			"chord_id": f"parent_{parent_idx}_chord_{chord_idx}",
+			"chord_id": chord_id,
 			"cell_indices": chord.get("cell_indices"),
 			"chord_method": chord.get("chord_method"),
 			"fixed_side": chord.get("fixed_side"),
@@ -1015,6 +1552,7 @@ def build_despike_contact_debug_payload(
 			"max_overshoot_after": chord.get("max_overshoot_after"),
 			"crossing_count_before": chord.get("crossing_count_before"),
 			"crossing_count_after": chord.get("crossing_count_after"),
+			"applied_to_corrected": chord.get("applied_to_corrected"),
 		}
 		if mode_norm == "full":
 			for key, value in chord.items():

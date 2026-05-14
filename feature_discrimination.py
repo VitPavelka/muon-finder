@@ -2723,6 +2723,9 @@ def compute_edge_width_metrics(
 		mapping_noise_guard_enabled: bool = False,
 		robust_reference_enabled: bool = False,
 		robust_reference_noise: float | None = None,
+		edge_noise_guard_enabled: bool = False,
+		edge_noise_guard_factor: float = 3.0,
+		edge_noise_guard_value: float | None = None,
 ) -> Dict[str, object]:
 	"""Measure width-at-relative-level inside the original spike-edges interval."""
 	x = np.asarray(signal, dtype=float)
@@ -2803,7 +2806,14 @@ def compute_edge_width_metrics(
 	apex_local = int(np.argmax(seg)) if apex_idx is None else int(np.clip(int(apex_idx) - int(left), 0, seg.size - 1))
 	reference_original = float(y_max)
 	reference_noise = float(max(robust_reference_noise if robust_reference_noise is not None else edge_noise_mad, 0.0)) if np.isfinite(robust_reference_noise if robust_reference_noise is not None else edge_noise_mad) else float("nan")
+	guard_base = edge_noise_guard_value if edge_noise_guard_value is not None else reference_noise
+	edge_noise_guard = (
+		float(max(0.0, float(guard_base)) * max(0.0, float(edge_noise_guard_factor)))
+		if np.isfinite(guard_base)
+		else float("nan")
+	)
 	reference_robust = float(reference_original)
+	reference_noise_guarded = float(reference_original)
 	reference_delta = 0.0
 	reference_adjusted = False
 	reference_reason = "disabled"
@@ -2814,7 +2824,16 @@ def compute_edge_width_metrics(
 		local_top_support = float(np.max(neighbor_vals)) if neighbor_vals.size else float(reference_original)
 		protrusion = float(max(reference_original - local_top_support, 0.0))
 		protrusion_cap = float(1.25 * reference_noise)
-		if protrusion > 0.0 and protrusion <= protrusion_cap:
+		if bool(edge_noise_guard_enabled) and np.isfinite(edge_noise_guard) and edge_noise_guard > 0.0:
+			if protrusion > 0.0 and protrusion <= edge_noise_guard:
+				reference_noise_guarded = float(local_top_support)
+				reference_robust = float(reference_noise_guarded)
+				reference_delta = float(max(reference_original - reference_robust, 0.0))
+				reference_adjusted = bool(reference_delta > 0.0)
+				reference_reason = "noise_guarded_apex_protrusion"
+			else:
+				reference_reason = "noise_guard_not_triggered"
+		elif protrusion > 0.0 and protrusion <= protrusion_cap:
 			reference_delta = float(min(protrusion, reference_noise))
 			reference_robust = float(reference_original - reference_delta)
 			reference_adjusted = bool(reference_delta > 0.0)
@@ -2843,6 +2862,11 @@ def compute_edge_width_metrics(
 		"edge_reference_noise_used": float(reference_noise) if np.isfinite(reference_noise) else np.nan,
 		"edge_reference_adjusted": bool(reference_adjusted),
 		"edge_reference_reason": str(reference_reason),
+		"edge_noise_guard_enabled": bool(edge_noise_guard_enabled),
+		"edge_noise_guard_factor": float(edge_noise_guard_factor),
+		"edge_noise_guard_value": float(edge_noise_guard) if np.isfinite(edge_noise_guard) else np.nan,
+		"edge_reference_noise_guarded": float(reference_noise_guarded),
+		"edge_reference_adjustment_reason": str(reference_reason),
 	}
 	if not np.isfinite(amp) or amp <= 1e-12:
 		debug["reason"] = "flat_segment"

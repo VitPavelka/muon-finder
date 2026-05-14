@@ -297,6 +297,47 @@ def show_hover_map(
 		if compact_pix is not None and compact_pix != (int(sy), int(sx)):
 			ss4_metrics_by_pixel.setdefault(compact_pix, []).extend(vals)
 			ss4_metrics_by_pixel[compact_pix] = _dedupe_ss4_rows(ss4_metrics_by_pixel[compact_pix])
+
+	def _pixel_contact_parents(yv: int, xv: int) -> List[Dict[str, object]]:
+		return [p for p in contact_parent_by_pixel.get((int(yv), int(xv)), []) if isinstance(p, dict)]
+
+	def _pixel_despike_stage_rows(yv: int, xv: int) -> List[Dict[str, object]]:
+		rows: List[Dict[str, object]] = []
+		for parent in _pixel_contact_parents(int(yv), int(xv)):
+			summary = parent.get("summary", {}) or {}
+			for stage in summary.get("despike_stages", []) or []:
+				if isinstance(stage, dict):
+					row = dict(stage)
+					row["_parent_id"] = parent.get("parent_id")
+					rows.append(row)
+		rows.sort(key=lambda row: (int(row.get("stage_index", 0)), str(row.get("_parent_id", ""))))
+		return rows
+
+	def _pixel_stage_curve(yv: int, xv: int, stage_index: int) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+		curve = np.asarray(spectra[int(yv), int(xv), :], dtype=float).copy()
+		raw_base = np.asarray(spectra[int(yv), int(xv), :], dtype=float)
+		applied: List[Dict[str, object]] = []
+		for parent in _pixel_contact_parents(int(yv), int(xv)):
+			summary = parent.get("summary", {}) or {}
+			chords = [ch for ch in (summary.get("final_despike_chords", []) or []) if isinstance(ch, dict)]
+			for local_idx, chord in enumerate(chords, start=1):
+				if int(local_idx) > int(stage_index):
+					break
+				try:
+					fl = int(chord.get("final_left_edge"))
+					fr = int(chord.get("final_right_edge"))
+					chy = np.asarray(chord.get("chord_y", []), dtype=float)
+				except Exception:
+					continue
+				if chy.size != max(fr - fl + 1, 0):
+					if 0 <= fl < raw_base.size and 0 <= fr < raw_base.size and fr >= fl:
+						chy = np.linspace(float(raw_base[fl]), float(raw_base[fr]), int(fr - fl + 1), dtype=float)
+					else:
+						chy = np.asarray([], dtype=float)
+				if chy.size == max(fr - fl + 1, 0):
+					curve[fl:fr + 1] = chy
+					applied.append(chord)
+		return curve, applied
 	GWS_SCALES = tuple(int(v) for v in GWS_GRANULO_SCALES)
 	GWS_DRAW_SCALES = tuple(int(v) for v in GWS_SCALES[::max(1, len(GWS_SCALES) // 5)]) or tuple(int(v) for v in GWS_SCALES)
 	GWS_DEFAULT_SCALE = 7
@@ -316,6 +357,7 @@ def show_hover_map(
 	top_hat_window_choices = (3, 7, 9, 11)
 	diag_state = {"median_window": 81, "mean_window": 81, "opening_window": 81}
 	top_hat_state = {"window": 3}
+	despike_stage_state = {"index": 0}
 
 	v = score_map.astype(float)
 	v = v[np.isfinite(v)]
@@ -579,6 +621,7 @@ def show_hover_map(
 
 	frozen = {"state": False}  # right click = freeze/unfreeze
 	current = {"y": 0, "x": 0}
+	last_pixel = {"y": None, "x": None}
 	focus = {"which": "", "replace_x": False, "replace_y": False}
 	hover_state = {"last_t": 0.0, "last_xy": (-1, -1)}
 	input_buffers = {"x": "0", "y": "0"}
@@ -1518,6 +1561,9 @@ def show_hover_map(
 						if 0 <= ci < N:
 							guide_specs.append({"metric": "show_dilation_contacts", "kind": "point", "x": float(x_axis[ci]), "y": float(raw_sig[ci]), "color": "#ff7f0e", "marker": "^", "markersize": 6.5, "alpha": 0.96})
 				cells = parent.get("cells", []) or []
+				summary = parent.get("summary", {}) or {}
+				stage_rows = [row for row in (summary.get("despike_stages", []) or []) if isinstance(row, dict)]
+				iter_rows = [row for row in (summary.get("iteration_rows", []) or []) if isinstance(row, dict)]
 				island = set(int(v) for v in (parent.get("summary", {}) or {}).get("preliminary_island_cell_indices", []) or [])
 				for cell in cells:
 					if not isinstance(cell, dict):
@@ -1538,7 +1584,7 @@ def show_hover_map(
 						guide_specs.append({"metric": "show_contact_cells", "kind": "vline", "x": float(x_axis[left]), "color": color, "alpha": 0.40, "linestyle": "--"})
 						guide_specs.append({"metric": "show_contact_cells", "kind": "vline", "x": float(x_axis[right]), "color": color, "alpha": 0.40, "linestyle": "--"})
 					if bool(metric_checked.get("secondary_spike_peaks", False)):
-						is_spike = bool(cell.get("secondary_final_is_spike", False))
+						is_spike = bool(cell.get("active_for_current_chord", cell.get("secondary_final_is_spike", False)))
 						color = "#d62728" if is_spike else "#1f77b4"
 						try:
 							if bool(cell.get("contains_parent_apex", False)) and parent.get("parent_apex") is not None:
@@ -1577,49 +1623,47 @@ def show_hover_map(
 							"fontsize": 7.0,
 							"alpha": 0.85,
 						})
-					if (
-							bool(metric_checked.get("show_secondary_ss4_labels", False))
-							and bool(cell.get("secondary_ss4_ran", False))
-					):
-						yy = float(np.nanmin(raw_sig[left:right + 1])) if np.any(np.isfinite(raw_sig[left:right + 1])) else float(raw_sig[left])
-						edge_value = cell.get("secondary_recdw_sum_0_90_raman_veto_evidence_signed")
-						edge_label = "edge"
-						run_reason = str(cell.get("secondary_ss4_reason_for_run", "") or "")
-						reason_tag = " | small_ctx" if run_reason == "degenerate_t_low_cell_above_noise" else ""
+				if bool(metric_checked.get("show_secondary_ss4_labels", False)):
+					for row in iter_rows:
 						try:
-							if not np.isfinite(float(edge_value)):
-								edge_value = cell.get("secondary_rve_value_used_for_ss4", cell.get("secondary_edge_rve_proxy"))
-								edge_label = "edge*"
+							left_i = int(np.clip(int(row.get("candidate_left")), 0, N - 1))
+							right_i = int(np.clip(int(row.get("candidate_right")), 0, N - 1))
+							ap_i = int(np.clip(int(row.get("candidate_apex", (left_i + right_i) // 2)), 0, N - 1))
 						except Exception:
-							edge_value = cell.get("secondary_rve_value_used_for_ss4", cell.get("secondary_edge_rve_proxy"))
-							edge_label = "edge*"
+							continue
+						if int(row.get("iteration_index", 0)) > int(despike_stage_state["index"]):
+							continue
+						yy = float(np.nanmin(raw_sig[left_i:right_i + 1])) if np.any(np.isfinite(raw_sig[left_i:right_i + 1])) else float(raw_sig[left_i])
+						profile_name = str(row.get("decision_profile", parent.get("primary_active_decision_profile", "ss4")))
+						score_key = "decision_score"
 						guide_specs.append({
 							"metric": "show_secondary_ss4_labels",
 							"kind": "text",
-							"x": float(x_axis[left]),
+							"x": float(x_axis[left_i]),
 							"y": yy,
 							"text": (
-								f"secondary\n"
-								f"ss1={_fmt_num(cell.get('secondary_spike_score_v1', cell.get('secondary_ss1')), 2)}\n"
-								f"pce={_fmt_num(cell.get('secondary_pce_negpref_t098_evidence_signed', cell.get('secondary_pce')), 2)}\n"
-								f"{edge_label}={_fmt_num(edge_value, 2)}{reason_tag}"
+								f"iter={int(row.get('iteration_index', 0))} | {profile_name}={_fmt_num(row.get(score_key), 2)}\n"
+								f"ss1={_fmt_num(row.get('ss1'), 2)} pce={_fmt_num(row.get('pce'), 2)} edge={_fmt_num(row.get('edge'), 2)}\n"
+								f"r={_fmt_num(row.get('height_ratio_to_noise'), 2)} {str(row.get('decision', row.get('residual_status', '')))}"
+								f"{'' if row.get('edge_guard_passed', True) is not False else ' | edge_guarded'}"
 							),
 							"color": "#333333",
 							"fontsize": 7.0,
 							"alpha": 0.90,
 						})
+						guide_specs.append({"metric": "show_secondary_ss4_labels", "kind": "vline", "x": float(x_axis[ap_i]), "color": "#555555", "alpha": 0.45, "linestyle": ":"})
 				if bool(metric_checked.get("despike_chords", False)):
 					cells_by_index = {
 						int(c.get("cell_index")): c
 						for c in cells
 						if isinstance(c, dict) and c.get("cell_index") is not None
 					}
-					for chord in (parent.get("summary", {}) or {}).get("final_despike_chords", []) or []:
+					for chord_idx, chord in enumerate((summary.get("final_despike_chords", []) or []), start=1):
 						try:
-							cell_indices = [int(v) for v in chord.get("cell_indices", []) or []]
-							if not cell_indices:
+							if int(chord_idx) > int(despike_stage_state["index"]):
 								continue
-							if any(not bool(cells_by_index.get(int(ci), {}).get("secondary_final_is_spike", False)) for ci in cell_indices):
+							cell_indices = [int(v) for v in chord.get("cell_indices", []) or []]
+							if cell_indices and any(not bool(cells_by_index.get(int(ci), {}).get("secondary_final_is_spike", False)) for ci in cell_indices):
 								continue
 							cx = np.asarray(chord.get("chord_x", []), dtype=float)
 							cy = np.asarray(chord.get("chord_y", []), dtype=float)
@@ -2221,8 +2265,44 @@ def show_hover_map(
 							guide_specs.append({"metric": "gws_area_trace", "kind": "point", "x": float(xt), "y": float(yt), "color": "#16a6a6" if int(sc) == active_gws_scale else "#008080", "marker": "D", "markersize": 4.0 if int(sc) == active_gws_scale else 3.4})
 
 			if need_edge_levels:
+				def _matching_primary_row() -> Optional[Dict[str, object]]:
+					for row in _pixel_ss4_metrics(int(y), int(x)):
+						try:
+							if (
+								int(row.get("peak_index", -1)) == int(getattr(seg_for_diag, "peak_index", -1))
+								and int(row.get("start", -1)) == int(seg_for_diag.start)
+								and int(row.get("end", -1)) == int(seg_for_diag.end)
+							):
+								return row
+						except Exception:
+							continue
+					return None
+
 				def _draw_dense(metric_name: str, source_sig: np.ndarray, prefix: str, color: str, ctx: bool, linestyle: str) -> None:
 					if not metric_checked.get(metric_name, False):
+						return
+					primary_row = _matching_primary_row() if (metric_name == "show_raw_edge_dense_ctx" and str(prefix).startswith("raw_edge")) else None
+					if primary_row is not None and _primary_value(primary_row, "primary_edge_guard_passed", "edge_guard_passed") is False:
+						ml = int(seg_for_diag.start)
+						mr = int(seg_for_diag.end)
+						reason_y = float(np.nanmax(source_sig[ml:mr + 1])) if np.any(np.isfinite(source_sig[ml:mr + 1])) else float(source_sig[ml])
+						guide_specs.append({"metric": metric_name, "kind": "span", "x0": float(x_axis[ml]), "x1": float(x_axis[mr]), "color": "#999999", "alpha": 0.03})
+						guide_specs.append({
+							"metric": metric_name,
+							"kind": "text",
+							"x": float(x_axis[ml]),
+							"y": reason_y,
+							"color": "#666666",
+							"fontsize": 7.0,
+							"alpha": 0.92,
+							"text": (
+								"recdw guarded\n"
+								f"edge_guard_passed=false reason={_primary_value(primary_row, 'primary_edge_guard_reason', 'edge_guard_reason')}\n"
+								f"after={_fmt_num(_primary_value(primary_row, 'primary_edge_value_after_guard', 'edge_value_after_guard'), 3)} "
+								f"r={_fmt_num(_primary_value(primary_row, 'primary_edge_noise_ratio', 'edge_noise_ratio'), 3)} "
+								f"thr={_fmt_num(_primary_value(primary_row, 'primary_edge_noise_guard_factor', 'edge_noise_guard_factor'), 3)}"
+							),
+						})
 						return
 					if bool(edge_use_enhanced_spike_mapping) and (str(prefix).startswith("raw_") or str(prefix).startswith("dilation_")):
 						edge_left = int(seg_for_diag.start)
@@ -2538,8 +2618,11 @@ def show_hover_map(
 	def _update(y: int, x: int) -> None:
 		y = int(np.clip(y, 0, H - 1))
 		x = int(np.clip(x, 0, W - 1))
+		pixel_changed = (last_pixel["y"] != y) or (last_pixel["x"] != x)
 		current["y"] = y
 		current["x"] = x
+		last_pixel["y"] = y
+		last_pixel["x"] = x
 
 		marker.set_offsets([[x, y]])
 
@@ -2576,6 +2659,15 @@ def show_hover_map(
 			ln_corr.set_data(x_axis, pixel_signals["corrected"])
 		else:
 			ln_corr.set_data([], [])
+		stage_rows_here = _pixel_despike_stage_rows(int(y), int(x))
+		max_stage_here = max([0] + [int(row.get("stage_index", 0)) for row in stage_rows_here if isinstance(row, dict)])
+		if pixel_changed:
+			despike_stage_state["index"] = int(max_stage_here)
+		else:
+			despike_stage_state["index"] = int(np.clip(int(despike_stage_state["index"]), 0, max_stage_here))
+		if bool(checked.get("corrected", False)) and stage_rows_here:
+			stage_curve, _ = _pixel_stage_curve(int(y), int(x), int(despike_stage_state["index"]))
+			ln_corr.set_data(x_axis, stage_curve)
 
 		# clear old spike overlays
 		for col in (spike_peak_lines, spike_edge_lines, spike_bands):
@@ -2788,6 +2880,14 @@ def show_hover_map(
 		]
 		if active_diag:
 			diag_info = f"diag={','.join(active_diag)}"
+		stage_rows_here = _pixel_despike_stage_rows(int(y), int(x))
+		if stage_rows_here:
+			max_stage_here = max([0] + [int(row.get("stage_index", 0)) for row in stage_rows_here])
+			stage_label = next((row for row in stage_rows_here if int(row.get("stage_index", -1)) == int(despike_stage_state["index"])), None)
+			stage_info = f"despike stage {int(despike_stage_state['index'])}/{int(max_stage_here)}"
+			if isinstance(stage_label, dict):
+				stage_info += f": {stage_label.get('working_stage_name', stage_label.get('stage_name', ''))}"
+			diag_info = f"{diag_info} | {stage_info}" if diag_info else stage_info
 		curv_label = curv_tolerance_tags[int(curv_variant_state['i'])]
 		if source_coords_map is not None:
 			src_y, src_x = source_coords_map.get((y, x), (y, x))
@@ -2834,7 +2934,7 @@ def show_hover_map(
 		spec_info_metric.set_text(metric_info)
 		_apply_dynamic_ylim()
 
-		_redraw_dynamic(use_fast=True)
+		_redraw_dynamic(use_fast=False)
 
 	def on_move(event) -> None:
 		if frozen["state"]:
@@ -2876,7 +2976,15 @@ def show_hover_map(
 			return
 		if event.button != 3:
 			return
+		if event.xdata is None or event.ydata is None:
+			frozen["state"] = not frozen["state"]
+			return
+		x = int(np.clip(int(round(event.xdata)), 0, W - 1))
+		y = int(np.clip(int(round(event.ydata)), 0, H - 1))
+		hover_state["last_xy"] = (x, y)
 		frozen["state"] = not frozen["state"]
+		if frozen["state"]:
+			_update(y, x)
 
 	def _toggle_line(label: str) -> None:
 		if label in checked:
@@ -3030,6 +3138,26 @@ def show_hover_map(
 			_refresh_legend()
 			_update(current["y"], current["x"])
 			return
+		if key == "a":
+			stage_rows_here = _pixel_despike_stage_rows(int(current["y"]), int(current["x"]))
+			max_stage_here = max([0] + [int(row.get("stage_index", 0)) for row in stage_rows_here]) if stage_rows_here else 0
+			despike_stage_state["index"] = int(np.clip(int(despike_stage_state["index"]) - 1, 0, max_stage_here))
+			_update(current["y"], current["x"])
+			return
+		if key == "x":
+			stage_rows_here = _pixel_despike_stage_rows(int(current["y"]), int(current["x"]))
+			max_stage_here = max([0] + [int(row.get("stage_index", 0)) for row in stage_rows_here]) if stage_rows_here else 0
+			despike_stage_state["index"] = int(np.clip(int(despike_stage_state["index"]) + 1, 0, max_stage_here))
+			_update(current["y"], current["x"])
+			return
+		if frozen["state"] and key in ("left", "right", "up", "down"):
+			dx = -1 if key == "left" else (1 if key == "right" else 0)
+			dy = -1 if key == "up" else (1 if key == "down" else 0)
+			ny = int(np.clip(int(current["y"]) + dy, 0, H - 1))
+			nx = int(np.clip(int(current["x"]) + dx, 0, W - 1))
+			hover_state["last_xy"] = (nx, ny)
+			_update(ny, nx)
+			return
 
 	def _sync_inputs() -> None:
 		input_buffers["x"] = str(current["x"])
@@ -3073,9 +3201,9 @@ def main() -> None:
 		viewer_status_text=cache.get("viewer_status_text") or "PREVIEW FROM CACHE - pipeline was not run now",
 		initial_checked={
 			"raw": True,
-			"top_hat": True,
-			"gradient": True,
-			"corrected": False,
+			"top_hat": False,
+			"gradient": False,
+			"corrected": True,
 		},
 	)
 

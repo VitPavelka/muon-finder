@@ -132,6 +132,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"edge_mapping_fallback_to_old": False,
 	"edge_mapping_noise_guard_enabled": False,
 	"edge_robust_reference_enabled": True,
+	"edge_noise_guard_enabled": True,
+	"edge_noise_guard_factor": 3.0,
 	"recdw_evidence_enabled": True,
 	"recdw_evidence_metrics": ["recdw_sum_0_90"],
 	"recdw_z_clip": 6.0,
@@ -193,6 +195,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 	"despike_contact_use_existing_morphology": True,
 	"despike_contact_strict_equal": True,
 	"despike_sensitivity": 1.0,
+	"despike_iterative_refinement_enabled": True,
+	"despike_iterative_max_removals_per_parent": 4,
+	"despike_cluster_cleanup_enabled": True,
+	"despike_cluster_cleanup_max_passes": 1,
+	"despike_residual_check_enabled": True,
 	"secondary_noise_thr": 0.05,
 	"secondary_uncertain_thr": 0.5,
 	"secondary_edge_rescue_ss_min": 0.85,
@@ -903,6 +910,12 @@ def run(cfg: Dict[str, Any]) -> None:
 			"primary_spike_score_v1": features.get("spike_score_v1"),
 			"primary_pce_negpref_t098_evidence_signed": features.get("pce_negpref_t098_evidence_signed"),
 			"primary_recdw_sum_0_90_raman_veto_evidence_signed": features.get("recdw_sum_0_90_raman_veto_evidence_signed"),
+			"primary_edge_noise_guard_factor": features.get("edge_noise_guard_factor"),
+			"primary_edge_noise_ratio": features.get("edge_noise_ratio"),
+			"primary_edge_guard_passed": features.get("edge_guard_passed"),
+			"primary_edge_guard_reason": features.get("edge_guard_reason"),
+			"primary_edge_value_before_guard": features.get("edge_value_before_guard"),
+			"primary_edge_value_after_guard": features.get("edge_value_after_guard"),
 			"primary_ss4": features.get("ss4"),
 			"primary_ss4_decision": features.get("ss4_decision"),
 			"primary_ss4_reason": features.get("ss4_reason"),
@@ -925,6 +938,12 @@ def run(cfg: Dict[str, Any]) -> None:
 			"spike_score_v1": features.get("spike_score_v1"),
 			"pce_negpref_t098_evidence_signed": features.get("pce_negpref_t098_evidence_signed"),
 			"recdw_sum_0_90_raman_veto_evidence_signed": features.get("recdw_sum_0_90_raman_veto_evidence_signed"),
+			"edge_noise_guard_factor": features.get("edge_noise_guard_factor"),
+			"edge_noise_ratio": features.get("edge_noise_ratio"),
+			"edge_guard_passed": features.get("edge_guard_passed"),
+			"edge_guard_reason": features.get("edge_guard_reason"),
+			"edge_value_before_guard": features.get("edge_value_before_guard"),
+			"edge_value_after_guard": features.get("edge_value_after_guard"),
 			"ss4": features.get("ss4"),
 			"ss4_decision": features.get("ss4_decision"),
 			"ss4_reason": features.get("ss4_reason"),
@@ -1070,18 +1089,58 @@ def run(cfg: Dict[str, Any]) -> None:
 						raw_bg_mad,
 					)
 				),
+				edge_noise_guard_enabled=bool(cfg.get("edge_noise_guard_enabled", True)),
+				edge_noise_guard_factor=float(cfg.get("edge_noise_guard_factor", cfg.get("candidate_noise_height_factor", 3.0))),
+				edge_noise_guard_value=float(
+					next(
+						(
+							float(row.get("noise_height_morph_range"))
+							for row in candidate_prefilter_rows_by_pixel.get((yv, xv), [])
+							if str(row.get("candidate_id")) == candidate_segment_id(prepared_seg)
+							and row.get("noise_height_morph_range") is not None
+						),
+						np.nan,
+					)
+				),
 			)
-			features["recdw_sum_0_90"] = float(edge_metrics.get("raw_edge_ctx_dense_width_sum_0_90", np.nan))
+			edge_sum_before_guard = float(edge_metrics.get("raw_edge_ctx_dense_width_sum_0_90", np.nan))
 			edge_debug = edge_metrics.get("raw_edge_ctx_debug")
+			dense_debug = edge_debug.get("dense_width_0_90", {}) if isinstance(edge_debug, dict) else {}
+			edge_noise_ratio = float(dense_debug.get("root_snr", np.nan)) if isinstance(dense_debug, dict) else float("nan")
+			edge_guard_enabled = bool(cfg.get("edge_noise_guard_enabled", True))
+			edge_guard_factor = float(cfg.get("edge_noise_guard_factor", cfg.get("candidate_noise_height_factor", 3.0)))
+			edge_guard_passed = bool((not edge_guard_enabled) or (np.isfinite(edge_noise_ratio) and edge_noise_ratio >= edge_guard_factor))
+			if not np.isfinite(edge_sum_before_guard):
+				edge_guard_reason = "edge_value_missing"
+			elif not edge_guard_enabled:
+				edge_guard_reason = "guard_disabled"
+			elif not np.isfinite(edge_noise_ratio):
+				edge_guard_reason = "edge_noise_ratio_missing"
+			elif edge_guard_passed:
+				edge_guard_reason = "guard_passed"
+			else:
+				edge_guard_reason = "below_edge_noise_guard"
+			features["edge_noise_guard_factor"] = float(edge_guard_factor)
+			features["edge_noise_ratio"] = float(edge_noise_ratio) if np.isfinite(edge_noise_ratio) else float("nan")
+			features["edge_guard_passed"] = bool(edge_guard_passed)
+			features["edge_guard_reason"] = str(edge_guard_reason)
+			features["edge_value_before_guard"] = float(edge_sum_before_guard) if np.isfinite(edge_sum_before_guard) else float("nan")
+			features["recdw_sum_0_90"] = float(edge_sum_before_guard) if edge_guard_passed else float("nan")
+			features["edge_value_after_guard"] = float(features["recdw_sum_0_90"]) if np.isfinite(features["recdw_sum_0_90"]) else float("nan")
 			if isinstance(edge_debug, dict):
 				for dbg_key in (
 					"edge_robust_reference_enabled",
+					"edge_noise_guard_enabled",
+					"edge_noise_guard_factor",
+					"edge_noise_guard_value",
 					"edge_reference_original",
+					"edge_reference_noise_guarded",
 					"edge_reference_robust",
 					"edge_reference_delta",
 					"edge_reference_noise_used",
 					"edge_reference_adjusted",
 					"edge_reference_reason",
+					"edge_reference_adjustment_reason",
 				):
 					features[dbg_key] = edge_debug.get(dbg_key)
 			records.append({"prepared": prepared_seg, "features": features, "needs_edge": needs_edge})
@@ -1262,6 +1321,8 @@ def run(cfg: Dict[str, Any]) -> None:
 			edge_mapping_fallback_to_old=bool(cfg.get("edge_mapping_fallback_to_old", False)),
 			edge_mapping_noise_guard_enabled=bool(cfg.get("edge_mapping_noise_guard_enabled", False)),
 			edge_robust_reference_enabled=bool(cfg.get("edge_robust_reference_enabled", True)),
+			edge_noise_guard_enabled=bool(cfg.get("edge_noise_guard_enabled", True)),
+			edge_noise_guard_factor=float(cfg.get("edge_noise_guard_factor", cfg.get("candidate_noise_height_factor", 3.0))),
 			edge_enhanced_in_debug_report=bool(cfg.get("edge_enhanced_in_debug_report", True)),
 			recdw_evidence_enabled=bool(cfg.get("recdw_evidence_enabled", True)),
 			recdw_evidence_metrics=tuple(str(v) for v in cfg.get("recdw_evidence_metrics", ["recdw_sum_0_90"])),
@@ -1576,6 +1637,13 @@ def run(cfg: Dict[str, Any]) -> None:
 				s for s in spikes
 				if str(spike_decisions.get(s, {}).get("muon_rule_v3_decision", "no_muon")) == "auto_muon"
 			]
+		recdw_vals_for_despike = np.asarray([
+			float(row.get("recdw_sum_0_90", np.nan))
+			for rows in ss4_candidate_metrics_by_pixel.values()
+			for row in rows
+			if isinstance(row, dict)
+		], dtype=float)
+		recdw_center_for_despike, recdw_scale_for_despike = _robust_center_scale(recdw_vals_for_despike)
 		despike_contact_analysis = analyze_erosion_dilation_contact_cells(
 			x_axis=x_axis,
 			raw_spectra=raw,
@@ -1597,6 +1665,33 @@ def run(cfg: Dict[str, Any]) -> None:
 			ss4_missing_policy=str(cfg.get("ss4_missing_policy", cfg.get("spike_score_v4_missing_policy", "review"))),
 			secondary_edge_rescue_ss_min=float(cfg.get("secondary_edge_rescue_ss_min", 0.85)),
 			candidate_noise_height_factor=float(cfg.get("candidate_noise_height_factor", cfg.get("candidate_noise_prefilter_sensitivity", 3.0))),
+			decision_profile=str(decision_profile),
+			recdw_center=float(recdw_center_for_despike),
+			recdw_scale=float(recdw_scale_for_despike),
+			recdw_z_clip=float(cfg.get("recdw_z_clip", 6.0)),
+			recdw_support_z_scale=float(cfg.get("recdw_support_z_scale", 1.0)),
+			ss5_ss1_threshold=float(cfg.get("ss5_ss1_threshold", 0.95)),
+			ss5_pce_spike_min=float(cfg.get("ss5_pce_spike_min", 0.8)),
+			ss5_edge_spike_max=float(cfg.get("ss5_edge_spike_max", -0.4)),
+			despike_iterative_refinement_enabled=bool(cfg.get("despike_iterative_refinement_enabled", True)),
+			despike_iterative_max_removals_per_parent=int(cfg.get("despike_iterative_max_removals_per_parent", 4)),
+			despike_cluster_cleanup_enabled=bool(cfg.get("despike_cluster_cleanup_enabled", True)),
+			despike_cluster_cleanup_max_passes=int(cfg.get("despike_cluster_cleanup_max_passes", 1)),
+			despike_residual_check_enabled=bool(cfg.get("despike_residual_check_enabled", True)),
+			edge_use_enhanced_spike_mapping=bool(cfg.get("edge_use_enhanced_spike_mapping", False)),
+			edge_mapping_levels_desc=tuple(int(v) for v in cfg.get("edge_mapping_levels_desc", [95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 5])),
+			edge_mapping_refine_step_percent=int(cfg.get("edge_mapping_refine_step_percent", 1)),
+			edge_mapping_min_level_percent=int(cfg.get("edge_mapping_min_level_percent", 1)),
+			edge_mapping_require_closed_interval=bool(cfg.get("edge_mapping_require_closed_interval", True)),
+			edge_mapping_use_apex_component=bool(cfg.get("edge_mapping_use_apex_component", True)),
+			edge_mapping_enable_merge_guard=bool(cfg.get("edge_mapping_enable_merge_guard", True)),
+			edge_mapping_max_width_jump_factor=float(cfg.get("edge_mapping_max_width_jump_factor", 2.5)),
+			edge_mapping_max_width_jump_points=float(cfg.get("edge_mapping_max_width_jump_points", 8)),
+			edge_mapping_fallback_to_old=bool(cfg.get("edge_mapping_fallback_to_old", False)),
+			edge_mapping_noise_guard_enabled=bool(cfg.get("edge_mapping_noise_guard_enabled", False)),
+			edge_robust_reference_enabled=bool(cfg.get("edge_robust_reference_enabled", True)),
+			edge_noise_guard_enabled=bool(cfg.get("edge_noise_guard_enabled", True)),
+			edge_noise_guard_factor=float(cfg.get("edge_noise_guard_factor", cfg.get("candidate_noise_height_factor", 3.0))),
 		)
 		corrected = apply_contact_cell_despike_chords(raw, despike_contact_analysis)
 		if report is not None:
