@@ -150,7 +150,7 @@ def evaluate_candidate_noise_prefilter(
                 "candidate_noise_chord_y_at_apex": float(chord_y_at_apex) if np.isfinite(chord_y_at_apex) else np.nan,
                 "candidate_noise_height_above_chord": float(height_above_chord) if np.isfinite(height_above_chord) else np.nan,
                 "candidate_noise_height_threshold": float(height_threshold) if np.isfinite(height_threshold) else np.nan,
-                "candidate_noise_height_factor": float(height_factor),
+                "noise_height_factor": float(height_factor),
                 "candidate_noise_height_ratio": float(height_ratio) if np.isfinite(height_ratio) else np.nan,
                 "candidate_noise_left_foot": np.nan if left_foot is None else int(left_foot),
                 "candidate_noise_right_foot": np.nan if right_foot is None else int(right_foot),

@@ -20,13 +20,15 @@ if __package__ in {None, ""}:
 
     from muonfinder_core.cache import load_viewer_cache
     from muonfinder_core.config import load_config
+    from muonfinder_core.metrics import EDGE_ALL_LEVELS_ASC, EDGE_DENSE_LEVELS_ASC
     from muonfinder_core.plotting import candidate_status_color
-    from muonfinder_core.utils import metric_float
+    from muonfinder_core.utils import metric_float, to_contiguous_spans
 else:
     from .cache import load_viewer_cache
     from .config import load_config
+    from .metrics import EDGE_ALL_LEVELS_ASC, EDGE_DENSE_LEVELS_ASC
     from .plotting import candidate_status_color
-    from .utils import metric_float
+    from .utils import metric_float, to_contiguous_spans
 
 
 CHECKBOX_ORDER = [
@@ -83,46 +85,6 @@ def _dedup_legend(handles: list[Any], labels: list[str]) -> tuple[list[Any], lis
     return out_h, out_l
 
 
-def _compute_pce_overlay_debug(signal: np.ndarray, row: dict[str, Any]) -> dict[str, Any]:
-    start = int(row.get("start", 0))
-    end = int(row.get("end", 0))
-    peak = int(row.get("peak_index", 0))
-    n = int(signal.size)
-    start = int(np.clip(start, 0, max(0, n - 1)))
-    end = int(np.clip(end, 0, max(0, n - 1)))
-    if end < start:
-        start, end = end, start
-    segment = np.asarray(signal[start : end + 1], dtype=float)
-    if segment.size < 3:
-        return {}
-    d2 = np.diff(segment)
-    if d2.size == 0:
-        return {}
-    peak_rel = int(np.clip(peak - start - 1, 0, d2.size - 1))
-    local_radius = max(1, int(np.ceil(0.20 * d2.size)))
-    local_left = max(0, peak_rel - local_radius)
-    local_right = min(d2.size - 1, peak_rel + local_radius)
-    local_slice = d2[local_left : local_right + 1]
-    global_min_idx = int(np.argmin(d2))
-    global_max_idx = int(np.argmax(d2))
-    local_min_idx = int(local_left + np.argmin(local_slice))
-    local_max_idx = int(local_left + np.argmax(local_slice))
-    chosen_idx = local_min_idx if d2[local_min_idx] <= d2[global_min_idx] else global_min_idx
-    return {
-        "segment_left": int(start),
-        "segment_right": int(end),
-        "d2": d2,
-        "peak_rel": int(peak_rel),
-        "global_min_idx": int(global_min_idx),
-        "global_max_idx": int(global_max_idx),
-        "local_left_idx": int(local_left),
-        "local_right_idx": int(local_right),
-        "local_min_idx": int(local_min_idx),
-        "local_max_idx": int(local_max_idx),
-        "chosen_idx": int(chosen_idx),
-    }
-
-
 def show_cache(cache: dict[str, Any]) -> None:
     x_axis = np.asarray(cache["x_axis"], dtype=float)
     spectra = np.asarray(cache["spectra"], dtype=float)
@@ -161,6 +123,7 @@ def show_cache(cache: dict[str, Any]) -> None:
     H, W = score_map.shape
     current = {"y": 0, "x": 0, "morph_idx": 0, "stage_idx": 0}
     frozen = {"state": False}
+    spectrum_home = {"xlim": None, "ylim": None}
     if H > 1 or W > 1:
         iy, ix = np.unravel_index(int(np.nanargmax(score_map)), score_map.shape)
         current["y"] = int(iy)
@@ -181,7 +144,6 @@ def show_cache(cache: dict[str, Any]) -> None:
     )
     ax_map = fig.add_subplot(gs[0, 0])
     ax_spec = fig.add_subplot(gs[0, 1])
-    ax_pce = ax_spec.twinx()
     chk_grid = gs[1, 1].subgridspec(1, 3, wspace=0.20)
     ax_chk_blocks = [fig.add_subplot(chk_grid[0, i]) for i in range(3)]
     for ax in ax_chk_blocks:
@@ -200,8 +162,6 @@ def show_cache(cache: dict[str, Any]) -> None:
         for txt in chk.labels:
             txt.set_fontsize(11)
         checks.append(chk)
-
-    overlay_diag_cache: dict[tuple[str, str], dict[str, Any]] = {}
 
     def current_window() -> int:
         return int(morph_windows[current["morph_idx"] % len(morph_windows)])
@@ -261,10 +221,10 @@ def show_cache(cache: dict[str, Any]) -> None:
             return
         colors = {
             "dilation": "#ff7f0e",
-            "erosion": "#1f77b4",
+            "erosion": "#222222",
             "opening": "#9467bd",
             "top-hat": "#8c564b",
-            "gradient": "#bcbd22",
+            "gradient": "#e377c2",
         }
         ax_spec.plot(
             x_axis,
@@ -275,29 +235,16 @@ def show_cache(cache: dict[str, Any]) -> None:
             label=f"{label} w={window}",
         )
 
-    def _diag_cache_key(kind: str, row: dict[str, Any]) -> tuple[str, str]:
-        return kind, str(row.get("candidate_id", ""))
-
-    def _get_pce_debug(row: dict[str, Any], gradient_signal: np.ndarray) -> dict[str, Any]:
-        key = _diag_cache_key("pce", row)
-        cached = overlay_diag_cache.get(key)
-        if cached is not None:
-            return cached
-        out = _compute_pce_overlay_debug(gradient_signal, row)
-        overlay_diag_cache[key] = out
-        return out
-
     def _edge_debug(row: dict[str, Any]) -> dict[str, Any]:
         debug = row.get("edge_debug", {})
         return debug if isinstance(debug, dict) else {}
 
     def _context_bounds(row: dict[str, Any]) -> tuple[int, int]:
         debug = _edge_debug(row)
-        selected = debug.get("edge_selected_context", {})
-        if isinstance(selected, dict):
-            left = int(selected.get("measurement_left", row.get("start", 0)))
-            right = int(selected.get("measurement_right", row.get("end", 0)))
-            return left, right
+        left = debug.get("edge_context_left")
+        right = debug.get("edge_context_right")
+        if left is not None and right is not None:
+            return int(left), int(right)
         return int(row.get("start", 0)), int(row.get("end", 0))
 
     def _contact_context_bounds(row: dict[str, Any], pad: int = 4) -> tuple[int, int]:
@@ -305,92 +252,108 @@ def show_cache(cache: dict[str, Any]) -> None:
         right = min(len(x_axis) - 1, int(row.get("end", 0)) + int(pad))
         return left, right
 
-    def _draw_pce_overlay(rows: list[dict[str, Any]], gradient_signal: np.ndarray) -> None:
-        ax_pce.clear()
-        ax_pce.set_visible(True)
+    def _draw_pce_overlay(rows: list[dict[str, Any]]) -> None:
         legend_handles: list[Any] = []
         legend_labels: list[str] = []
         first = True
         for row in rows:
-            debug = _get_pce_debug(row, gradient_signal)
-            d2 = np.asarray(debug.get("d2", []), dtype=float)
-            if d2.size == 0:
+            if str(row.get("candidate_noise_prefilter_status", "")) == "rejected_noise":
                 continue
-            start = int(debug.get("segment_left", row.get("start", 0)))
-            x_vals = x_axis[start + 1 : start + 1 + d2.size]
-            if x_vals.size != d2.size:
+            debug = row.get("pce_t98_debug", {})
+            if not isinstance(debug, dict):
                 continue
-            line, = ax_pce.plot(x_vals, d2, color="black", linewidth=1.5, alpha=0.85, label="PCE t98")
-            peak_rel = int(debug.get("peak_rel", 0))
-            global_min = int(debug.get("global_min_idx", 0))
-            local_min = int(debug.get("local_min_idx", global_min))
-            chosen = int(debug.get("chosen_idx", global_min))
-            apex_handle = ax_pce.plot([x_vals[peak_rel]], [d2[peak_rel]], marker="x", color="#d62728", markersize=8.0, linestyle="None")[0]
-            global_handle = ax_pce.plot([x_vals[global_min]], [d2[global_min]], marker="o", color="#1f77b4", markersize=6.8, linestyle="None")[0]
-            local_handle = ax_pce.plot([x_vals[local_min]], [d2[local_min]], marker="^", color="#ff7f0e", markersize=7.0, linestyle="None")[0]
-            chosen_handle = ax_pce.plot([x_vals[chosen]], [d2[chosen]], marker="D", color="#111111", markersize=6.4, linestyle="None")[0]
-            ll = int(debug.get("local_left_idx", local_min))
-            rr = int(debug.get("local_right_idx", local_min))
-            if 0 <= ll < d2.size and 0 <= rr < d2.size and rr >= ll:
-                ax_pce.axvspan(x_vals[ll], x_vals[rr], color="#444444", alpha=0.05)
+            x_rel = [int(v) for v in debug.get("curve_x_rel", [])]
+            y_vals = np.asarray(debug.get("curve_y", []), dtype=float)
+            if not x_rel or y_vals.size != len(x_rel):
+                continue
+            start = int(row.get("start", 0))
+            x_plot_idx = np.asarray([start + int(v) for v in x_rel], dtype=int)
+            if np.any(x_plot_idx < 0) or np.any(x_plot_idx >= len(x_axis)):
+                continue
+            ax_spec.axvspan(x_axis[int(x_plot_idx[0])], x_axis[int(x_plot_idx[-1])], color="#666666", alpha=0.08, zorder=0)
+            line, = ax_spec.plot(x_axis[x_plot_idx], y_vals, color="black", linewidth=1.4, alpha=0.95, zorder=2, label="curvature")
+            apex_idx_rel = int(debug.get("apex_idx_rel", 1))
+            chosen_idx_rel = int(debug.get("chosen_idx_rel", 1))
+            base_idx_rel = int(debug.get("base_idx_rel", 1))
+            neg_idx_rel = debug.get("negative_idx_rel")
+            local_left_rel = int(debug.get("local_left_idx_rel", apex_idx_rel))
+            local_right_rel = int(debug.get("local_right_idx_rel", apex_idx_rel))
+            def _plot_rel(rel_idx: int | None, marker: str, color: str, size: float, zorder: float, fill: bool = False) -> Any | None:
+                if rel_idx is None:
+                    return None
+                rel = int(rel_idx)
+                pos = rel - 1
+                if not (0 <= pos < y_vals.size):
+                    return None
+                return ax_spec.plot(
+                    [x_axis[start + rel]],
+                    [y_vals[pos]],
+                    marker=marker,
+                    color=color,
+                    markersize=size,
+                    linestyle="None",
+                    markerfacecolor=(color if fill else "none"),
+                    markeredgewidth=1.35,
+                    zorder=zorder,
+                )[0]
+            apex_handle = _plot_rel(apex_idx_rel, "x", "#111111", 7.8, 6.0)
+            base_handle = _plot_rel(base_idx_rel, "+", "#555555", 9.0, 5.2)
+            neg_handle = _plot_rel((None if neg_idx_rel is None else int(neg_idx_rel)), "X", "#1f77b4", 7.4, 5.4)
+            chosen_handle = _plot_rel(chosen_idx_rel, (5, 2, 0), "#d62728", 10.5, 6.2)
+            ll = start + local_left_rel
+            rr = start + local_right_rel
+            if 0 <= ll < len(x_axis) and 0 <= rr < len(x_axis) and rr >= ll:
+                ax_spec.axvspan(x_axis[ll], x_axis[rr], color="#999999", alpha=0.06, zorder=1)
             if first:
-                legend_handles.extend([line, apex_handle, global_handle, local_handle, chosen_handle])
-                legend_labels.extend(
-                    [
-                        "PCE t98",
-                        "apex",
-                        "global curvature support",
-                        "local curvature support",
-                        "chosen PCE point",
-                    ]
-                )
+                legend_handles.append(line)
+                legend_labels.append("curvature")
+                for handle, label in (
+                    (apex_handle, "apex"),
+                    (base_handle, "global support"),
+                    (neg_handle, "negative support"),
+                    (chosen_handle, "chosen PCE point (t098)"),
+                ):
+                    if handle is not None:
+                        legend_handles.append(handle)
+                        legend_labels.append(label)
                 first = False
-        ax_pce.axhline(0.0, color="#555555", linestyle="--", linewidth=0.9, alpha=0.8)
-        ax_pce.set_ylabel("PCE curvature", fontsize=10, color="#333333")
-        ax_pce.tick_params(axis="y", labelsize=9, colors="#333333")
-        if legend_handles:
-            handles, labels = _dedup_legend(legend_handles, legend_labels)
-            ax_pce.legend(handles, labels, loc="upper left", fontsize=9, framealpha=0.92)
+        ax_spec._pce_legend_handles = legend_handles  # type: ignore[attr-defined]
+        ax_spec._pce_legend_labels = legend_labels  # type: ignore[attr-defined]
 
     def _draw_edge_overlay(rows: list[dict[str, Any]], raw_sig: np.ndarray) -> None:
         legend_handles: list[Any] = []
         legend_labels: list[str] = []
         first = True
         for row in rows:
+            if str(row.get("candidate_noise_prefilter_status", "")) == "rejected_noise":
+                continue
             debug = _edge_debug(row)
             if not debug:
                 continue
-            selected = debug.get("edge_selected_context", {})
-            if isinstance(selected, dict):
-                ml = int(selected.get("measurement_left", row.get("start", 0)))
-                mr = int(selected.get("measurement_right", row.get("end", 0)))
-                if 0 <= ml < len(x_axis) and 0 <= mr < len(x_axis) and mr >= ml:
-                    ax_spec.axvspan(x_axis[ml], x_axis[mr], color="#fb6a4a", alpha=0.05)
-            guard_passed = bool(debug.get("edge_guard_passed", str(debug.get("reason", "")).strip().lower() == "ok"))
-            if not guard_passed:
-                peak = int(row.get("peak_index", 0))
-                if 0 <= peak < len(x_axis):
-                    ax_spec.text(
-                        x_axis[peak],
-                        raw_sig[peak],
-                        f"edge guard: {debug.get('edge_guard_reason', debug.get('reason', 'rejected'))}",
-                        fontsize=9,
-                        color="#fb6a4a",
-                        ha="left",
-                        va="bottom",
-                    )
+            edge_value = metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed")
+            if not np.isfinite(edge_value):
                 continue
+            ml = int(debug.get("edge_context_left", row.get("start", 0)))
+            mr = int(debug.get("edge_context_right", row.get("end", 0)))
+            if 0 <= ml < len(x_axis) and 0 <= mr < len(x_axis) and mr >= ml:
+                ax_spec.axvspan(x_axis[ml], x_axis[mr], color="#fb6a4a", alpha=0.05)
             segments = []
             colors = []
             support_x = []
             support_y = []
+            base_levels = []
             for item in debug.get("edge_selected_levels", []):
                 if not isinstance(item, dict):
+                    continue
+                percent = int(item.get("percent", -1))
+                if percent == 0:
+                    base_levels.append(item)
+                    continue
+                if percent not in EDGE_DENSE_LEVELS_ASC:
                     continue
                 left_cross = metric_float(item, "left_cross")
                 right_cross = metric_float(item, "right_cross")
                 level_y = metric_float(item, "level_value")
-                percent = int(item.get("percent", 0))
                 if not (np.isfinite(left_cross) and np.isfinite(right_cross) and np.isfinite(level_y)):
                     continue
                 lx = _x_from_index(x_axis, left_cross)
@@ -399,35 +362,63 @@ def show_cache(cache: dict[str, Any]) -> None:
                 colors.append((0.95, 0.25, 0.15, 0.18 + 0.50 * (percent / 100.0)))
                 support_x.extend([lx, rx])
                 support_y.extend([level_y, level_y])
+            for item in base_levels:
+                left_cross = metric_float(item, "left_cross")
+                right_cross = metric_float(item, "right_cross")
+                level_y = metric_float(item, "level_value")
+                if np.isfinite(left_cross) and np.isfinite(right_cross) and np.isfinite(level_y):
+                    ax_spec.plot(
+                        [_x_from_index(x_axis, left_cross), _x_from_index(x_axis, right_cross)],
+                        [level_y, level_y],
+                        color="#fb6a4a",
+                        linestyle=":",
+                        linewidth=1.1,
+                    )
             if segments:
                 ax_spec.add_collection(LineCollection(segments, colors=colors, linewidths=1.35))
                 ax_spec.scatter(support_x, support_y, s=16, c="#fb6a4a", zorder=4)
-                base_levels = [item for item in debug.get("edge_selected_levels", []) if isinstance(item, dict) and int(item.get("percent", -1)) == 0]
-                for item in base_levels:
-                    left_cross = metric_float(item, "left_cross")
-                    right_cross = metric_float(item, "right_cross")
-                    level_y = metric_float(item, "level_value")
-                    if np.isfinite(left_cross) and np.isfinite(right_cross) and np.isfinite(level_y):
-                        ax_spec.plot(
-                            [_x_from_index(x_axis, left_cross), _x_from_index(x_axis, right_cross)],
-                            [level_y, level_y],
-                            color="#fb6a4a",
-                            linestyle=":",
-                            linewidth=1.1,
-                        )
-                if first:
-                    legend_handles.extend(
-                        [
-                            Line2D([0], [0], color="#fb6a4a", linewidth=1.5),
-                            Line2D([0], [0], color="#fb6a4a", linestyle=":", linewidth=1.2),
-                            Line2D([0], [0], marker="o", color="#fb6a4a", linestyle="None", markersize=5.0),
-                        ]
+            if first:
+                if segments:
+                    legend_handles.append(Line2D([0], [0], color="#fb6a4a", linewidth=1.5))
+                    legend_labels.append("EDGE levels 5..90")
+                if base_levels:
+                    legend_handles.append(Line2D([0], [0], color="#fb6a4a", linestyle=":", linewidth=1.2))
+                    legend_labels.append("EDGE level 0")
+                if support_x:
+                    legend_handles.append(Line2D([0], [0], marker="o", color="#fb6a4a", linestyle="None", markersize=5.0))
+                    legend_labels.append("EDGE support points")
+            if bool(debug.get("edge_foot_search_triggered")) and str(debug.get("edge_foot_search_status", "")) in {"searched", "unresolved", "context_limited"}:
+                peak = int(row.get("peak_index", 0))
+                if 0 <= peak < len(x_axis):
+                    ax_spec.text(
+                        x_axis[peak],
+                        raw_sig[peak],
+                        "EDGE foot search",
+                        fontsize=8,
+                        color="#fb6a4a",
+                        ha="left",
+                        va="bottom",
                     )
-                    legend_labels.extend(["EDGE levels 5..90", "EDGE level 0", "EDGE support points"])
-                    first = False
+            for item in debug.get("edge_rejected_foots", []):
+                if not isinstance(item, dict):
+                    continue
+                idx = int(item.get("index", -1))
+                ratio = metric_float(item, "r")
+                if not (0 <= idx < len(x_axis)):
+                    continue
+                yv = float(raw_sig[idx])
+                ax_spec.plot([x_axis[idx]], [yv], marker="v", color="#d62728", markersize=7.5, linestyle="None", zorder=5)
+                ax_spec.axvline(x_axis[idx], color="#d62728", linestyle=":", linewidth=0.9, alpha=0.8)
+                if np.isfinite(ratio):
+                    ax_spec.text(x_axis[idx], yv, f"r={ratio:.1f}", color="#d62728", fontsize=8, ha="center", va="top")
+            if first and debug.get("edge_rejected_foots"):
+                legend_handles.append(Line2D([0], [0], marker="v", color="#d62728", linestyle="None", markersize=6.0))
+                legend_labels.append("rejected foot")
+            if first and legend_handles:
+                first = False
         if legend_handles:
-            handles, labels = _dedup_legend(legend_handles, legend_labels)
-            ax_spec.legend(handles, labels, loc="upper right", fontsize=9, framealpha=0.92)
+            ax_spec._edge_legend_handles = legend_handles  # type: ignore[attr-defined]
+            ax_spec._edge_legend_labels = legend_labels  # type: ignore[attr-defined]
 
     def _draw_contacts(rows: list[dict[str, Any]], indices: list[int], marker: str, color: str, size: float) -> None:
         points: set[int] = set()
@@ -470,40 +461,104 @@ def show_cache(cache: dict[str, Any]) -> None:
                 ax_spec.text(x_axis[ai], raw_sig[ai], " | ".join(parts), color=color, fontsize=10, va="bottom", ha="center")
 
     def _draw_metrics(rows: list[dict[str, Any]], raw_sig: np.ndarray) -> None:
-        for idx, row in enumerate(rows):
+        metric_rows = [row for row in rows if str(row.get("candidate_noise_prefilter_status", "")) != "rejected_noise"]
+        metric_rows.sort(key=lambda row: int(row.get("peak_index", 0)))
+        if not metric_rows:
+            return
+        x_min, x_max = ax_spec.get_xlim()
+        y_min, y_max = ax_spec.get_ylim()
+        y_span = max(1e-9, float(y_max - y_min))
+        renderer = fig.canvas.get_renderer()
+        x_span = max(1e-9, float(x_max - x_min))
+        placed_bboxes = []
+        for row in metric_rows:
             peak = int(row.get("peak_index", 0))
             if not (0 <= peak < len(raw_sig)):
                 continue
+            ss1 = metric_float(row, "spike_score_v1")
+            pce = metric_float(row, "pce_negpref_t098_evidence_signed")
+            if not np.isfinite(pce):
+                pce = metric_float(row, "pce")
+            edge = metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed")
+            finite_parts: list[str] = []
+            if np.isfinite(ss1):
+                finite_parts.append(f"ss1={ss1:.3g}")
+            if np.isfinite(pce):
+                finite_parts.append(f"pce={pce:.3g}")
+            if np.isfinite(edge):
+                finite_parts.append(f"edge={edge:.3g}")
+            if not finite_parts:
+                continue
             color = candidate_status_color(row, active_profile)
-            y_pos = float(raw_sig[peak]) + (idx % 2) * 18.0
-            label = (
-                f"ss1={metric_float(row, 'spike_score_v1'):.3g}\n"
-                f"pce={metric_float(row, 'pce_negpref_t098_evidence_signed'):.3g}\n"
-                f"edge={metric_float(row, 'recdw_sum_0_90_raman_veto_evidence_signed'):.3g}\n"
-                f"{row.get('primary_active_reason', '')}"
-            )
-            ax_spec.text(
-                x_axis[peak],
-                y_pos,
+            x_pos = float(x_axis[peak])
+            label = "\n".join(finite_parts + ([str(row.get("primary_active_reason", ""))] if row.get("primary_active_reason") else []))
+            y_peak = float(raw_sig[peak])
+            x_text = float(np.clip(x_pos + 0.010 * x_span, x_min + 0.02 * x_span, x_max - 0.20 * x_span))
+            y_pos = float(np.clip(y_peak + 0.045 * y_span, y_min + 0.03 * y_span, y_max - 0.03 * y_span))
+            text = ax_spec.annotate(
                 label,
-                color=color,
-                fontsize=10,
+                xy=(x_pos, y_peak),
+                xytext=(x_text, y_pos),
+                textcoords="data",
                 ha="left",
                 va="bottom",
-                bbox={"facecolor": "white", "alpha": 0.74, "edgecolor": color, "linewidth": 0.9},
+                fontsize=10,
+                color=color,
+                bbox={"facecolor": "white", "alpha": 0.78, "edgecolor": color, "linewidth": 0.9},
+                arrowprops={"arrowstyle": "-", "color": color, "lw": 0.7, "alpha": 0.55, "shrinkA": 2, "shrinkB": 2},
             )
-            ax_spec.axvline(x_axis[peak], color=color, linestyle=":", linewidth=1.0, alpha=0.65)
+            if renderer is None:
+                fig.canvas.draw()
+                renderer = fig.canvas.get_renderer()
+            best_xy = (x_text, y_pos)
+            for step in range(24):
+                text.set_position((x_text, y_pos))
+                bbox = text.get_window_extent(renderer=renderer).expanded(1.03, 1.08)
+                axes_bbox = ax_spec.get_window_extent(renderer=renderer)
+                inside = (
+                    bbox.x0 >= axes_bbox.x0 + 2
+                    and bbox.x1 <= axes_bbox.x1 - 2
+                    and bbox.y0 >= axes_bbox.y0 + 2
+                    and bbox.y1 <= axes_bbox.y1 - 2
+                )
+                overlap = any(bbox.overlaps(prev) for prev in placed_bboxes)
+                if inside and not overlap:
+                    best_xy = (x_text, y_pos)
+                    placed_bboxes.append(bbox)
+                    break
+                if step % 2 == 0:
+                    y_pos += 0.07 * y_span
+                else:
+                    y_pos -= 0.09 * y_span
+                if step % 4 == 3:
+                    x_text += 0.014 * x_span
+                if step % 6 == 5:
+                    x_text -= 0.020 * x_span
+                x_text = float(np.clip(x_text, x_min + 0.02 * x_span, x_max - 0.20 * x_span))
+                y_pos = float(np.clip(y_pos, y_min + 0.02 * y_span, y_max - 0.02 * y_span))
+            text.set_position(best_xy)
+
+    def _contact_context_spans(rows: list[dict[str, Any]], pad: int = 4) -> list[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        for row in rows:
+            left, right = _contact_context_bounds(row, pad=pad)
+            spans.append((int(left), int(right)))
+        indices: list[int] = []
+        for left, right in spans:
+            indices.extend(range(left, right + 1))
+        return to_contiguous_spans(sorted(set(indices)))
 
     raw_sig = np.asarray(spectra[current["y"], current["x"], :], dtype=float)
 
     def _draw_spectrum() -> None:
         nonlocal raw_sig
         ax_spec.clear()
-        ax_pce.clear()
-        ax_pce.set_visible(False)
+        ax_spec._pce_legend_handles = []  # type: ignore[attr-defined]
+        ax_spec._pce_legend_labels = []  # type: ignore[attr-defined]
+        ax_spec._edge_legend_handles = []  # type: ignore[attr-defined]
+        ax_spec._edge_legend_labels = []  # type: ignore[attr-defined]
         rows = current_rows()
         raw_sig = np.asarray(spectra[current["y"], current["x"], :], dtype=float)
-        gradient_signal = np.asarray(overlays["gradient"][current_window()][current["y"], current["x"], :], dtype=float)
         if states["corrected"]:
             ax_spec.plot(x_axis, raw_sig, color="#d62728", linewidth=1.7, label="raw")
             ax_spec.plot(
@@ -534,23 +589,40 @@ def show_cache(cache: dict[str, Any]) -> None:
 
         morph_row = small_by_pixel.get((int(current["y"]), int(current["x"])), {})
         if states["dilation contacts"] or states["erosion contacts"] or states["despike chords"]:
-            bounds = [_contact_context_bounds(row) for row in rows]
-            if bounds:
-                left = min(v[0] for v in bounds)
-                right = max(v[1] for v in bounds)
-                left = max(0, min(left, len(x_axis) - 1))
-                right = max(0, min(right, len(x_axis) - 1))
-                if right >= left:
-                    ax_spec.axvspan(x_axis[left], x_axis[right], color="#17becf", alpha=0.05)
+            for left, right in _contact_context_spans(rows, pad=4):
+                li = max(0, min(int(left), len(x_axis) - 1))
+                ri = max(0, min(int(right), len(x_axis) - 1))
+                if ri >= li:
+                    ax_spec.axvspan(x_axis[li], x_axis[ri], color="#17becf", alpha=0.14)
         if states["noise reference"]:
             for left, right in morph_row.get("noise_reference_spans", []):
                 li = int(max(0, left))
                 ri = int(min(len(raw_sig) - 1, right))
                 if ri >= li:
                     ax_spec.plot(x_axis[li : ri + 1], raw_sig[li : ri + 1], color="black", linewidth=2.2)
+            noise_line = None
+            for row in rows:
+                dbg = _edge_debug(row)
+                src = dbg.get("edge_noise_source")
+                val = metric_float(dbg, "edge_noise_value")
+                if src and np.isfinite(val):
+                    noise_line = f"noise={val:.1f} ({src})"
+                    break
+            if noise_line:
+                ax_spec.text(
+                    0.015,
+                    0.98,
+                    noise_line,
+                    transform=ax_spec.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=9,
+                    color="black",
+                    bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "black", "linewidth": 0.7},
+                )
 
         if states["PCE"]:
-            _draw_pce_overlay(rows, gradient_signal)
+            _draw_pce_overlay(rows)
         if states["EDGE"]:
             _draw_edge_overlay(rows, raw_sig)
 
@@ -572,18 +644,32 @@ def show_cache(cache: dict[str, Any]) -> None:
                 ri = int(chord["right"])
                 ax_spec.plot([x_axis[li], x_axis[ri]], [float(chord["y_left"]), float(chord["y_right"])], color="#17becf", linewidth=1.7)
 
-        if states["noise filter"]:
-            _draw_noise_filter(rows, raw_sig)
-        if states["metrics"]:
-            _draw_metrics(rows, raw_sig)
-
         ax_spec.set_xlabel("wavenumber", fontsize=11)
         ax_spec.set_ylabel("intensity", fontsize=11)
         ax_spec.set_title("spectrum", fontsize=12)
         ax_spec.tick_params(labelsize=10)
+        ax_spec.relim()
+        ax_spec.autoscale_view()
+        if states["noise filter"]:
+            ax_spec.relim()
+            ax_spec.autoscale_view()
+        xlim = ax_spec.get_xlim()
+        ylim = ax_spec.get_ylim()
+        y_span = max(1e-9, float(ylim[1] - ylim[0]))
+        spectrum_home["xlim"] = xlim
+        spectrum_home["ylim"] = (float(ylim[0] - 0.03 * y_span), float(ylim[1] + 0.18 * y_span))
+        ax_spec.set_xlim(*spectrum_home["xlim"])
+        ax_spec.set_ylim(*spectrum_home["ylim"])
+        if states["noise filter"]:
+            _draw_noise_filter(rows, raw_sig)
+        if states["metrics"]:
+            _draw_metrics(rows, raw_sig)
         handles1, labels1 = ax_spec.get_legend_handles_labels()
-        handles2, labels2 = ax_pce.get_legend_handles_labels()
-        handles, labels = _dedup_legend(handles1 + handles2, labels1 + labels2)
+        handles2 = list(getattr(ax_spec, "_pce_legend_handles", []))
+        labels2 = list(getattr(ax_spec, "_pce_legend_labels", []))
+        handles3 = list(getattr(ax_spec, "_edge_legend_handles", []))
+        labels3 = list(getattr(ax_spec, "_edge_legend_labels", []))
+        handles, labels = _dedup_legend(handles1 + handles2 + handles3, labels1 + labels2 + labels3)
         if handles:
             ax_spec.legend(handles, labels, loc="upper right", fontsize=9, framealpha=0.92)
 
@@ -640,6 +726,12 @@ def show_cache(cache: dict[str, Any]) -> None:
         if key == "x":
             current["stage_idx"] = (current_stage_index() + 1) % max(1, len(despike_stages))
             update()
+            return
+        if key == "home":
+            if spectrum_home["xlim"] is not None and spectrum_home["ylim"] is not None:
+                ax_spec.set_xlim(*spectrum_home["xlim"])
+                ax_spec.set_ylim(*spectrum_home["ylim"])
+                fig.canvas.draw_idle()
             return
         if frozen["state"] and key in {"left", "right", "up", "down"}:
             dx = -1 if key == "left" else (1 if key == "right" else 0)

@@ -19,6 +19,11 @@ elektroferogramy pro vitu/
 plots/
 ss4_histograms/
 outputs/
+outputs_core/
+viewer_cache.npz
+debug_light.json
+despike_debug*.json
+debug_feature*.json
 
 # IDEs
 .vscode/

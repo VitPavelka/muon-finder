@@ -64,6 +64,20 @@ def _safe_float(value: object, default: float = float("nan")) -> float:
     return out if np.isfinite(out) else default
 
 
+def _nan_summary(values: list[float], fn: str) -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    if fn == "mean":
+        return float(np.mean(arr))
+    if fn == "max":
+        return float(np.max(arr))
+    if fn == "min":
+        return float(np.min(arr))
+    raise ValueError(fn)
+
+
 def _fmt(value: object, digits: int = 4) -> str:
     v = _safe_float(value)
     if np.isfinite(v):
@@ -172,26 +186,31 @@ def _feature_row(name: str, rows: list[dict[str, Any]], binary_labels: dict[tupl
     auc_mr = _auc_pairwise(values, labels_ter, "muon", "raman")
     auc_mn = _auc_pairwise(values, labels_ter, "muon", "noise")
     auc_rn = _auc_pairwise(values, labels_ter, "raman", "noise")
-    macro_pair = float(np.nanmean([auc_mr, auc_mn, auc_rn]))
+    macro_pair = _nan_summary([auc_mr, auc_mn, auc_rn], "mean")
+    auc_raman_vs_rest = _auc_pairwise(values, labels_ter, "raman", "muon")
+    auc_noise_vs_rest = _auc_pairwise(values, labels_ter, "noise", "muon")
+    finite_mask = np.isfinite(np.asarray(values, dtype=float))
     return {
         "feature": name,
         "auc": auc_bin,
         "auc_feature_oriented": auc_bin,
         "auc_feat_oriented": auc_bin,
         "auc_muon_vs_rest": auc_bin,
-        "auc_raman_vs_rest": _auc_pairwise(values, labels_ter, "raman", "muon"),
-        "auc_noise_vs_rest": _auc_pairwise(values, labels_ter, "noise", "muon"),
+        "auc_raman_vs_rest": auc_raman_vs_rest,
+        "auc_noise_vs_rest": auc_noise_vs_rest,
         "auc_muon_vs_raman": auc_mr,
         "auc_muon_vs_noise": auc_mn,
         "auc_raman_vs_noise": auc_rn,
         "macro_pairwise_auc": macro_pair,
-        "macro_ovr_auc": float(np.nanmean([auc_bin, _auc_pairwise(values, labels_ter, "raman", "muon"), _auc_pairwise(values, labels_ter, "noise", "muon")])),
-        "best_pairwise_auc": float(np.nanmax([auc_mr, auc_mn, auc_rn])) if np.any(np.isfinite([auc_mr, auc_mn, auc_rn])) else float("nan"),
-        "worst_pairwise_auc": float(np.nanmin([auc_mr, auc_mn, auc_rn])) if np.any(np.isfinite([auc_mr, auc_mn, auc_rn])) else float("nan"),
+        "macro_ovr_auc": _nan_summary([auc_bin, auc_raman_vs_rest, auc_noise_vs_rest], "mean"),
+        "best_pairwise_auc": _nan_summary([auc_mr, auc_mn, auc_rn], "max"),
+        "worst_pairwise_auc": _nan_summary([auc_mr, auc_mn, auc_rn], "min"),
         "raman_veto_auc": auc_mr,
         "noise_filter_auc": auc_mn,
         "muon_detector_auc": auc_bin,
         "n_labeled": int(len(labels_bin)),
+        "n_finite": int(np.sum(finite_mask)),
+        "n_missing": int(len(labels_bin) - int(np.sum(finite_mask))),
     }
 
 
@@ -242,14 +261,15 @@ def _show_matrix(selected: list[str], rows: list[dict[str, Any]], feature_rows: 
     auc_by_feature = {str(row["feature"]): _safe_float(row.get(auc_key)) for row in feature_rows}
     short_labels = [_short_label(name) for name in selected]
     if corr_type == "both":
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6.5), constrained_layout=True)
+        fig = plt.figure(figsize=(14, 6.6), constrained_layout=True)
+        gs = fig.add_gridspec(1, 2)
+        axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])]
         mats = [("Pearson", pearson), ("Spearman", spearman)]
     else:
-        fig, ax = plt.subplots(1, 1, figsize=(7.4, 6.5), constrained_layout=True)
-        axes = [ax]
+        fig = plt.figure(figsize=(7.4, 6.6), constrained_layout=True)
+        gs = fig.add_gridspec(1, 1)
+        axes = [fig.add_subplot(gs[0, 0])]
         mats = [(corr_type.capitalize(), pearson if corr_type == "pearson" else spearman)]
-    annot = axes[0].annotate("", xy=(0, 0), xytext=(12, 12), textcoords="offset points", bbox={"boxstyle": "round", "fc": "w", "alpha": 0.96})
-    annot.set_visible(False)
     artists = []
     norm = Normalize(vmin=-1.0, vmax=1.0)
     for ax, (title, corr) in zip(axes, mats):
@@ -261,32 +281,81 @@ def _show_matrix(selected: list[str], rows: list[dict[str, Any]], feature_rows: 
         ax.set_title(f"{title} correlation")
         artists.append((ax, im, title, corr))
     fig.colorbar(artists[0][1], ax=axes, fraction=0.046, pad=0.04)
+    last_hover = {"ax": None, "i": None, "j": None}
+    annots = {}
+    for ax, _im, _title, _corr in artists:
+        annot = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(10, 10),
+            textcoords="offset points",
+            ha="left",
+            va="bottom",
+            fontsize=8.5,
+            bbox={"boxstyle": "round", "fc": "white", "alpha": 0.98},
+        )
+        annot.set_visible(False)
+        annot.set_in_layout(False)
+        annots[id(ax)] = annot
 
     def on_move(event) -> None:
-        shown = False
+        shown_ax = None
         for ax, _im, title, corr in artists:
             if event.inaxes is not ax or event.xdata is None or event.ydata is None:
                 continue
             j = int(np.clip(round(event.xdata), 0, len(selected) - 1))
             i = int(np.clip(round(event.ydata), 0, len(selected) - 1))
+            if last_hover["ax"] is ax and last_hover["i"] == i and last_hover["j"] == j:
+                return
+            annot = annots[id(ax)]
             annot.xy = (j, i)
             annot.set_text(
                 "\n".join(
                     [
-                        f"A={selected[i]}",
-                        f"B={selected[j]}",
-                        f"Pearson={pearson[i, j]:.4f}",
-                        f"Spearman={spearman[i, j]:.4f}",
-                        f"A {auc_key}={auc_by_feature.get(selected[i], float('nan')):.4f}",
-                        f"B {auc_key}={auc_by_feature.get(selected[j], float('nan')):.4f}",
+                        f"A: {_short_label(selected[i], 22)}",
+                        f"B: {_short_label(selected[j], 22)}",
+                        f"Pearson: {pearson[i, j]:.4f}",
+                        f"Spearman: {spearman[i, j]:.4f}",
+                        f"AUC A: {auc_by_feature.get(selected[i], float('nan')):.4f}",
+                        f"AUC B: {auc_by_feature.get(selected[j], float('nan')):.4f}",
                     ]
                 )
             )
             annot.set_visible(True)
-            shown = True
+            renderer = fig.canvas.get_renderer()
+            axes_bbox = ax.get_window_extent(renderer=renderer)
+            placed = False
+            for xoff, yoff in ((12, 12), (-12, 12), (12, -12), (-12, -12), (20, 20), (-20, 20), (20, -20), (-20, -20)):
+                annot.set_position((xoff, yoff))
+                annot.set_ha("right" if xoff < 0 else "left")
+                annot.set_va("top" if yoff < 0 else "bottom")
+                bbox = annot.get_window_extent(renderer=renderer).expanded(1.02, 1.04)
+                if (
+                    bbox.x0 >= axes_bbox.x0 + 2
+                    and bbox.x1 <= axes_bbox.x1 - 2
+                    and bbox.y0 >= axes_bbox.y0 + 2
+                    and bbox.y1 <= axes_bbox.y1 - 2
+                ):
+                    placed = True
+                    break
+            if not placed:
+                annot.set_position((12, -12))
+                annot.set_ha("left")
+                annot.set_va("top")
+            shown_ax = ax
+            last_hover["ax"] = ax
+            last_hover["i"] = i
+            last_hover["j"] = j
             break
-        if not shown and annot.get_visible():
-            annot.set_visible(False)
+        for ax, *_rest in artists:
+            if ax is not shown_ax:
+                annots[id(ax)].set_visible(False)
+        if shown_ax is None:
+            last_hover["ax"] = None
+            last_hover["i"] = None
+            last_hover["j"] = None
+            for ax, *_rest in artists:
+                annots[id(ax)].set_visible(False)
         fig.canvas.draw_idle()
 
     fig.canvas.mpl_connect("motion_notify_event", on_move)
@@ -324,7 +393,7 @@ def main() -> None:
     if args.sort_by != "input":
         feature_rows.sort(key=lambda row: _safe_float(row.get(args.sort_by), float("-inf")), reverse=True)
         selected = [row["feature"] for row in feature_rows]
-    summary_cols = ["feature", "auc_feature_oriented", "macro_pairwise_auc", "auc_muon_vs_raman", "auc_muon_vs_noise", "auc_raman_vs_noise", "n_labeled"]
+    summary_cols = ["feature", "auc_feature_oriented", "macro_pairwise_auc", "auc_muon_vs_raman", "auc_muon_vs_noise", "auc_raman_vs_noise", "n_labeled", "n_finite", "n_missing"]
     _print_table(feature_rows, summary_cols, "Feature Summary")
 
     pair_rows: list[dict[str, Any]] = []

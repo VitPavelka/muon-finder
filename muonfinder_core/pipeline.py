@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
 import subprocess
 import time
@@ -31,6 +33,9 @@ if __package__ in {None, ""}:
     from muonfinder_core.despike import build_placeholder_correction
     from muonfinder_core.io import load_dataset, load_target_coords_csv
     from muonfinder_core.metrics import (
+        EDGE_ALL_LEVELS_ASC,
+        EDGE_DENSE_LEVELS_ASC,
+        EDGE_MAPPING_LEVELS_DESC,
         MetricComputationContext,
         compute_raw_edge_metric,
         compute_ss1_pce_features,
@@ -54,6 +59,9 @@ else:
     from .despike import build_placeholder_correction
     from .io import load_dataset, load_target_coords_csv
     from .metrics import (
+        EDGE_ALL_LEVELS_ASC,
+        EDGE_DENSE_LEVELS_ASC,
+        EDGE_MAPPING_LEVELS_DESC,
         MetricComputationContext,
         compute_raw_edge_metric,
         compute_ss1_pce_features,
@@ -137,14 +145,20 @@ def _prepare_candidate_rows(
         edge_context_pad_pts=int(cfg.noise.get("edge_dense_context_pad_pts", 20)),
         edge_context_min_pad_pts=int(cfg.noise.get("edge_dense_context_min_pad_pts", 10)),
         edge_context_max_pad_pts=int(cfg.noise.get("edge_dense_context_max_pad_pts", 80)),
-        edge_dense_min_snr=float(cfg.noise.get("edge_dense_min_snr", 3.0)),
+        noise_height_factor=float(cfg.noise.get("noise_height_factor", 5.0)),
         edge_robust_reference_enabled=bool(cfg.noise.get("edge_robust_reference_enabled", True)),
-        edge_noise_guard_enabled=bool(cfg.noise.get("edge_noise_guard_enabled", True)),
-        edge_noise_guard_factor=float(cfg.noise.get("candidate_noise_height_factor", 5.0)),
         edge_use_enhanced_spike_mapping=bool(cfg.noise.get("edge_use_enhanced_spike_mapping", True)),
         edge_mapping_enable_merge_guard=bool(cfg.noise.get("edge_mapping_enable_merge_guard", True)),
         edge_mapping_noise_guard_enabled=bool(cfg.noise.get("edge_mapping_noise_guard_enabled", False)),
-        edge_mapping_min_level_percent=int(cfg.noise.get("edge_mapping_min_level_percent", 1)),
+        edge_mapping_levels_desc=EDGE_MAPPING_LEVELS_DESC,
+        edge_mapping_refine_step_percent=5,
+        edge_mapping_min_level_percent=int(cfg.noise.get("edge_mapping_min_level_percent", 5)),
+        noise_aware_foot_search_enabled=bool(cfg.noise.get("noise_aware_foot_search_enabled", False)),
+    )
+    print(f"[{_ts()}] [edge-levels] all={list(EDGE_ALL_LEVELS_ASC)} dense_desc={list(EDGE_MAPPING_LEVELS_DESC)}")
+    print(
+        f"[{_ts()}] [edge-mode] noise_aware_foot_search_enabled={bool(metric_ctx.noise_aware_foot_search_enabled)} "
+        f"noise_height_factor={float(metric_ctx.noise_height_factor):.3g}"
     )
     all_metric_rows: list[dict[str, Any]] = []
     all_edge_rows: list[dict[str, Any]] = []
@@ -188,7 +202,7 @@ def _prepare_candidate_rows(
             small_morphology=small,
             enabled=bool(cfg.noise.get("candidate_noise_prefilter_enabled", True)),
             mode=str(cfg.noise.get("candidate_noise_prefilter_mode", "morph_range_chord")),
-            height_factor=float(cfg.noise.get("candidate_noise_height_factor", 5.0)),
+            height_factor=float(cfg.noise.get("noise_height_factor", 5.0)),
         )
         total_after_noise += int(prefilter_summary.get("n_candidates_after_noise_prefilter", 0))
         noise_by_candidate = {str(row["candidate_id"]): row for row in prefilter_rows}
@@ -250,30 +264,53 @@ def _prepare_candidate_rows(
     finalize_edge_evidence(all_edge_rows, metric_ctx)
     for rows in rows_by_pixel.values():
         for row in rows:
-            ss4 = compute_ss4(
-                float(row.get("spike_score_v1", np.nan)),
-                float(row.get("pce_negpref_t098_evidence_signed", np.nan)),
-                float(row.get("recdw_sum_0_90_raman_veto_evidence_signed", np.nan)),
-                ss_blue_max=float(cfg.ss4["ss_blue_max"]),
-                ss_red_min=float(cfg.ss4["ss_red_min"]),
-                pce_red_min=float(cfg.ss4["pce_red_min"]),
-                edge_red_max=float(cfg.ss4["edge_red_max"]),
-                pce_dead_zone_enabled=bool(cfg.ss4.get("pce_dead_zone_enabled", False)),
-                pce_dead_zone_low=float(cfg.ss4.get("pce_dead_zone_low", -0.8)),
-                pce_dead_zone_high=float(cfg.ss4.get("pce_dead_zone_high", -0.2)),
-                missing_policy=str(cfg.ss4.get("missing_policy", "review")),
-            )
-            ss5 = compute_ss5(
-                float(row.get("spike_score_v1", np.nan)),
-                float(row.get("pce_negpref_t098_evidence_signed", np.nan)),
-                float(row.get("recdw_sum_0_90_raman_veto_evidence_signed", np.nan)),
-                ss1_threshold=float(cfg.ss5["ss1_threshold"]),
-                pce_spike_min=float(cfg.ss5["pce_spike_min"]),
-                edge_spike_max=float(cfg.ss5["edge_spike_max"]),
-            )
+            if str(row.get("candidate_noise_prefilter_status", "")) == "rejected_noise":
+                ss4 = {
+                    "ss4": "",
+                    "ss4_decision": "",
+                    "ss4_reason": "",
+                    "ss4_ss_zone": "",
+                    "ss4_pce_zone": "",
+                    "ss4_rve_zone": "",
+                }
+                ss5 = {
+                    "spike_score_v5": "",
+                    "ss5": "",
+                    "ss5_decision": "",
+                    "ss5_reason": "",
+                    "ss5_ss1_vote": "",
+                    "ss5_pce_vote": "",
+                    "ss5_edge_vote": "",
+                    "ss5_ss1_threshold": float(cfg.ss5["ss1_threshold"]),
+                    "ss5_pce_spike_min": float(cfg.ss5["pce_spike_min"]),
+                    "ss5_edge_spike_max": float(cfg.ss5["edge_spike_max"]),
+                }
+            else:
+                ss4 = compute_ss4(
+                    float(row.get("spike_score_v1", np.nan)),
+                    float(row.get("pce_negpref_t098_evidence_signed", np.nan)),
+                    float(row.get("recdw_sum_0_90_raman_veto_evidence_signed", np.nan)),
+                    ss_blue_max=float(cfg.ss4["ss_blue_max"]),
+                    ss_red_min=float(cfg.ss4["ss_red_min"]),
+                    pce_red_min=float(cfg.ss4["pce_red_min"]),
+                    edge_red_max=float(cfg.ss4["edge_red_max"]),
+                    pce_dead_zone_enabled=bool(cfg.ss4.get("pce_dead_zone_enabled", False)),
+                    pce_dead_zone_low=float(cfg.ss4.get("pce_dead_zone_low", -0.8)),
+                    pce_dead_zone_high=float(cfg.ss4.get("pce_dead_zone_high", -0.2)),
+                    missing_policy=str(cfg.ss4.get("missing_policy", "review")),
+                )
+                ss5 = compute_ss5(
+                    float(row.get("spike_score_v1", np.nan)),
+                    float(row.get("pce_negpref_t098_evidence_signed", np.nan)),
+                    float(row.get("recdw_sum_0_90_raman_veto_evidence_signed", np.nan)),
+                    ss1_threshold=float(cfg.ss5["ss1_threshold"]),
+                    pce_spike_min=float(cfg.ss5["pce_spike_min"]),
+                    edge_spike_max=float(cfg.ss5["edge_spike_max"]),
+                )
             row.update(ss4)
             row.update(ss5)
             row["primary_spike_score_v1"] = row.get("spike_score_v1")
+            row["primary_pce"] = row.get("pce", row.get("pce_negpref_t098_evidence_signed"))
             row["primary_pce_negpref_t098_evidence_signed"] = row.get("pce_negpref_t098_evidence_signed")
             row["primary_recdw_sum_0_90_raman_veto_evidence_signed"] = row.get("recdw_sum_0_90_raman_veto_evidence_signed")
             row["primary_ss4"] = row.get("ss4")
@@ -416,6 +453,36 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
     prefilter_rejected = sum(int(v.get("n_candidates_rejected_by_noise_prefilter", 0)) for v in prefilter_summary_by_pixel.values())
     sufficient_noise_refs = sum(1 for v in prefilter_summary_by_pixel.values() if str(v.get("noise_reference_status")) == "ok")
     insufficient_noise_refs = sum(1 for v in prefilter_summary_by_pixel.values() if str(v.get("noise_reference_status")) != "ok")
+    noise_kept_rows = [row for row in all_rows if str(row.get("candidate_noise_prefilter_status", "")) != "rejected_noise"]
+    finite_edge_rows = [row for row in noise_kept_rows if np.isfinite(_safe_float(row.get("recdw_sum_0_90_raman_veto_evidence_signed")))]
+    missing_edge_rows = [row for row in noise_kept_rows if not np.isfinite(_safe_float(row.get("recdw_sum_0_90_raman_veto_evidence_signed")))]
+    finite_pce_rows = [row for row in noise_kept_rows if np.isfinite(_safe_float(row.get("pce_negpref_t098_evidence_signed")))]
+    finite_pce_alias_rows = [row for row in noise_kept_rows if np.isfinite(_safe_float(row.get("pce")))]
+    review_missing_due_pce = [
+        row for row in noise_kept_rows
+        if str(row.get("ss4_reason", "")) == "review_missing"
+        and not np.isfinite(_safe_float(row.get("pce_negpref_t098_evidence_signed")))
+    ]
+    direct_edge_rows = [
+        row for row in finite_edge_rows
+        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_foot_search_status", "direct")) == "direct"
+    ]
+    searched_edge_rows = [
+        row for row in finite_edge_rows
+        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_foot_search_status", "")) == "searched"
+    ]
+    unresolved_edge_rows = [
+        row for row in finite_edge_rows
+        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_foot_search_status", "")) == "unresolved"
+    ]
+    expanded_edge_rows = [
+        row for row in finite_edge_rows
+        if bool((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_context_expanded"))
+    ]
+    rejected_foot_rows = [
+        row for row in finite_edge_rows
+        if bool((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_rejected_foots"))
+    ]
     metadata = {
         "input_path": str(dataset.path),
         "decision_profile": str(cfg.decision_profile),
@@ -436,6 +503,8 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
         "accepted_by_ss4_only": int(accepted_ss4_only),
         "accepted_by_ss5_only": int(accepted_ss5_only),
         "rejected_by_both": int(rejected_both),
+        "n_noise_kept_candidates": int(len(noise_kept_rows)),
+        "n_noise_kept_with_finite_edge": int(len(finite_edge_rows)),
         "prefilter_summaries": {
             f"{y},{x}": value for (y, x), value in prefilter_summary_by_pixel.items()
         },
@@ -452,14 +521,31 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
     print(
         f"[{_ts()}] [summary] noise_reference ok={sufficient_noise_refs} insufficient={insufficient_noise_refs}"
     )
+    print(f"[{_ts()}] [summary] edge_finite_for_noise_kept={len(finite_edge_rows)}/{len(noise_kept_rows)}")
+    print(
+        f"[{_ts()}] [summary] pce_finite_for_noise_kept={len(finite_pce_rows)}/{len(noise_kept_rows)} "
+        f"pce_alias_finite={len(finite_pce_alias_rows)}/{len(noise_kept_rows)} "
+        f"review_missing_due_pce={len(review_missing_due_pce)}"
+    )
+    print(
+        f"[{_ts()}] [summary] edge direct kept={len(direct_edge_rows)} "
+        f"noise-aware triggered={len(searched_edge_rows)} "
+        f"fallback last resort={len(unresolved_edge_rows)}"
+    )
+    print(
+        f"[{_ts()}] [summary] edge context_expanded={len(expanded_edge_rows)} "
+        f"rows_with_rejected_foots={len(rejected_foot_rows)}"
+    )
     print(
         f"[{_ts()}] [summary] {str(cfg.decision_profile).upper()} active_spikes="
         f"{active_primary_spikes} "
         f"| ss4={ss4_spikes} ss5={ss5_spikes} both={accepted_both} "
         f"ss4_only={accepted_ss4_only} ss5_only={accepted_ss5_only} neither={rejected_both}"
     )
-    print(f"[{_ts()}] [pipeline] finished in {_fmt_s(time.perf_counter() - run_started)}")
-    return PipelineArtifacts(
+    if missing_edge_rows:
+        _write_missing_edge_audit(cfg, missing_edge_rows)
+        print(f"[{_ts()}] [audit] edge_missing_audit rows={len(missing_edge_rows)} -> {Path(cfg.paths['output_dir']) / 'edge_missing_audit.csv'}")
+    artifacts = PipelineArtifacts(
         dataset=dataset,
         x_axis=np.asarray(dataset.x_axis, dtype=float),
         spectra=np.asarray(raw),
@@ -475,6 +561,9 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
         despike_chords=correction.chords,
         metadata=metadata,
     )
+    _write_parity_audit(cfg, artifacts)
+    print(f"[{_ts()}] [pipeline] finished in {_fmt_s(time.perf_counter() - run_started)}")
+    return artifacts
 
 
 def _write_light_debug(cfg: CoreConfig, artifacts: PipelineArtifacts) -> None:
@@ -483,6 +572,232 @@ def _write_light_debug(cfg: CoreConfig, artifacts: PipelineArtifacts) -> None:
     out_path = Path(cfg.paths["light_debug_path"])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(dumps_json(artifacts.metadata), encoding="utf-8")
+
+
+def _write_missing_edge_audit(cfg: CoreConfig, rows: list[dict[str, Any]]) -> None:
+    out_path = Path(cfg.paths["output_dir"]) / "edge_missing_audit.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "source_y", "source_x", "compact_y", "compact_x", "candidate_id",
+                "peak_index", "start", "end", "edge_foot_search_status", "edge_noise_ratio",
+                "bg_mad", "edge_direct_foot_index", "edge_selected_foot_index", "edge_noise_range",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            dbg = row.get("edge_debug", {}) if isinstance(row.get("edge_debug"), dict) else {}
+            writer.writerow(
+                {
+                    "source_y": row.get("source_y"),
+                    "source_x": row.get("source_x"),
+                    "compact_y": row.get("y"),
+                    "compact_x": row.get("x"),
+                    "candidate_id": row.get("candidate_id"),
+                    "peak_index": row.get("peak_index"),
+                    "start": row.get("start"),
+                    "end": row.get("end"),
+                    "edge_foot_search_status": dbg.get("edge_foot_search_status"),
+                    "edge_noise_ratio": row.get("edge_noise_ratio"),
+                    "bg_mad": row.get("bg_mad"),
+                    "edge_direct_foot_index": dbg.get("edge_direct_foot_index"),
+                    "edge_selected_foot_index": dbg.get("edge_selected_foot_index"),
+                    "edge_noise_range": dbg.get("edge_noise_range"),
+                }
+            )
+
+
+def _legacy_candidate_rows(legacy_debug_path: Path) -> list[dict[str, Any]]:
+    if not legacy_debug_path.exists():
+        return []
+    try:
+        payload = json.loads(legacy_debug_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for spec in payload.get("per_spectrum", []):
+        sy = int(spec.get("y", -1))
+        sx = int(spec.get("x", -1))
+        for row in spec.get("spikes", []):
+            item = dict(row)
+            item["source_y"] = sy
+            item["source_x"] = sx
+            out.append(item)
+    return out
+
+
+def _row_key(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    return (
+        int(row.get("source_y", row.get("y", -1))),
+        int(row.get("source_x", row.get("x", -1))),
+        int(row.get("peak_index", -1)),
+        int(row.get("start", -1)),
+        int(row.get("end", -1)),
+    )
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return float("nan")
+    return out if np.isfinite(out) else float("nan")
+
+
+def _median_or_nan(values: list[float]) -> float:
+    finite = [v for v in values if np.isfinite(v)]
+    if not finite:
+        return float("nan")
+    return float(np.median(np.asarray(finite, dtype=float)))
+
+
+def _write_parity_audit(cfg: CoreConfig, artifacts: PipelineArtifacts) -> None:
+    legacy_debug_path = Path("debug.json")
+    legacy_rows = _legacy_candidate_rows(legacy_debug_path)
+    if not legacy_rows:
+        print(f"[{_ts()}] [parity] legacy debug unavailable at {legacy_debug_path}")
+        return
+
+    core_rows = [dict(row) for rows in artifacts.candidate_records_by_pixel.values() for row in rows]
+    core_by_key = {_row_key(row): row for row in core_rows}
+    legacy_by_key = {_row_key(row): row for row in legacy_rows}
+    matched_keys = sorted(set(core_by_key).intersection(legacy_by_key))
+    core_only_keys = sorted(set(core_by_key).difference(legacy_by_key))
+    legacy_only_keys = sorted(set(legacy_by_key).difference(core_by_key))
+
+    out_path = Path(cfg.paths["output_dir"]) / "parity_audit_candidates.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "source_y",
+        "source_x",
+        "peak_index",
+        "start",
+        "end",
+        "core_candidate_id",
+        "legacy_candidate_id",
+        "core_noise_status",
+        "legacy_noise_status",
+        "core_spike_score_v1",
+        "legacy_spike_score_v1",
+        "absdiff_spike_score_v1",
+        "core_pce_negpref_t098_evidence_signed",
+        "legacy_pce_negpref_t098_evidence_signed",
+        "absdiff_pce_negpref_t098_evidence_signed",
+        "core_recdw_sum_0_90",
+        "legacy_recdw_sum_0_90",
+        "absdiff_recdw_sum_0_90",
+        "core_recdw_sum_0_90_z",
+        "legacy_recdw_sum_0_90_z",
+        "absdiff_recdw_sum_0_90_z",
+        "core_recdw_sum_0_90_support01",
+        "legacy_recdw_sum_0_90_support01",
+        "absdiff_recdw_sum_0_90_support01",
+        "core_recdw_sum_0_90_raman_veto_evidence_signed",
+        "legacy_recdw_sum_0_90_raman_veto_evidence_signed",
+        "absdiff_recdw_sum_0_90_raman_veto_evidence_signed",
+        "core_ss4_decision",
+        "legacy_ss4_decision",
+        "ss4_mismatch",
+        "core_ss5_decision",
+        "legacy_ss5_decision",
+        "ss5_mismatch",
+        "core_primary_active_decision",
+        "legacy_primary_active_decision",
+        "primary_active_mismatch",
+    ]
+
+    ss1_diffs: list[float] = []
+    pce_diffs: list[float] = []
+    edge_signed_diffs: list[float] = []
+    ss4_mismatches = 0
+    ss5_mismatches = 0
+    active_mismatches = 0
+    active_profile = str(cfg.decision_profile).strip().lower()
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for key in matched_keys:
+            core_row = core_by_key[key]
+            legacy_row = legacy_by_key[key]
+            core_ss1 = _safe_float(core_row.get("spike_score_v1"))
+            legacy_ss1 = _safe_float(legacy_row.get("spike_score_v1"))
+            core_pce = _safe_float(core_row.get("pce_negpref_t098_evidence_signed"))
+            legacy_pce = _safe_float(legacy_row.get("pce_negpref_t098_evidence_signed"))
+            core_edge = _safe_float(core_row.get("recdw_sum_0_90_raman_veto_evidence_signed"))
+            legacy_edge = _safe_float(legacy_row.get("recdw_sum_0_90_raman_veto_evidence_signed"))
+            ss1_absdiff = abs(core_ss1 - legacy_ss1) if np.isfinite(core_ss1) and np.isfinite(legacy_ss1) else float("nan")
+            pce_absdiff = abs(core_pce - legacy_pce) if np.isfinite(core_pce) and np.isfinite(legacy_pce) else float("nan")
+            edge_absdiff = abs(core_edge - legacy_edge) if np.isfinite(core_edge) and np.isfinite(legacy_edge) else float("nan")
+            ss1_diffs.append(ss1_absdiff)
+            pce_diffs.append(pce_absdiff)
+            edge_signed_diffs.append(edge_absdiff)
+            core_ss4 = str(core_row.get("ss4_decision", ""))
+            legacy_ss4 = str(legacy_row.get("ss4_decision", ""))
+            core_ss5 = str(core_row.get("ss5_decision", ""))
+            legacy_ss5 = str(legacy_row.get("ss5_decision", ""))
+            ss4_bad = int(core_ss4 != legacy_ss4)
+            ss5_bad = int(core_ss5 != legacy_ss5)
+            ss4_mismatches += ss4_bad
+            ss5_mismatches += ss5_bad
+            legacy_active = legacy_ss5 if active_profile == "ss5" else legacy_ss4
+            core_active = str(core_row.get("primary_active_decision", ""))
+            active_bad = int(core_active != legacy_active)
+            active_mismatches += active_bad
+            writer.writerow(
+                {
+                    "source_y": key[0],
+                    "source_x": key[1],
+                    "peak_index": key[2],
+                    "start": key[3],
+                    "end": key[4],
+                    "core_candidate_id": core_row.get("candidate_id", ""),
+                    "legacy_candidate_id": legacy_row.get("candidate_id", ""),
+                    "core_noise_status": core_row.get("candidate_noise_prefilter_status", ""),
+                    "legacy_noise_status": legacy_row.get("candidate_noise_prefilter_status", ""),
+                    "core_spike_score_v1": core_ss1,
+                    "legacy_spike_score_v1": legacy_ss1,
+                    "absdiff_spike_score_v1": ss1_absdiff,
+                    "core_pce_negpref_t098_evidence_signed": core_pce,
+                    "legacy_pce_negpref_t098_evidence_signed": legacy_pce,
+                    "absdiff_pce_negpref_t098_evidence_signed": pce_absdiff,
+                    "core_recdw_sum_0_90": _safe_float(core_row.get("recdw_sum_0_90")),
+                    "legacy_recdw_sum_0_90": _safe_float(legacy_row.get("recdw_sum_0_90")),
+                    "absdiff_recdw_sum_0_90": abs(_safe_float(core_row.get("recdw_sum_0_90")) - _safe_float(legacy_row.get("recdw_sum_0_90"))),
+                    "core_recdw_sum_0_90_z": _safe_float(core_row.get("recdw_sum_0_90_z")),
+                    "legacy_recdw_sum_0_90_z": _safe_float(legacy_row.get("recdw_sum_0_90_z")),
+                    "absdiff_recdw_sum_0_90_z": abs(_safe_float(core_row.get("recdw_sum_0_90_z")) - _safe_float(legacy_row.get("recdw_sum_0_90_z"))),
+                    "core_recdw_sum_0_90_support01": _safe_float(core_row.get("recdw_sum_0_90_support01")),
+                    "legacy_recdw_sum_0_90_support01": _safe_float(legacy_row.get("recdw_sum_0_90_support01")),
+                    "absdiff_recdw_sum_0_90_support01": abs(_safe_float(core_row.get("recdw_sum_0_90_support01")) - _safe_float(legacy_row.get("recdw_sum_0_90_support01"))),
+                    "core_recdw_sum_0_90_raman_veto_evidence_signed": core_edge,
+                    "legacy_recdw_sum_0_90_raman_veto_evidence_signed": legacy_edge,
+                    "absdiff_recdw_sum_0_90_raman_veto_evidence_signed": edge_absdiff,
+                    "core_ss4_decision": core_ss4,
+                    "legacy_ss4_decision": legacy_ss4,
+                    "ss4_mismatch": ss4_bad,
+                    "core_ss5_decision": core_ss5,
+                    "legacy_ss5_decision": legacy_ss5,
+                    "ss5_mismatch": ss5_bad,
+                    "core_primary_active_decision": core_active,
+                    "legacy_primary_active_decision": legacy_active,
+                    "primary_active_mismatch": active_bad,
+                }
+            )
+    print(
+        f"[{_ts()}] [parity] matched={len(matched_keys)} core_only={len(core_only_keys)} "
+        f"legacy_only={len(legacy_only_keys)} ss4_mismatches={ss4_mismatches} "
+        f"ss5_mismatches={ss5_mismatches} primary_active_mismatches={active_mismatches}"
+    )
+    ss1_max = float(np.nanmax(np.asarray(ss1_diffs, dtype=float))) if matched_keys else float("nan")
+    pce_max = float(np.nanmax(np.asarray(pce_diffs, dtype=float))) if matched_keys else float("nan")
+    edge_max = float(np.nanmax(np.asarray(edge_signed_diffs, dtype=float))) if matched_keys else float("nan")
+    print(
+        f"[{_ts()}] [parity] absdiff ss1 max={ss1_max:.6g} median={_median_or_nan(ss1_diffs):.6g} "
+        f"| pce max={pce_max:.6g} median={_median_or_nan(pce_diffs):.6g} "
+        f"| edge_signed max={edge_max:.6g} median={_median_or_nan(edge_signed_diffs):.6g}"
+    )
 
 
 def main() -> None:

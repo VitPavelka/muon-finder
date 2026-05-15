@@ -9,15 +9,15 @@ All direct legacy imports should go through this module.
 """
 
 from feature_discrimination import (  # type: ignore
-    compute_edge_width_metrics,
+    CURVATURE_NEGPREF_LOCAL_RADIUS,
+    compute_curvature_negpref_diagnostics,
     compute_peak_curvature_features,
-    compute_spike_score_v2_features,
     estimate_background_mad,
 )
 
 __all__ = [
-    "compute_edge_width_metrics",
+    "CURVATURE_NEGPREF_LOCAL_RADIUS",
+    "compute_curvature_negpref_diagnostics",
     "compute_peak_curvature_features",
-    "compute_spike_score_v2_features",
     "estimate_background_mad",
 ]
