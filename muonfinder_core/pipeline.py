@@ -161,6 +161,10 @@ def _prepare_candidate_rows(
     )
     all_metric_rows: list[dict[str, Any]] = []
     all_edge_rows: list[dict[str, Any]] = []
+    prep_time = 0.0
+    noise_time = 0.0
+    pce_time = 0.0
+    edge_time = 0.0
     total_raw_candidates = 0
     total_merged_candidates = 0
     total_after_noise = 0
@@ -178,6 +182,7 @@ def _prepare_candidate_rows(
         total_raw_candidates += int(len(segs))
         raw_sig = np.asarray(raw[y, x, :], dtype=float)
         grad_sig = np.asarray(gradient[y, x, :], dtype=float)
+        t_part = time.perf_counter()
         prepared = prepare_primary_candidates(
             y=int(y),
             x=int(x),
@@ -193,8 +198,10 @@ def _prepare_candidate_rows(
             merge_duplicate_segments=bool(cfg.candidates.get("merge_duplicate_segments", True)),
             merge_max_width_pts=int(cfg.candidates.get("max_width_pts", 24)),
         )
+        prep_time += time.perf_counter() - t_part
         total_merged_candidates += int(len(prepared))
         small = get_or_compute_small_morphology(small_morph_cache, raw, int(y), int(x), window_size=noise_window)
+        t_part = time.perf_counter()
         prefilter_rows, prefilter_summary = evaluate_candidate_noise_prefilter(
             segs=prepared,
             raw_signal=raw_sig,
@@ -203,6 +210,7 @@ def _prepare_candidate_rows(
             mode=str(cfg.noise.get("candidate_noise_prefilter_mode", "morph_range_chord")),
             height_factor=float(cfg.noise.get("noise_height_factor", 3.0)),
         )
+        noise_time += time.perf_counter() - t_part
         total_after_noise += int(prefilter_summary.get("n_candidates_after_noise_prefilter", 0))
         noise_by_candidate = {str(row["candidate_id"]): row for row in prefilter_rows}
         out_rows: list[dict[str, Any]] = []
@@ -226,6 +234,7 @@ def _prepare_candidate_rows(
             base_row.update(noise_by_candidate.get(seg.candidate_id, {}))
             compute_metrics = str(base_row.get("candidate_noise_prefilter_status", "")) != "rejected_noise"
             if compute_metrics:
+                t_part = time.perf_counter()
                 base_row.update(
                     compute_ss1_pce_features(
                         raw_signal=raw_sig,
@@ -234,6 +243,8 @@ def _prepare_candidate_rows(
                         feature_signal_source="gradient",
                     )
                 )
+                pce_time += time.perf_counter() - t_part
+                t_part = time.perf_counter()
                 base_row.update(
                     compute_raw_edge_metric(
                         raw_signal=raw_sig,
@@ -242,6 +253,7 @@ def _prepare_candidate_rows(
                         ctx=metric_ctx,
                     )
                 )
+                edge_time += time.perf_counter() - t_part
                 all_edge_rows.append(base_row)
             out_rows.append(base_row)
         rows_by_pixel[(int(y), int(x))] = out_rows
@@ -261,6 +273,11 @@ def _prepare_candidate_rows(
             refresh=False,
         )
     finalize_edge_evidence(all_edge_rows, metric_ctx)
+    print(
+        f"[{_ts()}] [primary-substage] prepare={_fmt_s(prep_time)} "
+        f"noise_prefilter={_fmt_s(noise_time)} "
+        f"pce_ss1={_fmt_s(pce_time)} edge={_fmt_s(edge_time)}"
+    )
     for rows in rows_by_pixel.values():
         for row in rows:
             if str(row.get("candidate_noise_prefilter_status", "")) == "rejected_noise":

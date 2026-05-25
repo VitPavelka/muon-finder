@@ -56,6 +56,25 @@ DEFAULT_SS6_CONFIG: dict[str, Any] = {
     },
 }
 
+SS6_BRANCH_DEFINITIONS: list[dict[str, Any]] = [
+    {"name": "pce_strong", "category": "accepted", "accepted": True, "label": "pce_strong", "description": "direct accept by strong PCE"},
+    {"name": "pce_dead_rescue", "category": "accepted", "accepted": True, "label": "pce_dead_rescue", "description": "PCE dead-zone rescued by residual + EEL + EDGE/delta"},
+    {"name": "pce_gray_spike_on_structure", "category": "accepted", "accepted": True, "label": "pce_gray_spike_on_structure", "description": "gray PCE spike-on-structure branch"},
+    {"name": "pce_gray_high_pce_eel_rescue", "category": "accepted", "accepted": True, "label": "pce_gray_high_pce_eel_rescue", "description": "high gray PCE + strong EEL + medium residual"},
+    {"name": "pce_gray_high_resid_soft_edge_rescue", "category": "accepted", "accepted": True, "label": "pce_gray_high_resid_soft_edge_rescue", "description": "high gray PCE + high residual + soft EDGE/EEL"},
+    {"name": "pce_gray_rescue", "category": "accepted", "accepted": True, "label": "pce_gray_rescue", "description": "gray PCE rescued by residual + EDGE/EEL"},
+    {"name": "low_pce_double_edge_rescue", "category": "accepted", "accepted": True, "label": "low_pce_double_edge_rescue", "description": "low PCE rescued by both EDGE variants + residual"},
+    {"name": "low_pce_strong_rescue", "category": "accepted", "accepted": True, "label": "low_pce_strong_rescue", "description": "low PCE rescued by very strong residual + EEL + EDGE/delta"},
+    {"name": "missing_metric", "category": "diagnostic", "accepted": False, "label": "missing_metric", "description": "required SS6 metric missing or non-finite"},
+    {"name": "ss1_low", "category": "rejected", "accepted": False, "label": "ss1_low", "description": "below SS1 gate"},
+    {"name": "pce_dead_reject", "category": "rejected", "accepted": False, "label": "pce_dead_reject", "description": "PCE dead-zone not rescued"},
+    {"name": "pce_gray_reject", "category": "rejected", "accepted": False, "label": "pce_gray_reject", "description": "gray PCE not rescued"},
+    {"name": "low_pce_reject", "category": "rejected", "accepted": False, "label": "low_pce_reject", "description": "low PCE not rescued"},
+    {"name": "noise_rejected", "category": "rejected", "accepted": False, "label": "noise_rejected", "description": "rejected by candidate noise prefilter"},
+]
+SS6_BRANCH_ORDER = [str(item["name"]) for item in SS6_BRANCH_DEFINITIONS]
+SS6_KNOWN_BRANCHES = set(SS6_BRANCH_ORDER)
+
 
 def _deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)

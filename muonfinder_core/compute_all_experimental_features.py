@@ -9,8 +9,14 @@ Example:
 import argparse
 import json
 from pathlib import Path
+import time
 
 import numpy as np
+
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 if __package__ in {None, ""}:
     import sys
@@ -205,6 +211,26 @@ def _finalize_edge_variant_evidence(
     }
 
 
+def _progress_iter(items, *, desc: str, total: int | None = None):
+    if tqdm is not None:
+        return tqdm(items, desc=desc, total=total, dynamic_ncols=True, mininterval=0.25)
+
+    def _fallback():
+        count = 0
+        next_print = 250
+        for item in items:
+            count += 1
+            if count == 1 or count >= next_print:
+                if total is not None and total > 0:
+                    print(f"{desc}: {count}/{total}")
+                else:
+                    print(f"{desc}: {count}")
+                next_print += 250
+            yield item
+
+    return _fallback()
+
+
 def compute_all_experimental_features_from_config(
     cfg: object,
     *,
@@ -243,7 +269,11 @@ def compute_all_experimental_features_from_config(
     missing_edge_foot = 0
     invalid_prominence = 0
     missing_noise = 0
-    for row in used_rows:
+    raw_pce_time = 0.0
+    resid_time = 0.0
+    edge_time = 0.0
+    total_rows = len(used_rows)
+    for row in _progress_iter(used_rows, desc="Experimental features", total=total_rows):
         out_row: dict[str, object] = build_join_row(row)
         y = int(row.get("y", -1))
         x = int(row.get("x", -1))
@@ -261,21 +291,27 @@ def compute_all_experimental_features_from_config(
 
         raw_status = ""
         if bool(dict(exp_cfg.get("raw_pce", {})).get("enabled", True)):
+            t_part = time.perf_counter()
             raw_features = compute_experimental_raw_pce(raw, row, noise_value, dict(exp_cfg.get("raw_pce", {})))
             out_row.update(raw_features)
             raw_status = str(raw_features.get("exp_raw_pce_status", ""))
+            raw_pce_time += time.perf_counter() - t_part
 
         resid_status = ""
         if bool(dict(exp_cfg.get("residual_pce", {})).get("enabled", True)) or bool(dict(exp_cfg.get("residual_threshold", {})).get("enabled", True)):
+            t_part = time.perf_counter()
             resid_features = compute_experimental_residual_features(raw, row, noise_value, exp_cfg)
             out_row.update(resid_features)
             resid_status = str(resid_features.get("exp_resid3_status", ""))
+            resid_time += time.perf_counter() - t_part
 
         edge_status = ""
         if bool(dict(exp_cfg.get("edge_variants", {})).get("enabled", True)):
+            t_part = time.perf_counter()
             edge_features = compute_experimental_edge_variants(raw, row, noise_value, exp_cfg)
             out_row.update(edge_features)
             edge_status = str(edge_features.get("exp_edge_variants_status", ""))
+            edge_time += time.perf_counter() - t_part
 
         if "missing_raw_signal" in {raw_status, resid_status, edge_status}:
             missing_raw_signal += 1
@@ -340,6 +376,9 @@ def compute_all_experimental_features_from_config(
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"experimental raw_pce time: {raw_pce_time:.1f} s")
+    print(f"experimental residual time: {resid_time:.1f} s")
+    print(f"experimental edge_variants time: {edge_time:.1f} s")
 
     return {
         "cache_path": cache_path,

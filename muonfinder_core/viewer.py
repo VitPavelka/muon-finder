@@ -21,15 +21,19 @@ if __package__ in {None, ""}:
     from muonfinder_core.cap_metrics import join_extra_feature_rows, load_extra_feature_rows
     from muonfinder_core.cache import load_viewer_cache
     from muonfinder_core.config import load_config
+    from muonfinder_core.despike import load_despike_bundle
     from muonfinder_core.metrics import EDGE_ALL_LEVELS_ASC, EDGE_DENSE_LEVELS_ASC
     from muonfinder_core.plotting import candidate_status_color
+    from muonfinder_core.ss6_decision import SS6_BRANCH_DEFINITIONS, SS6_KNOWN_BRANCHES
     from muonfinder_core.utils import metric_float, to_contiguous_spans
 else:
     from .cap_metrics import join_extra_feature_rows, load_extra_feature_rows
     from .cache import load_viewer_cache
     from .config import load_config
+    from .despike import load_despike_bundle
     from .metrics import EDGE_ALL_LEVELS_ASC, EDGE_DENSE_LEVELS_ASC
     from .plotting import candidate_status_color
+    from .ss6_decision import SS6_BRANCH_DEFINITIONS, SS6_KNOWN_BRANCHES
     from .utils import metric_float, to_contiguous_spans
 
 
@@ -186,11 +190,11 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     small_rows = [dict(row) for row in cache.get("small_morphology", [])]
     overlays = cache.get("overlays", {})
     chords = [dict(row) for row in cache.get("despike_chords", [])]
-    despike_stages = [dict(row) for row in cache.get("despike_stages", [])]
     active_profile = str(getattr(cfg, "decision_profile", metadata.get("decision_profile", "ss4"))).strip().lower()
     viewer_cfg = dict(getattr(cfg, "viewer", {}) if cfg is not None else {})
     experimental_cfg = dict(getattr(cfg, "experimental_features", {}) if cfg is not None else {})
     ss6_cfg = dict(getattr(cfg, "ss6", {}) if cfg is not None else {})
+    despike_cfg = dict(getattr(cfg, "despike", {}) if cfg is not None else {})
     experimental_columns = [str(col) for col in experimental_cfg.get("viewer_columns", []) if str(col).strip()]
     ss6_columns = [str(col) for col in ss6_cfg.get("viewer_columns", []) if str(col).strip()]
     display_columns = list(dict.fromkeys(experimental_columns + ss6_columns))
@@ -234,6 +238,17 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             print(f"ss6 decisions path: {ss6_path}")
             print(f"ss6 decision rows loaded: {join_info['loaded_rows']}")
             print(f"ss6 rows matched to candidates: {join_info['matched_rows']}")
+            branch_counts_loaded: dict[str, int] = {}
+            for row in candidate_rows:
+                branch = str(row.get("ss6_branch", "")).strip()
+                if branch:
+                    branch_counts_loaded[branch] = branch_counts_loaded.get(branch, 0) + 1
+            unique_branches = sorted(branch_counts_loaded.keys())
+            print(f"ss6 unique branches: {unique_branches}")
+            print(f"ss6 branch counts: {branch_counts_loaded}")
+            unknown_branches = [branch for branch in unique_branches if branch not in SS6_KNOWN_BRANCHES]
+            if unknown_branches:
+                print(f"warning: ss6 decisions contain unknown branches: {unknown_branches}")
         else:
             load_messages.append("ss6 missing")
             if active_profile == "ss6":
@@ -244,6 +259,17 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     print(f"experimental viewer columns: {display_columns}")
     if loaded_any:
         experimental_state = {"loaded": True, "message": "; ".join(load_messages)}
+    despike_path_raw = str(despike_cfg.get("corrected_path", "")).strip()
+    if despike_path_raw:
+        despike_path = Path(despike_path_raw)
+        if despike_path.exists():
+            despike_bundle = load_despike_bundle(despike_path)
+            corrected = np.asarray(despike_bundle.get("corrected_spectra", corrected), dtype=float)
+            chords = [dict(row) for row in despike_bundle.get("despike_chords", [])] or chords
+            print(f"despike corrected path: {despike_path}")
+            print(f"despike chords loaded: {len(chords)}")
+        else:
+            print("despike corrected file not found. Run compute_despike first.")
     morph_windows = sorted(int(v) for v in metadata.get("morphology_windows", sorted(overlays.get("dilation", {}).keys())))
     if not morph_windows:
         morph_windows = [3]
@@ -266,9 +292,27 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         ],
         dtype=float,
     )
+    finite_map = score_map[np.isfinite(score_map)]
+    map_vmin = None
+    map_vmax = None
+    if finite_map.size:
+        try:
+            p_lo, p_hi = viewer_cfg.get("map_color_percentiles", [5, 95])
+            map_vmin = float(np.nanpercentile(finite_map, float(p_lo)))
+            map_vmax = float(np.nanpercentile(finite_map, float(p_hi)))
+        except Exception:
+            map_vmin = float(np.nanmin(finite_map))
+            map_vmax = float(np.nanmax(finite_map))
+        if not (np.isfinite(map_vmin) and np.isfinite(map_vmax) and map_vmax > map_vmin):
+            try:
+                map_vmin = float(np.nanmin(finite_map))
+                map_vmax = float(np.nanmax(finite_map))
+            except Exception:
+                map_vmin = None
+                map_vmax = None
 
     H, W = score_map.shape
-    current = {"y": 0, "x": 0, "morph_idx": 0, "stage_idx": 0}
+    current = {"y": 0, "x": 0, "morph_idx": 0, "chord_idx": 0}
     frozen = {"state": False}
     spectrum_home = {"xlim": None, "ylim": None}
     if H > 1 or W > 1:
@@ -291,6 +335,15 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     )
     ax_map = fig.add_subplot(gs[0, 0])
     ax_spec = fig.add_subplot(gs[0, 1])
+    ss6_grid = gs[1, 0].subgridspec(2, 1, height_ratios=[0.28, 0.72], hspace=0.04)
+    ax_ss6_info = fig.add_subplot(ss6_grid[0, 0])
+    ax_ss6_info.set_xticks([])
+    ax_ss6_info.set_yticks([])
+    ss6_block_grid = ss6_grid[1, 0].subgridspec(1, 3, wspace=0.16)
+    ax_ss6_blocks = [fig.add_subplot(ss6_block_grid[0, i]) for i in range(3)]
+    for ax in ax_ss6_blocks:
+        ax.set_xticks([])
+        ax.set_yticks([])
     chk_grid = gs[1, 1].subgridspec(1, 3, wspace=0.20)
     ax_chk_blocks = [fig.add_subplot(chk_grid[0, i]) for i in range(3)]
     for ax in ax_chk_blocks:
@@ -298,13 +351,20 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         ax.set_yticks([])
 
     states = {name: (name in {"located muon", "raw", "corrected"}) for name in CHECKBOX_ORDER}
+    located_count = int(len(accepted_offsets)) if accepted_offsets.size else 0
+    display_label_map = {
+        name: (f"located muon ({located_count})" if name == "located muon" and located_count > 0 else name)
+        for name in CHECKBOX_ORDER
+    }
+    display_to_state = {label: state for state, label in display_label_map.items()}
     checks = []
     block_size = int(np.ceil(len(CHECKBOX_ORDER) / 3))
     for block_index, ax_chk in enumerate(ax_chk_blocks):
         start = block_index * block_size
         stop = min(len(CHECKBOX_ORDER), start + block_size)
-        labels = CHECKBOX_ORDER[start:stop]
-        actives = [states[label] for label in labels]
+        state_labels = CHECKBOX_ORDER[start:stop]
+        labels = [display_label_map[label] for label in state_labels]
+        actives = [states[label] for label in state_labels]
         chk = CheckButtons(ax_chk, labels=labels, actives=actives)
         for txt in chk.labels:
             txt.set_fontsize(11)
@@ -313,15 +373,31 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     def current_window() -> int:
         return int(morph_windows[current["morph_idx"] % len(morph_windows)])
 
-    def current_stage_index() -> int:
-        stage_count = max(1, len(despike_stages))
-        return int(current["stage_idx"] % stage_count)
-
     def current_rows() -> list[dict[str, Any]]:
         return rows_by_pixel.get((int(current["y"]), int(current["x"])), [])
 
-    map_im = ax_map.imshow(score_map, cmap="viridis", origin="upper", interpolation="nearest")
+    def current_spectrum_chords() -> list[dict[str, Any]]:
+        return [
+            dict(chord)
+            for chord in chords
+            if int(chord.get("y", -1)) == int(current["y"]) and int(chord.get("x", -1)) == int(current["x"])
+        ]
+
+    def current_chord_index() -> int:
+        spectrum_chords = current_spectrum_chords()
+        if not spectrum_chords:
+            return 0
+        return int(current["chord_idx"] % len(spectrum_chords))
+
+    def current_chord() -> dict[str, Any] | None:
+        spectrum_chords = current_spectrum_chords()
+        if not spectrum_chords:
+            return None
+        return spectrum_chords[current_chord_index()]
+
+    map_im = ax_map.imshow(score_map, cmap="viridis", origin="upper", interpolation="nearest", vmin=map_vmin, vmax=map_vmax)
     located_scatter = ax_map.scatter([], [], s=26, c="#d62728", marker="s", linewidths=0.0, alpha=0.90)
+    ss6_branch_scatter = ax_map.scatter([], [], s=48, c="#17becf", marker="s", linewidths=0.8, edgecolors="#111111", alpha=0.92)
     cursor_marker, = ax_map.plot(
         [current["x"]],
         [current["y"]],
@@ -336,17 +412,125 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     ax_map.set_xlabel("x (pixel)", fontsize=11)
     ax_map.set_ylabel("y (pixel)", fontsize=11)
     ax_map.tick_params(labelsize=10)
-    fig.colorbar(map_im, ax=ax_map, fraction=0.046, pad=0.04)
+    if bool(viewer_cfg.get("show_map_colorbar", False)):
+        fig.colorbar(map_im, ax=ax_map, fraction=0.046, pad=0.04)
+
+    branch_counts: dict[str, int] = {}
+    branch_pixels: dict[str, np.ndarray] = {}
+    for row in candidate_rows:
+        branch = str(row.get("ss6_branch", "")).strip()
+        if not branch:
+            continue
+        branch_counts[branch] = branch_counts.get(branch, 0) + 1
+    for branch in list(branch_counts.keys()):
+        coords = sorted({(int(row["x"]), int(row["y"])) for row in candidate_rows if str(row.get("ss6_branch", "")).strip() == branch})
+        branch_pixels[branch] = np.asarray(coords, dtype=float) if coords else np.empty((0, 2), dtype=float)
+    unknown_branch_names = sorted(branch for branch in branch_counts if branch not in SS6_KNOWN_BRANCHES)
+    ss6_branch_state = {"selected": None, "message": ""}
+
+    def _branch_label(branch_name: str) -> str:
+        return f"{branch_name} ({int(branch_counts.get(branch_name, 0))})"
+
+    accepted_names = [str(item["name"]) for item in SS6_BRANCH_DEFINITIONS if str(item.get("category", "")) == "accepted"]
+    rejected_names = [str(item["name"]) for item in SS6_BRANCH_DEFINITIONS if str(item.get("category", "")) != "accepted"]
+    ss6_panel_groups = [
+        [("none / off", None)] + [(_branch_label(name), name) for name in accepted_names],
+        [(_branch_label(name), name) for name in rejected_names],
+        [(f"other: {branch} ({int(branch_counts.get(branch, 0))})", branch) for branch in unknown_branch_names],
+    ]
+    ss6_label_to_branch: dict[str, str | None] = {}
+    ss6_button_index: dict[str, tuple[Any, int]] = {}
+    ss6_controls: list[Any] = []
+    ss6_updating = {"state": False}
+    for ax, group in zip(ax_ss6_blocks, ss6_panel_groups):
+        labels = [label for label, _branch in group] or [""]
+        actives = [label == "none / off" for label in labels]
+        chk = CheckButtons(ax, labels=labels, actives=actives)
+        ss6_controls.append(chk)
+        for idx, (label, branch) in enumerate(group):
+            ss6_label_to_branch[label] = branch
+            ss6_button_index[label] = (chk, idx)
+            txt = chk.labels[idx]
+            txt.set_fontsize(8.4)
+            if branch is None:
+                txt.set_fontweight("bold")
+            elif int(branch_counts.get(branch, 0)) == 0:
+                txt.set_color("#9a9a9a")
+        if not group:
+            for txt in chk.labels:
+                txt.set_text("")
+
+    def _set_ss6_info(text: str) -> None:
+        ax_ss6_info.clear()
+        ax_ss6_info.set_xticks([])
+        ax_ss6_info.set_yticks([])
+        ax_ss6_info.text(
+            0.01,
+            0.92,
+            "SS6 branch overlay",
+            transform=ax_ss6_info.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+            fontweight="bold",
+        )
+        ax_ss6_info.text(
+            0.01,
+            0.52,
+            text,
+            transform=ax_ss6_info.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8.8,
+            color="#333333",
+        )
+
+    def _apply_ss6_branch_selection(branch_name: str | None) -> None:
+        ss6_branch_state["selected"] = branch_name
+        if branch_name is None:
+            ss6_branch_state["message"] = "Overlay off."
+        elif int(branch_counts.get(branch_name, 0)) <= 0:
+            ss6_branch_state["message"] = "No candidates for selected SS6 branch."
+        else:
+            ss6_branch_state["message"] = f"{branch_name}: {int(branch_counts.get(branch_name, 0))} candidate rows"
+        _set_ss6_info(ss6_branch_state["message"])
+
+    def _set_ss6_branch_buttons(active_branch: str | None) -> None:
+        ss6_updating["state"] = True
+        try:
+            for label, (chk, idx) in ss6_button_index.items():
+                should_be_on = (active_branch is None and label == "none / off") or (ss6_label_to_branch.get(label) == active_branch and active_branch is not None)
+                current_state = bool(chk.get_status()[idx])
+                if current_state != should_be_on:
+                    chk.set_active(idx)
+        finally:
+            ss6_updating["state"] = False
+
+    def _on_ss6_branch_toggle(label: str) -> None:
+        if ss6_updating["state"]:
+            return
+        branch = ss6_label_to_branch.get(str(label))
+        _set_ss6_branch_buttons(branch)
+        _apply_ss6_branch_selection(branch)
+        update()
+
+    for chk in ss6_controls:
+        chk.on_clicked(_on_ss6_branch_toggle)
+    if ss6_path_raw and not Path(ss6_path_raw).exists():
+        _set_ss6_info("SS6 decisions file not found. Run compute_ss6_decisions first.")
+    else:
+        _apply_ss6_branch_selection(None)
 
     def _set_suptitle() -> None:
         compact = (int(current["y"]), int(current["x"]))
         source = coord_map.get(compact, compact)
-        stage_idx = current_stage_index()
-        stage_count = max(1, len(despike_stages))
+        spectrum_chords = current_spectrum_chords()
+        chord_count = len(spectrum_chords)
+        chord_index = current_chord_index() + 1 if chord_count else 0
         fig.suptitle(
             f"spectrum @ compact(y={compact[0]}, x={compact[1]}) -> "
             f"source(y={source[0]}, x={source[1]}) | "
-            f"despike stage {stage_idx}/{stage_count - 1} (a/x) | morph window {current_window()} (z/c)",
+            f"despike chord {chord_index}/{chord_count} (a/x) | morph window {current_window()} (z/c)",
             fontsize=13,
             fontweight="bold",
             y=0.965,
@@ -360,6 +544,14 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         else:
             located_scatter.set_offsets(np.empty((0, 2), dtype=float))
             located_scatter.set_visible(False)
+        selected_branch = ss6_branch_state["selected"]
+        branch_points = branch_pixels.get(selected_branch, np.empty((0, 2), dtype=float)) if selected_branch is not None else np.empty((0, 2), dtype=float)
+        if selected_branch is not None and branch_points.size:
+            ss6_branch_scatter.set_offsets(branch_points)
+            ss6_branch_scatter.set_visible(True)
+        else:
+            ss6_branch_scatter.set_offsets(np.empty((0, 2), dtype=float))
+            ss6_branch_scatter.set_visible(False)
 
     def _plot_overlay_line(label: str) -> None:
         overlay_key = OVERLAY_KEY_BY_LABEL[label]
@@ -911,11 +1103,12 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         ax_spec._edge_legend_labels = []  # type: ignore[attr-defined]
         rows = current_rows()
         raw_sig = np.asarray(spectra[current["y"], current["x"], :], dtype=float)
+        corrected_sig = np.asarray(corrected[current["y"], current["x"], :], dtype=float)
         if states["corrected"]:
             ax_spec.plot(x_axis, raw_sig, color="#d62728", linewidth=1.7, label="raw")
             ax_spec.plot(
                 x_axis,
-                np.asarray(corrected[current["y"], current["x"], :], dtype=float),
+                corrected_sig,
                 color="#2ca02c",
                 linewidth=1.7,
                 label="corrected",
@@ -940,7 +1133,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                 ax_spec.axvline(x_axis[int(row["peak_index"])], color=color, linestyle="--", linewidth=1.5)
 
         morph_row = small_by_pixel.get((int(current["y"]), int(current["x"])), {})
-        if states["dilation contacts"] or states["erosion contacts"] or states["despike chords"]:
+        if states["dilation contacts"] or states["erosion contacts"]:
             for left, right in _contact_context_spans(rows, pad=4):
                 li = max(0, min(int(left), len(x_axis) - 1))
                 ri = max(0, min(int(right), len(x_axis) - 1))
@@ -986,17 +1179,13 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             _draw_contacts(rows, morph_row.get("erosion_contacts", []), "o", "#111111", 7.5)
 
         if states["despike chords"]:
-            stage_id = None
-            if despike_stages:
-                stage_id = str(despike_stages[current_stage_index()].get("stage_id", ""))
-            for chord in chords:
-                if int(chord.get("y", -1)) != int(current["y"]) or int(chord.get("x", -1)) != int(current["x"]):
-                    continue
-                if stage_id is not None and str(chord.get("stage_id", "")) != stage_id:
-                    continue
+            chord = current_chord()
+            if chord is not None:
                 li = int(chord["left"])
                 ri = int(chord["right"])
-                ax_spec.plot([x_axis[li], x_axis[ri]], [float(chord["y_left"]), float(chord["y_right"])], color="#17becf", linewidth=1.7)
+                ax_spec.plot([x_axis[li], x_axis[ri]], [float(chord["y_left"]), float(chord["y_right"])], color="#17becf", linewidth=1.9, label="despike chord")
+                ax_spec.plot([x_axis[li]], [float(chord["y_left"])], marker="o", color="#17becf", markersize=5.5, linestyle="None")
+                ax_spec.plot([x_axis[ri]], [float(chord["y_right"])], marker="o", color="#17becf", markersize=5.5, linestyle="None")
 
         ax_spec.set_xlabel("wavenumber", fontsize=11)
         ax_spec.set_ylabel("intensity", fontsize=11)
@@ -1039,7 +1228,8 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         fig.canvas.draw_idle()
 
     def on_toggle(label: str) -> None:
-        states[str(label)] = not states[str(label)]
+        state_key = display_to_state.get(str(label), str(label))
+        states[state_key] = not states[state_key]
         update()
 
     for chk in checks:
@@ -1056,6 +1246,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             return
         current["x"] = x
         current["y"] = y
+        current["chord_idx"] = 0
         update()
 
     def on_click(event) -> None:
@@ -1065,6 +1256,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             return
         current["x"] = int(np.clip(round(event.xdata), 0, W - 1))
         current["y"] = int(np.clip(round(event.ydata), 0, H - 1))
+        current["chord_idx"] = 0
         frozen["state"] = not frozen["state"]
         update()
 
@@ -1079,11 +1271,15 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             update()
             return
         if key == "a":
-            current["stage_idx"] = (current_stage_index() - 1) % max(1, len(despike_stages))
+            spectrum_chords = current_spectrum_chords()
+            if spectrum_chords:
+                current["chord_idx"] = (current_chord_index() - 1) % len(spectrum_chords)
             update()
             return
         if key == "x":
-            current["stage_idx"] = (current_stage_index() + 1) % max(1, len(despike_stages))
+            spectrum_chords = current_spectrum_chords()
+            if spectrum_chords:
+                current["chord_idx"] = (current_chord_index() + 1) % len(spectrum_chords)
             update()
             return
         if key == "home":
@@ -1097,6 +1293,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             dy = -1 if key == "up" else (1 if key == "down" else 0)
             current["x"] = int(np.clip(int(current["x"]) + dx, 0, W - 1))
             current["y"] = int(np.clip(int(current["y"]) + dy, 0, H - 1))
+            current["chord_idx"] = 0
             update()
 
     fig.canvas.mpl_connect("motion_notify_event", on_move)

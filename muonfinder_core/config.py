@@ -18,6 +18,7 @@ class CoreConfig:
     cap: dict[str, Any] = field(default_factory=dict)
     experimental_features: dict[str, Any] = field(default_factory=dict)
     ss6: dict[str, Any] = field(default_factory=dict)
+    despike: dict[str, Any] = field(default_factory=dict)
     ss4: dict[str, Any] = field(default_factory=dict)
     ss5: dict[str, Any] = field(default_factory=dict)
     outputs: dict[str, Any] = field(default_factory=dict)
@@ -184,6 +185,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "ss6_edge": "edge",
         },
     },
+    "despike": {
+        "enabled": False,
+        "source": "ss6",
+        "corrected_path": "outputs_core/despike_corrected.npz",
+        "debug_path": "outputs_core/despike_debug.csv",
+        "summary_path": "outputs_core/despike_summary.json",
+        "method": "morph_contact_cells",
+        "morph_windows": [3, 5],
+        "max_iterations": 4,
+        "max_cell_width_pts": 10,
+        "max_half_width_pts": 5,
+        "min_height_above_chord_noise_z": 3.0,
+        "anchor_overshoot_noise_factor": 0.5,
+        "allow_spectrum_edge_anchors": False,
+        "recheck_enabled": True,
+        "recheck_context_pad_pts": 3,
+        "skip_overlapping_corrections": True,
+    },
     "ss4": {
         "ss_blue_max": 0.95,
         "ss_red_min": 0.9999,
@@ -207,6 +226,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "viewer": {
         "open_after_pipeline": False,
         "show_candidate_status_summary_box": False,
+        "map_color_percentiles": [5, 95],
+        "show_map_colorbar": False,
     },
     "decision_profile": "ss4",
 }
@@ -228,6 +249,7 @@ def _resolve_path_values(cfg: dict[str, Any], base_dir: Path) -> dict[str, Any]:
     cap = dict(out.get("cap", {}))
     experimental = dict(out.get("experimental_features", {}))
     ss6 = dict(out.get("ss6", {}))
+    despike = dict(out.get("despike", {}))
     repo_root = base_dir.parent
     for key, value in list(paths.items()):
         if value in (None, ""):
@@ -282,10 +304,24 @@ def _resolve_path_values(cfg: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             continue
         repo_candidate = (repo_root / path).resolve()
         ss6[key] = str(repo_candidate if repo_candidate.exists() else candidate)
+    for key in ("corrected_path", "debug_path", "summary_path"):
+        value = despike.get(key)
+        if value in (None, "") or not isinstance(value, str):
+            continue
+        path = Path(value)
+        if path.is_absolute():
+            continue
+        candidate = (base_dir / path).resolve()
+        if candidate.exists():
+            despike[key] = str(candidate)
+            continue
+        repo_candidate = (repo_root / path).resolve()
+        despike[key] = str(repo_candidate if repo_candidate.exists() else candidate)
     out["paths"] = paths
     out["cap"] = cap
     out["experimental_features"] = experimental
     out["ss6"] = ss6
+    out["despike"] = despike
     return out
 
 
@@ -303,6 +339,7 @@ def load_config(path: Path | str) -> CoreConfig:
         cap=dict(merged.get("cap", {})),
         experimental_features=dict(merged.get("experimental_features", {})),
         ss6=dict(merged.get("ss6", {})),
+        despike=dict(merged.get("despike", {})),
         ss4=dict(merged.get("ss4", {})),
         ss5=dict(merged.get("ss5", {})),
         outputs=dict(merged.get("outputs", {})),
