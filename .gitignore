@@ -31,8 +31,8 @@ debug_feature*.json
 
 # main
 config.json
+config_core.json
 debug.json
-config*
 stats*
 debug2.json
 debugAll.json
