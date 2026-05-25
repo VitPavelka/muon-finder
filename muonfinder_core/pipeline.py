@@ -35,7 +35,6 @@ if __package__ in {None, ""}:
     from muonfinder_core.metrics import (
         EDGE_ALL_LEVELS_ASC,
         EDGE_DENSE_LEVELS_ASC,
-        EDGE_MAPPING_LEVELS_DESC,
         MetricComputationContext,
         compute_raw_edge_metric,
         compute_ss1_pce_features,
@@ -61,7 +60,6 @@ else:
     from .metrics import (
         EDGE_ALL_LEVELS_ASC,
         EDGE_DENSE_LEVELS_ASC,
-        EDGE_MAPPING_LEVELS_DESC,
         MetricComputationContext,
         compute_raw_edge_metric,
         compute_ss1_pce_features,
@@ -142,23 +140,24 @@ def _prepare_candidate_rows(
     merge_signal = gradient
     metric_ctx = MetricComputationContext(
         feature_signal_source="gradient",
-        edge_context_pad_pts=int(cfg.noise.get("edge_dense_context_pad_pts", 20)),
-        edge_context_min_pad_pts=int(cfg.noise.get("edge_dense_context_min_pad_pts", 10)),
-        edge_context_max_pad_pts=int(cfg.noise.get("edge_dense_context_max_pad_pts", 80)),
-        noise_height_factor=float(cfg.noise.get("noise_height_factor", 5.0)),
-        edge_robust_reference_enabled=bool(cfg.noise.get("edge_robust_reference_enabled", True)),
-        edge_use_enhanced_spike_mapping=bool(cfg.noise.get("edge_use_enhanced_spike_mapping", True)),
-        edge_mapping_enable_merge_guard=bool(cfg.noise.get("edge_mapping_enable_merge_guard", True)),
-        edge_mapping_noise_guard_enabled=bool(cfg.noise.get("edge_mapping_noise_guard_enabled", False)),
-        edge_mapping_levels_desc=EDGE_MAPPING_LEVELS_DESC,
-        edge_mapping_refine_step_percent=5,
-        edge_mapping_min_level_percent=int(cfg.noise.get("edge_mapping_min_level_percent", 5)),
-        noise_aware_foot_search_enabled=bool(cfg.noise.get("noise_aware_foot_search_enabled", False)),
+        noise_source=str(cfg.noise.get("noise_source", "morph_range")),
+        noise_height_factor=float(cfg.noise.get("noise_height_factor", 3.0)),
+        edge_foot_method=str(cfg.noise.get("edge_foot_method", "noise_quantized_component")),
+        edge_pre_level_step_noise=float(cfg.noise.get("edge_pre_level_step_noise", 1.0)),
+        edge_pre_transient_tolerance_levels=int(cfg.noise.get("edge_pre_transient_tolerance_levels", 2)),
+        edge_pre_min_stable_levels=int(cfg.noise.get("edge_pre_min_stable_levels", 2)),
+        edge_neighbor_structure_factor=float(cfg.noise.get("edge_neighbor_structure_factor", 3.0)),
+        edge_dense_context_min_pad_pts=int(cfg.noise.get("edge_dense_context_min_pad_pts", 10)),
+        edge_dense_context_pad_pts=int(cfg.noise.get("edge_dense_context_pad_pts", 20)),
+        edge_dense_context_max_pad_pts=int(cfg.noise.get("edge_dense_context_max_pad_pts", 120)),
+        edge_context_expand_step_pts=int(cfg.noise.get("edge_context_expand_step_pts", 10)),
     )
-    print(f"[{_ts()}] [edge-levels] all={list(EDGE_ALL_LEVELS_ASC)} dense_desc={list(EDGE_MAPPING_LEVELS_DESC)}")
+    print(f"[{_ts()}] [edge-levels] all={list(EDGE_ALL_LEVELS_ASC)} dense={list(EDGE_DENSE_LEVELS_ASC)}")
     print(
-        f"[{_ts()}] [edge-mode] noise_aware_foot_search_enabled={bool(metric_ctx.noise_aware_foot_search_enabled)} "
-        f"noise_height_factor={float(metric_ctx.noise_height_factor):.3g}"
+        f"[{_ts()}] [edge-mode] method={metric_ctx.edge_foot_method} "
+        f"noise_source={metric_ctx.noise_source} "
+        f"noise_height_factor={float(metric_ctx.noise_height_factor):.3g} "
+        f"neighbor_structure_factor={float(metric_ctx.edge_neighbor_structure_factor):.3g}"
     )
     all_metric_rows: list[dict[str, Any]] = []
     all_edge_rows: list[dict[str, Any]] = []
@@ -202,7 +201,7 @@ def _prepare_candidate_rows(
             small_morphology=small,
             enabled=bool(cfg.noise.get("candidate_noise_prefilter_enabled", True)),
             mode=str(cfg.noise.get("candidate_noise_prefilter_mode", "morph_range_chord")),
-            height_factor=float(cfg.noise.get("noise_height_factor", 5.0)),
+            height_factor=float(cfg.noise.get("noise_height_factor", 3.0)),
         )
         total_after_noise += int(prefilter_summary.get("n_candidates_after_noise_prefilter", 0))
         noise_by_candidate = {str(row["candidate_id"]): row for row in prefilter_rows}
@@ -463,25 +462,25 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
         if str(row.get("ss4_reason", "")) == "review_missing"
         and not np.isfinite(_safe_float(row.get("pce_negpref_t098_evidence_signed")))
     ]
-    direct_edge_rows = [
+    foot_ok_rows = [
         row for row in finite_edge_rows
-        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_foot_search_status", "direct")) == "direct"
+        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_selected_foot_status", "")) == "ok"
     ]
-    searched_edge_rows = [
+    foot_last_touch_rows = [
         row for row in finite_edge_rows
-        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_foot_search_status", "")) == "searched"
+        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_selected_foot_status", "")) == "last_valid_touch"
     ]
-    unresolved_edge_rows = [
+    foot_neighbor_stop_rows = [
         row for row in finite_edge_rows
-        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_foot_search_status", "")) == "unresolved"
+        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_selected_foot_status", "")) == "neighbor_structure_stop"
+    ]
+    foot_context_limited_rows = [
+        row for row in finite_edge_rows
+        if str((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_selected_foot_status", "")) == "context_limited"
     ]
     expanded_edge_rows = [
         row for row in finite_edge_rows
         if bool((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_context_expanded"))
-    ]
-    rejected_foot_rows = [
-        row for row in finite_edge_rows
-        if bool((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_rejected_foots"))
     ]
     metadata = {
         "input_path": str(dataset.path),
@@ -528,13 +527,11 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
         f"review_missing_due_pce={len(review_missing_due_pce)}"
     )
     print(
-        f"[{_ts()}] [summary] edge direct kept={len(direct_edge_rows)} "
-        f"noise-aware triggered={len(searched_edge_rows)} "
-        f"fallback last resort={len(unresolved_edge_rows)}"
-    )
-    print(
-        f"[{_ts()}] [summary] edge context_expanded={len(expanded_edge_rows)} "
-        f"rows_with_rejected_foots={len(rejected_foot_rows)}"
+        f"[{_ts()}] [summary] edge foot_status ok={len(foot_ok_rows)} "
+        f"last_valid_touch={len(foot_last_touch_rows)} "
+        f"neighbor_structure_stop={len(foot_neighbor_stop_rows)} "
+        f"context_limited={len(foot_context_limited_rows)} "
+        f"context_expanded={len(expanded_edge_rows)}"
     )
     print(
         f"[{_ts()}] [summary] {str(cfg.decision_profile).upper()} active_spikes="
@@ -582,8 +579,8 @@ def _write_missing_edge_audit(cfg: CoreConfig, rows: list[dict[str, Any]]) -> No
             f,
             fieldnames=[
                 "source_y", "source_x", "compact_y", "compact_x", "candidate_id",
-                "peak_index", "start", "end", "edge_foot_search_status", "edge_noise_ratio",
-                "bg_mad", "edge_direct_foot_index", "edge_selected_foot_index", "edge_noise_range",
+                "peak_index", "start", "end", "edge_selected_foot_status", "edge_noise_ratio",
+                "bg_mad", "edge_selected_foot_index", "edge_noise_source", "edge_noise_range",
             ],
         )
         writer.writeheader()
@@ -599,11 +596,11 @@ def _write_missing_edge_audit(cfg: CoreConfig, rows: list[dict[str, Any]]) -> No
                     "peak_index": row.get("peak_index"),
                     "start": row.get("start"),
                     "end": row.get("end"),
-                    "edge_foot_search_status": dbg.get("edge_foot_search_status"),
+                    "edge_selected_foot_status": dbg.get("edge_selected_foot_status"),
                     "edge_noise_ratio": row.get("edge_noise_ratio"),
                     "bg_mad": row.get("bg_mad"),
-                    "edge_direct_foot_index": dbg.get("edge_direct_foot_index"),
                     "edge_selected_foot_index": dbg.get("edge_selected_foot_index"),
+                    "edge_noise_source": dbg.get("edge_noise_source"),
                     "edge_noise_range": dbg.get("edge_noise_range"),
                 }
             )

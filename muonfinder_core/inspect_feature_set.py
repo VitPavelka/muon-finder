@@ -19,10 +19,12 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(_REPO_ROOT))
 
     from muonfinder_core.cache import load_viewer_cache
+    from muonfinder_core.cap_metrics import join_extra_feature_rows, load_extra_feature_rows, resolve_extra_features_path
     from muonfinder_core.config import load_config
     from muonfinder_core.utils import flatten_dict_keys, human_text_key
 else:
     from .cache import load_viewer_cache
+    from .cap_metrics import join_extra_feature_rows, load_extra_feature_rows, resolve_extra_features_path
     from .config import load_config
     from .utils import flatten_dict_keys, human_text_key
 
@@ -52,6 +54,9 @@ KEYWORD_MAP = {
     "ss4": ("ss4", "primary_ss4"),
     "ss5": ("ss5", "primary_ss5"),
     "edge": ("recdw_", "edge_", "raw_edge_"),
+    "cap": ("cap_",),
+    "exp": ("exp_",),
+    "experimental": ("exp_",),
     "noise": ("candidate_noise_", "noise_"),
 }
 
@@ -149,7 +154,7 @@ def _resolve_feature_keyword(names: list[str], token: str) -> list[str]:
     return [token]
 
 
-def _selected_features(names: list[str], explicit: list[str], features_file: Path | None) -> list[str]:
+def _requested_feature_tokens(explicit: list[str], features_file: Path | None) -> list[str]:
     wanted = list(explicit)
     if features_file is not None:
         wanted.extend(
@@ -157,18 +162,27 @@ def _selected_features(names: list[str], explicit: list[str], features_file: Pat
             for line in features_file.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.strip().startswith("#")
         )
+    return wanted
+
+
+def _selected_features(names: list[str], explicit: list[str], features_file: Path | None) -> tuple[list[str], list[str]]:
+    wanted = _requested_feature_tokens(explicit, features_file)
     if not wanted:
         raise ValueError("Provide --features and/or --features-file.")
     selected: list[str] = []
+    missing: list[str] = []
     seen = set()
     for token in wanted:
-        for name in _resolve_feature_keyword(names, token):
+        resolved = [name for name in _resolve_feature_keyword(names, token) if name in names]
+        if not resolved:
+            missing.append(str(token))
+        for name in resolved:
             if name in names and name not in seen:
                 seen.add(name)
                 selected.append(name)
     if not selected:
         raise ValueError("None of the requested features were found in the current core cache.")
-    return selected
+    return selected, missing
 
 
 def _feature_row(name: str, rows: list[dict[str, Any]], binary_labels: dict[tuple[int, int, int], int], ternary_labels: dict[tuple[int, int, int], str]) -> dict[str, Any]:
@@ -366,7 +380,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect a manually selected feature subset from core metric rows.")
     parser.add_argument("--config", type=Path, default=Path("config_core.json"), help="Core config; used to resolve viewer_cache_path and labels_csv.")
     parser.add_argument("--corr-json", type=Path, default=None, help="Accepted for compatibility; core mode reads current metrics from viewer cache.")
-    parser.add_argument("--features", nargs="*", default=[], help="Explicit feature names or supported keywords (currently: pce, ss1, ss4, ss5, edge, noise).")
+    parser.add_argument("--features", nargs="*", default=[], help="Explicit feature names or supported keywords (currently: pce, ss1, ss4, ss5, edge, cap, exp, noise).")
     parser.add_argument("--features-file", type=Path, default=None, help="Text file with one feature name or supported keyword per line.")
     parser.add_argument("--corr-type", choices=["pearson", "spearman", "both"], default="both", help="Which correlation heatmap to display.")
     parser.add_argument("--sort-by", choices=["input", *AUC_SORT_KEYS], default="input", help="How to order selected features.")
@@ -376,13 +390,30 @@ def main() -> None:
     parser.add_argument("--auc-min-key", choices=AUC_SORT_KEYS, default=None, help="AUC column used by --auc-min.")
     parser.add_argument("--hide-pairwise-summary", action="store_true", help="Do not print the Pairwise Summary table in the console.")
     parser.add_argument("--label-mode", choices=["binary", "ternary"], default="binary", help="Read binary or ternary labels from labels.csv.")
+    parser.add_argument("--extra-features", type=Path, default=None, help="Optional extra feature CSV joined by candidate_id or (source_y, source_x, peak_index).")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     cache = load_viewer_cache(Path(cfg.paths["viewer_cache_path"]))
     rows = [dict(row) for row in cache.get("candidate_records", [])]
+    extra_path = resolve_extra_features_path(cfg, args.extra_features)
+    if extra_path is not None and extra_path.exists():
+        extra_rows, extra_columns = load_extra_feature_rows(extra_path)
+        join_info = join_extra_feature_rows(rows, extra_rows)
+        print(f"[extra features] path={extra_path}")
+        print(
+            f"[extra features] loaded={join_info['loaded_rows']} matched={join_info['matched_rows']} "
+            f"unmatched={join_info['unmatched_rows']}"
+        )
+        print(f"[extra features] columns={', '.join(extra_columns)}")
+    elif args.extra_features is not None:
+        print(f"[extra features] missing file: {extra_path}")
     names = [name for name in flatten_dict_keys(rows) if not name.endswith("_debug") and all(ch not in name for ch in ("source_record_origin", "candidate_id", "parent_id"))]
-    selected = _selected_features(names, list(args.features), args.features_file)
+    selected, missing_requested = _selected_features(names, list(args.features), args.features_file)
+    print(f"[features available] {len(names)}")
+    print(f"[features selected] {', '.join(selected)}")
+    if missing_requested:
+        print(f"[missing requested features] {', '.join(missing_requested)}")
     binary_labels, ternary_labels = _load_labels(Path(cfg.paths["labels_csv"]))
 
     feature_rows = [_feature_row(name, rows, binary_labels, ternary_labels) for name in selected]

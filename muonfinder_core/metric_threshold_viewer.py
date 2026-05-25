@@ -18,10 +18,12 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(_REPO_ROOT))
 
     from muonfinder_core.cache import load_viewer_cache
+    from muonfinder_core.cap_metrics import join_extra_feature_rows, load_extra_feature_rows, resolve_extra_features_path
     from muonfinder_core.config import load_config
     from muonfinder_core.utils import flatten_dict_keys, human_text_key
 else:
     from .cache import load_viewer_cache
+    from .cap_metrics import join_extra_feature_rows, load_extra_feature_rows, resolve_extra_features_path
     from .config import load_config
     from .utils import flatten_dict_keys, human_text_key
 
@@ -32,6 +34,9 @@ KEYWORD_MAP = {
     "ss4": ("ss4",),
     "ss5": ("ss5",),
     "edge": ("recdw_sum_0_90_raman_veto_evidence_signed", "recdw_sum_0_90_support01", "recdw_sum_0_90_z", "recdw_", "edge_", "raw_edge_"),
+    "cap": ("cap_",),
+    "exp": ("exp_",),
+    "experimental": ("exp_",),
     "noise": ("candidate_noise_", "noise_"),
 }
 
@@ -132,12 +137,25 @@ def main() -> None:
     parser.add_argument("--thr-h", type=float, default=None, help="Upper threshold guide.")
     parser.add_argument("--reverse", action="store_true", help="Interpret lower / more negative values as more spike-like.")
     parser.add_argument("--label-mode", choices=["binary", "ternary"], default="binary", help="Use binary or ternary labels.")
+    parser.add_argument("--extra-features", type=Path, default=None, help="Optional extra feature CSV joined by candidate_id or (source_y, source_x, peak_index).")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     cache = load_viewer_cache(Path(cfg.paths["viewer_cache_path"]))
     binary_labels, ternary_labels = _load_labels(Path(cfg.paths["labels_csv"]))
     rows = [dict(row) for row in cache.get("candidate_records", [])]
+    extra_path = resolve_extra_features_path(cfg, args.extra_features)
+    if extra_path is not None and extra_path.exists():
+        extra_rows, extra_columns = load_extra_feature_rows(extra_path)
+        join_info = join_extra_feature_rows(rows, extra_rows)
+        print(f"[extra features] path={extra_path}")
+        print(
+            f"[extra features] loaded={join_info['loaded_rows']} matched={join_info['matched_rows']} "
+            f"unmatched={join_info['unmatched_rows']}"
+        )
+        print(f"[extra features] columns={', '.join(extra_columns)}")
+    elif args.extra_features is not None:
+        print(f"[extra features] missing file: {extra_path}")
     x_axis = np.asarray(cache["x_axis"], dtype=float)
     spectra = np.asarray(cache["spectra"], dtype=float)
     names = flatten_dict_keys(rows)

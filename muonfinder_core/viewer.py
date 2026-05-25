@@ -18,12 +18,14 @@ if __package__ in {None, ""}:
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
 
+    from muonfinder_core.cap_metrics import join_extra_feature_rows, load_extra_feature_rows
     from muonfinder_core.cache import load_viewer_cache
     from muonfinder_core.config import load_config
     from muonfinder_core.metrics import EDGE_ALL_LEVELS_ASC, EDGE_DENSE_LEVELS_ASC
     from muonfinder_core.plotting import candidate_status_color
     from muonfinder_core.utils import metric_float, to_contiguous_spans
 else:
+    from .cap_metrics import join_extra_feature_rows, load_extra_feature_rows
     from .cache import load_viewer_cache
     from .config import load_config
     from .metrics import EDGE_ALL_LEVELS_ASC, EDGE_DENSE_LEVELS_ASC
@@ -45,11 +47,13 @@ CHECKBOX_ORDER = [
     "spike bands",
     "noise reference",
     "PCE",
+    "pre-EDGE",
     "EDGE",
     "dilation contacts",
     "erosion contacts",
     "despike chords",
     "noise filter",
+    "Experimental metrics",
     "metrics",
 ]
 
@@ -60,16 +64,103 @@ OVERLAY_KEY_BY_LABEL = {
     "top-hat": "top_hat",
     "gradient": "gradient",
 }
-
-
-def _config_cache_path(config_path: Path) -> Path:
-    cfg = load_config(config_path)
-    return Path(str(cfg.paths["viewer_cache_path"]))
-
-
 def _x_from_index(x_axis: np.ndarray, idx: float) -> float:
     xp = np.arange(int(x_axis.size), dtype=float)
     return float(np.interp(float(idx), xp, np.asarray(x_axis, dtype=float)))
+
+
+def _has_finite_experimental_metric(row: dict[str, Any], columns: list[str]) -> bool:
+    for col in columns:
+        value = metric_float(row, col)
+        if np.isfinite(value):
+            return True
+        raw = row.get(col)
+        if isinstance(raw, str) and raw.strip():
+            return True
+    return False
+
+
+def _show_experimental_metric_row(row: dict[str, Any], columns: list[str]) -> bool:
+    return (
+        str(row.get("candidate_noise_prefilter_status", "")).strip() != "rejected_noise"
+        and _has_finite_experimental_metric(row, columns)
+    )
+
+
+def _experimental_peak_text(row: dict[str, Any], x_axis: np.ndarray) -> str:
+    try:
+        peak_idx = int(row.get("peak_index", -1))
+    except Exception:
+        peak_idx = -1
+    if 0 <= peak_idx < int(x_axis.size):
+        try:
+            peak_pos = float(x_axis[peak_idx])
+        except Exception:
+            peak_pos = float("nan")
+        if np.isfinite(peak_pos):
+            return rf"$\bf{{peak\ {peak_pos:.1f}}}$"
+    return rf"$\bf{{peak\_idx\ {peak_idx}}}$"
+
+
+def _experimental_metric_label(column: str, aliases: dict[str, str]) -> str:
+    alias = str(aliases.get(column, "")).strip()
+    if alias:
+        return alias
+    parts = [part for part in str(column).strip().split("_") if part]
+    acronym = ""
+    for part in parts:
+        for ch in part:
+            if ch.isalpha():
+                acronym += ch.lower()
+                break
+        else:
+            if part[0].isdigit():
+                acronym += part[0]
+    return acronym or str(column)
+
+
+def _experimental_metric_text(row: dict[str, Any], column: str) -> str | None:
+    value = metric_float(row, column)
+    if np.isfinite(value):
+        return f"{value:.4g}"
+    raw = row.get(column)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text if text else None
+
+
+def _viewer_active_decision(row: dict[str, Any], active_profile: str) -> tuple[str, str]:
+    if active_profile == "ss6":
+        accept = row.get("ss6_accept")
+        try:
+            accept_int = int(float(accept))
+        except Exception:
+            accept_int = -1
+        branch = str(row.get("ss6_branch", "")).strip()
+        if accept_int == 1:
+            return "spike", branch
+        if accept_int == 0 and branch:
+            return "non_spike", branch
+        return "unknown", "ss6_missing"
+    decision_key = "ss5_decision" if active_profile == "ss5" else "ss4_decision"
+    decision = str(row.get("primary_active_decision", row.get(decision_key, "non_spike"))).strip()
+    reason = str(row.get("primary_active_reason", row.get(f"{active_profile}_reason", ""))).strip()
+    return decision, reason
+
+
+def _viewer_candidate_color(row: dict[str, Any], active_profile: str) -> str:
+    if active_profile != "ss6":
+        return candidate_status_color(row, active_profile)
+    status = str(row.get("candidate_noise_prefilter_status", ""))
+    if status == "rejected_noise":
+        return "#7f7f7f"
+    decision, _reason = _viewer_active_decision(row, active_profile)
+    if decision == "spike":
+        return "#d62728"
+    if decision == "non_spike":
+        return "#1f77b4"
+    return "#9467bd"
 
 
 def _dedup_legend(handles: list[Any], labels: list[str]) -> tuple[list[Any], list[str]]:
@@ -85,7 +176,7 @@ def _dedup_legend(handles: list[Any], labels: list[str]) -> tuple[list[Any], lis
     return out_h, out_l
 
 
-def show_cache(cache: dict[str, Any]) -> None:
+def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     x_axis = np.asarray(cache["x_axis"], dtype=float)
     spectra = np.asarray(cache["spectra"], dtype=float)
     corrected = np.asarray(cache["corrected_spectra"], dtype=float)
@@ -96,7 +187,63 @@ def show_cache(cache: dict[str, Any]) -> None:
     overlays = cache.get("overlays", {})
     chords = [dict(row) for row in cache.get("despike_chords", [])]
     despike_stages = [dict(row) for row in cache.get("despike_stages", [])]
-    active_profile = str(metadata.get("decision_profile", "ss4")).strip().lower()
+    active_profile = str(getattr(cfg, "decision_profile", metadata.get("decision_profile", "ss4"))).strip().lower()
+    viewer_cfg = dict(getattr(cfg, "viewer", {}) if cfg is not None else {})
+    experimental_cfg = dict(getattr(cfg, "experimental_features", {}) if cfg is not None else {})
+    ss6_cfg = dict(getattr(cfg, "ss6", {}) if cfg is not None else {})
+    experimental_columns = [str(col) for col in experimental_cfg.get("viewer_columns", []) if str(col).strip()]
+    ss6_columns = [str(col) for col in ss6_cfg.get("viewer_columns", []) if str(col).strip()]
+    display_columns = list(dict.fromkeys(experimental_columns + ss6_columns))
+    experimental_label_aliases = {
+        str(key): str(value)
+        for key, value in dict(experimental_cfg.get("viewer_label_aliases", {})).items()
+        if str(key).strip() and str(value).strip()
+    }
+    for key, value in dict(ss6_cfg.get("viewer_label_aliases", {})).items():
+        if str(key).strip() and str(value).strip():
+            experimental_label_aliases[str(key)] = str(value)
+    experimental_state = {"loaded": False, "message": "Experimental features not loaded."}
+    load_messages: list[str] = []
+    loaded_any = False
+    exp_path_raw = str(experimental_cfg.get("features_path", "")).strip()
+    if exp_path_raw:
+        exp_path = Path(exp_path_raw)
+        if exp_path.exists():
+            extra_rows, _extra_columns = load_extra_feature_rows(exp_path)
+            join_info = join_extra_feature_rows(candidate_rows, extra_rows)
+            loaded_any = True
+            load_messages.append(f"exp matched {join_info['matched_rows']} / {join_info['loaded_rows']}")
+            print(f"experimental features path: {exp_path}")
+            print(f"experimental features rows loaded: {join_info['loaded_rows']}")
+            print(f"experimental features rows matched to candidates: {join_info['matched_rows']}")
+        else:
+            load_messages.append("exp missing")
+    needs_ss6 = (
+        bool(ss6_columns)
+        or any(col.startswith("ss6_") for col in experimental_columns)
+        or (active_profile == "ss6" and bool(ss6_cfg.get("auto_load_in_viewer", True)))
+    )
+    ss6_path_raw = str(ss6_cfg.get("decisions_path", "")).strip()
+    if needs_ss6 and ss6_path_raw:
+        ss6_path = Path(ss6_path_raw)
+        if ss6_path.exists():
+            ss6_rows, _ss6_columns = load_extra_feature_rows(ss6_path)
+            join_info = join_extra_feature_rows(candidate_rows, ss6_rows)
+            loaded_any = True
+            load_messages.append(f"ss6 matched {join_info['matched_rows']} / {join_info['loaded_rows']}")
+            print(f"ss6 decisions path: {ss6_path}")
+            print(f"ss6 decision rows loaded: {join_info['loaded_rows']}")
+            print(f"ss6 rows matched to candidates: {join_info['matched_rows']}")
+        else:
+            load_messages.append("ss6 missing")
+            if active_profile == "ss6":
+                print("decision_profile is ss6, but ss6_decisions.csv was not found.")
+                print("Run: python -m muonfinder_core.compute_ss6_decisions --config muonfinder_core/config_core.json")
+    finite_metric_rows = sum(1 for row in candidate_rows if _show_experimental_metric_row(row, display_columns))
+    print(f"experimental rows with finite/displayable configured metrics: {finite_metric_rows}")
+    print(f"experimental viewer columns: {display_columns}")
+    if loaded_any:
+        experimental_state = {"loaded": True, "message": "; ".join(load_messages)}
     morph_windows = sorted(int(v) for v in metadata.get("morphology_windows", sorted(overlays.get("dilation", {}).keys())))
     if not morph_windows:
         morph_windows = [3]
@@ -115,7 +262,7 @@ def show_cache(cache: dict[str, Any]) -> None:
         [
             [int(row["x"]), int(row["y"])]
             for row in candidate_rows
-            if str(row.get("primary_active_decision", "non_spike")) == "spike"
+            if _viewer_active_decision(row, active_profile)[0] == "spike"
         ],
         dtype=float,
     )
@@ -320,6 +467,129 @@ def show_cache(cache: dict[str, Any]) -> None:
         ax_spec._pce_legend_handles = legend_handles  # type: ignore[attr-defined]
         ax_spec._pce_legend_labels = legend_labels  # type: ignore[attr-defined]
 
+    def _draw_pre_edge_overlay(rows: list[dict[str, Any]], raw_sig: np.ndarray) -> None:
+        legend_handles: list[Any] = []
+        legend_labels: list[str] = []
+        status_style = {
+            "ok": {"color": "#4c78a8", "linestyle": "-", "alpha": 0.32},
+            "transient": {"color": "#7f7f7f", "linestyle": "--", "alpha": 0.45},
+            "neighbor_structure": {"color": "#f58518", "linestyle": "-", "alpha": 0.72},
+            "lost": {"color": "#d62728", "linestyle": ":", "alpha": 0.78},
+            "context_boundary": {"color": "#6f4c9b", "linestyle": "-.", "alpha": 0.62},
+        }
+        first = True
+        for row in rows:
+            if str(row.get("candidate_noise_prefilter_status", "")) == "rejected_noise":
+                continue
+            debug = _edge_debug(row)
+            pre_levels = debug.get("edge_pre_levels", [])
+            if not isinstance(pre_levels, list) or not pre_levels:
+                continue
+            ml = int(debug.get("edge_context_left", row.get("start", 0)))
+            mr = int(debug.get("edge_context_right", row.get("end", 0)))
+            if 0 <= ml < len(x_axis) and 0 <= mr < len(x_axis) and mr >= ml:
+                ax_spec.axvspan(x_axis[ml], x_axis[mr], color="#1f78b4", alpha=0.05)
+            apex_idx = int(debug.get("edge_apex_index", row.get("peak_index", 0)))
+            apex_x = x_axis[apex_idx] if 0 <= apex_idx < len(x_axis) else None
+            for item in pre_levels:
+                if not isinstance(item, dict):
+                    continue
+                level_y = metric_float(item, "level_value")
+                left_cross = metric_float(item, "apex_left")
+                right_cross = metric_float(item, "apex_right")
+                status = str(item.get("component_status", "ok"))
+                style = status_style.get(status, status_style["ok"])
+                if np.isfinite(left_cross) and np.isfinite(right_cross) and np.isfinite(level_y):
+                    lx = _x_from_index(x_axis, left_cross)
+                    rx = _x_from_index(x_axis, right_cross)
+                    ax_spec.plot(
+                        [lx, rx],
+                        [level_y, level_y],
+                        color=style["color"],
+                        linestyle=style["linestyle"],
+                        linewidth=1.1 if not bool(item.get("selected_for_foot")) else 1.8,
+                        alpha=style["alpha"],
+                    )
+                    ax_spec.scatter([lx, rx], [level_y, level_y], s=12, c=style["color"], alpha=min(1.0, style["alpha"] + 0.2), zorder=4)
+                elif apex_x is not None and np.isfinite(level_y):
+                    ax_spec.plot(
+                        [apex_x],
+                        [level_y],
+                        marker="x",
+                        color=style["color"],
+                        markersize=5.5,
+                        linestyle="None",
+                        alpha=min(1.0, style["alpha"] + 0.15),
+                        zorder=5,
+                    )
+                if bool(item.get("neighbor_detected")) and np.isfinite(level_y):
+                    neighbor_r = metric_float(item, "neighbor_r")
+                    marker_x = _x_from_index(x_axis, right_cross) if np.isfinite(right_cross) else apex_x
+                    if marker_x is not None:
+                        ax_spec.plot(
+                            [marker_x],
+                            [level_y],
+                            marker="o" if status != "neighbor_structure" else "s",
+                            color=style["color"],
+                            markersize=4.6 if status != "neighbor_structure" else 5.6,
+                            linestyle="None",
+                            zorder=5,
+                        )
+                        if status == "neighbor_structure" and np.isfinite(neighbor_r):
+                            ax_spec.text(marker_x, level_y, f"r={neighbor_r:.1f}", fontsize=8, color=style["color"], ha="left", va="bottom")
+            foot_left = metric_float(debug, "edge_selected_foot_left")
+            foot_right = metric_float(debug, "edge_selected_foot_right")
+            foot_value = metric_float(debug, "edge_selected_foot_value")
+            foot_index = debug.get("edge_selected_foot_index")
+            foot_status = str(debug.get("edge_selected_foot_status", "ok"))
+            foot_color = "#f58518" if foot_status == "neighbor_structure_stop" else "#1f78b4"
+            if np.isfinite(foot_left) and np.isfinite(foot_right) and np.isfinite(foot_value):
+                ax_spec.plot(
+                    [_x_from_index(x_axis, foot_left), _x_from_index(x_axis, foot_right)],
+                    [foot_value, foot_value],
+                    color=foot_color,
+                    linestyle=":",
+                    linewidth=2.0,
+                    alpha=0.95,
+                )
+            if foot_index is not None:
+                foot_idx = int(foot_index)
+                if 0 <= foot_idx < len(x_axis):
+                    ax_spec.plot(
+                        [x_axis[foot_idx]],
+                        [raw_sig[foot_idx]],
+                        marker="D",
+                        color=foot_color,
+                        markersize=6.5,
+                        linestyle="None",
+                        zorder=6,
+                    )
+            if first:
+                legend_handles.extend(
+                    [
+                        Line2D([0], [0], color="#4c78a8", linewidth=1.2),
+                        Line2D([0], [0], color="#7f7f7f", linestyle="--", linewidth=1.2),
+                        Line2D([0], [0], color="#f58518", linewidth=1.2),
+                        Line2D([0], [0], color="#d62728", linestyle=":", linewidth=1.2),
+                        Line2D([0], [0], color="#6f4c9b", linestyle="-.", linewidth=1.2),
+                        Line2D([0], [0], color="#1f78b4", linestyle=":", linewidth=1.8),
+                    ]
+                )
+                legend_labels.extend(
+                    [
+                        "pre-EDGE ok",
+                        "pre-EDGE transient/noise",
+                        "neighbor-structure stop",
+                        "pre-EDGE lost",
+                        "pre-EDGE context boundary",
+                        "selected foot/base",
+                    ]
+                )
+                first = False
+        if legend_handles:
+            ax_spec._pre_edge_legend_handles = legend_handles  # type: ignore[attr-defined]
+            ax_spec._pre_edge_legend_labels = legend_labels  # type: ignore[attr-defined]
+
     def _draw_edge_overlay(rows: list[dict[str, Any]], raw_sig: np.ndarray) -> None:
         legend_handles: list[Any] = []
         legend_labels: list[str] = []
@@ -387,33 +657,6 @@ def show_cache(cache: dict[str, Any]) -> None:
                 if support_x:
                     legend_handles.append(Line2D([0], [0], marker="o", color="#fb6a4a", linestyle="None", markersize=5.0))
                     legend_labels.append("EDGE support points")
-            if bool(debug.get("edge_foot_search_triggered")) and str(debug.get("edge_foot_search_status", "")) in {"searched", "unresolved", "context_limited"}:
-                peak = int(row.get("peak_index", 0))
-                if 0 <= peak < len(x_axis):
-                    ax_spec.text(
-                        x_axis[peak],
-                        raw_sig[peak],
-                        "EDGE foot search",
-                        fontsize=8,
-                        color="#fb6a4a",
-                        ha="left",
-                        va="bottom",
-                    )
-            for item in debug.get("edge_rejected_foots", []):
-                if not isinstance(item, dict):
-                    continue
-                idx = int(item.get("index", -1))
-                ratio = metric_float(item, "r")
-                if not (0 <= idx < len(x_axis)):
-                    continue
-                yv = float(raw_sig[idx])
-                ax_spec.plot([x_axis[idx]], [yv], marker="v", color="#d62728", markersize=7.5, linestyle="None", zorder=5)
-                ax_spec.axvline(x_axis[idx], color="#d62728", linestyle=":", linewidth=0.9, alpha=0.8)
-                if np.isfinite(ratio):
-                    ax_spec.text(x_axis[idx], yv, f"r={ratio:.1f}", color="#d62728", fontsize=8, ha="center", va="top")
-            if first and debug.get("edge_rejected_foots"):
-                legend_handles.append(Line2D([0], [0], marker="v", color="#d62728", linestyle="None", markersize=6.0))
-                legend_labels.append("rejected foot")
             if first and legend_handles:
                 first = False
         if legend_handles:
@@ -489,9 +732,10 @@ def show_cache(cache: dict[str, Any]) -> None:
                 finite_parts.append(f"edge={edge:.3g}")
             if not finite_parts:
                 continue
-            color = candidate_status_color(row, active_profile)
+            color = _viewer_candidate_color(row, active_profile)
             x_pos = float(x_axis[peak])
-            label = "\n".join(finite_parts + ([str(row.get("primary_active_reason", ""))] if row.get("primary_active_reason") else []))
+            _decision, reason = _viewer_active_decision(row, active_profile)
+            label = "\n".join(finite_parts + ([reason] if reason else []))
             y_peak = float(raw_sig[peak])
             x_text = float(np.clip(x_pos + 0.010 * x_span, x_min + 0.02 * x_span, x_max - 0.20 * x_span))
             y_pos = float(np.clip(y_peak + 0.045 * y_span, y_min + 0.03 * y_span, y_max - 0.03 * y_span))
@@ -538,6 +782,84 @@ def show_cache(cache: dict[str, Any]) -> None:
                 y_pos = float(np.clip(y_pos, y_min + 0.02 * y_span, y_max - 0.02 * y_span))
             text.set_position(best_xy)
 
+    def _draw_experimental_metrics(rows: list[dict[str, Any]]) -> None:
+        if not display_columns:
+            ax_spec.text(
+                0.015,
+                0.97,
+                "Experimental viewer_columns not configured",
+                transform=ax_spec.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                family="monospace",
+                bbox={"facecolor": "white", "alpha": 0.80, "edgecolor": "#666666", "linewidth": 0.8},
+            )
+            return
+        if not experimental_state["loaded"]:
+            ax_spec.text(
+                0.015,
+                0.97,
+                str(experimental_state["message"]),
+                transform=ax_spec.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                family="monospace",
+                bbox={"facecolor": "white", "alpha": 0.80, "edgecolor": "#666666", "linewidth": 0.8},
+            )
+            return
+        display_rows = sorted(
+            [row for row in rows if _show_experimental_metric_row(row, display_columns)],
+            key=lambda item: int(item.get("peak_index", -1)),
+        )
+        if not display_rows:
+            ax_spec.text(
+                0.015,
+                0.97,
+                "No finite experimental metrics for this spectrum.",
+                transform=ax_spec.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                family="monospace",
+                bbox={"facecolor": "white", "alpha": 0.80, "edgecolor": "#666666", "linewidth": 0.8},
+            )
+            return
+        blocks: list[str] = []
+        for row in display_rows:
+            block_lines = [_experimental_peak_text(row, x_axis)]
+            for col in display_columns:
+                text = _experimental_metric_text(row, col)
+                if text is not None:
+                    block_lines.append(f"{_experimental_metric_label(col, experimental_label_aliases)}: {text}")
+            if len(block_lines) > 1:
+                blocks.append("\n".join(block_lines))
+        if not blocks:
+            ax_spec.text(
+                0.015,
+                0.97,
+                "No finite experimental metrics for this spectrum.",
+                transform=ax_spec.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                family="monospace",
+                bbox={"facecolor": "white", "alpha": 0.80, "edgecolor": "#666666", "linewidth": 0.8},
+            )
+            return
+        ax_spec.text(
+            0.015,
+            0.97,
+            "\n\n".join(blocks),
+            transform=ax_spec.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8.7,
+            family="monospace",
+            bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "#555555", "linewidth": 0.8},
+        )
+
     def _contact_context_spans(rows: list[dict[str, Any]], pad: int = 4) -> list[tuple[int, int]]:
         spans: list[tuple[int, int]] = []
         for row in rows:
@@ -548,6 +870,34 @@ def show_cache(cache: dict[str, Any]) -> None:
             indices.extend(range(left, right + 1))
         return to_contiguous_spans(sorted(set(indices)))
 
+    def _draw_active_profile_summary(rows: list[dict[str, Any]]) -> None:
+        if not bool(viewer_cfg.get("show_candidate_status_summary_box", False)):
+            return
+        if active_profile != "ss6" or not rows:
+            return
+        lines: list[str] = []
+        for row in rows[:5]:
+            peak_text = _experimental_peak_text(row, x_axis).replace("$\\bf{", "").replace("}$", "").replace("\\_", "_").replace("\\ ", " ")
+            branch = str(row.get("ss6_branch", "")).strip() or "unknown"
+            try:
+                accept_text = str(int(float(row.get("ss6_accept", np.nan))))
+            except Exception:
+                accept_text = "?"
+            lines.append(f"ss6={accept_text} {branch} {peak_text}")
+        if len(rows) > 5:
+            lines.append(f"+{len(rows) - 5} more")
+        ax_spec.text(
+            0.015,
+            0.90,
+            "\n".join(lines),
+            transform=ax_spec.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8.6,
+            family="monospace",
+            bbox={"facecolor": "white", "alpha": 0.76, "edgecolor": "#666666", "linewidth": 0.8},
+        )
+
     raw_sig = np.asarray(spectra[current["y"], current["x"], :], dtype=float)
 
     def _draw_spectrum() -> None:
@@ -555,6 +905,8 @@ def show_cache(cache: dict[str, Any]) -> None:
         ax_spec.clear()
         ax_spec._pce_legend_handles = []  # type: ignore[attr-defined]
         ax_spec._pce_legend_labels = []  # type: ignore[attr-defined]
+        ax_spec._pre_edge_legend_handles = []  # type: ignore[attr-defined]
+        ax_spec._pre_edge_legend_labels = []  # type: ignore[attr-defined]
         ax_spec._edge_legend_handles = []  # type: ignore[attr-defined]
         ax_spec._edge_legend_labels = []  # type: ignore[attr-defined]
         rows = current_rows()
@@ -584,7 +936,7 @@ def show_cache(cache: dict[str, Any]) -> None:
                 ax_spec.axvline(x_axis[int(row["end"])], color="#2ca02c", linestyle="--", linewidth=1.2, alpha=0.95)
         if states["spike peaks"]:
             for row in rows:
-                color = candidate_status_color(row, active_profile)
+                color = _viewer_candidate_color(row, active_profile)
                 ax_spec.axvline(x_axis[int(row["peak_index"])], color=color, linestyle="--", linewidth=1.5)
 
         morph_row = small_by_pixel.get((int(current["y"]), int(current["x"])), {})
@@ -606,7 +958,7 @@ def show_cache(cache: dict[str, Any]) -> None:
                 src = dbg.get("edge_noise_source")
                 val = metric_float(dbg, "edge_noise_value")
                 if src and np.isfinite(val):
-                    noise_line = f"noise={val:.1f} ({src})"
+                    noise_line = f"noise = {val:.1f} ({src})"
                     break
             if noise_line:
                 ax_spec.text(
@@ -623,6 +975,8 @@ def show_cache(cache: dict[str, Any]) -> None:
 
         if states["PCE"]:
             _draw_pce_overlay(rows)
+        if states["pre-EDGE"]:
+            _draw_pre_edge_overlay(rows, raw_sig)
         if states["EDGE"]:
             _draw_edge_overlay(rows, raw_sig)
 
@@ -664,12 +1018,17 @@ def show_cache(cache: dict[str, Any]) -> None:
             _draw_noise_filter(rows, raw_sig)
         if states["metrics"]:
             _draw_metrics(rows, raw_sig)
+        if states["Experimental metrics"]:
+            _draw_experimental_metrics(rows)
+        _draw_active_profile_summary(rows)
         handles1, labels1 = ax_spec.get_legend_handles_labels()
         handles2 = list(getattr(ax_spec, "_pce_legend_handles", []))
         labels2 = list(getattr(ax_spec, "_pce_legend_labels", []))
-        handles3 = list(getattr(ax_spec, "_edge_legend_handles", []))
-        labels3 = list(getattr(ax_spec, "_edge_legend_labels", []))
-        handles, labels = _dedup_legend(handles1 + handles2 + handles3, labels1 + labels2 + labels3)
+        handles3 = list(getattr(ax_spec, "_pre_edge_legend_handles", []))
+        labels3 = list(getattr(ax_spec, "_pre_edge_legend_labels", []))
+        handles4 = list(getattr(ax_spec, "_edge_legend_handles", []))
+        labels4 = list(getattr(ax_spec, "_edge_legend_labels", []))
+        handles, labels = _dedup_legend(handles1 + handles2 + handles3 + handles4, labels1 + labels2 + labels3 + labels4)
         if handles:
             ax_spec.legend(handles, labels, loc="upper right", fontsize=9, framealpha=0.92)
 
@@ -752,8 +1111,9 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("config_core.json"), help="Core config JSON; used to resolve viewer_cache_path.")
     parser.add_argument("--cache", type=Path, default=None, help="Optional explicit viewer cache path; overrides config.")
     args = parser.parse_args()
-    cache_path = Path(args.cache) if args.cache is not None else _config_cache_path(Path(args.config))
-    show_cache(load_viewer_cache(cache_path))
+    cfg = load_config(Path(args.config))
+    cache_path = Path(args.cache) if args.cache is not None else Path(str(cfg.paths["viewer_cache_path"]))
+    show_cache(load_viewer_cache(cache_path), cfg=cfg)
 
 
 if __name__ == "__main__":
