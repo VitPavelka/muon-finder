@@ -19,9 +19,11 @@ if __package__ in {None, ""}:
 
     from muonfinder_core.config import load_config
     from muonfinder_core.despike import compute_despike_from_cache_and_ss6
+    from muonfinder_core.metrics import MetricComputationContext
 else:
     from .config import load_config
     from .despike import compute_despike_from_cache_and_ss6
+    from .metrics import MetricComputationContext
 
 
 def _progress_iter(items):
@@ -60,7 +62,23 @@ def main() -> None:
     ss6_path = Path(args.ss6) if args.ss6 is not None else Path(str(cfg.ss6["decisions_path"]))
     corrected_path = Path(args.corrected_out) if args.corrected_out is not None else Path(str(despike_cfg["corrected_path"]))
     debug_path = Path(args.debug_out) if args.debug_out is not None else Path(str(despike_cfg["debug_path"]))
+    attempts_path = Path(str(despike_cfg["attempts_path"]))
     summary_path = Path(args.summary_out) if args.summary_out is not None else Path(str(despike_cfg["summary_path"]))
+
+    noise_cfg = dict(getattr(cfg, "noise", {}))
+    metric_ctx = MetricComputationContext(
+        noise_source=str(noise_cfg.get("noise_source", "morph_range")),
+        noise_height_factor=float(noise_cfg.get("noise_height_factor", 3.0)),
+        edge_foot_method=str(noise_cfg.get("edge_foot_method", "noise_quantized_component")),
+        edge_pre_level_step_noise=float(noise_cfg.get("edge_pre_level_step_noise", 1.0)),
+        edge_pre_transient_tolerance_levels=int(noise_cfg.get("edge_pre_transient_tolerance_levels", 2)),
+        edge_pre_min_stable_levels=int(noise_cfg.get("edge_pre_min_stable_levels", 2)),
+        edge_neighbor_structure_factor=float(noise_cfg.get("edge_neighbor_structure_factor", 3.0)),
+        edge_dense_context_min_pad_pts=int(noise_cfg.get("edge_dense_context_min_pad_pts", 10)),
+        edge_dense_context_pad_pts=int(noise_cfg.get("edge_dense_context_pad_pts", 20)),
+        edge_dense_context_max_pad_pts=int(noise_cfg.get("edge_dense_context_max_pad_pts", 120)),
+        edge_context_expand_step_pts=int(noise_cfg.get("edge_context_expand_step_pts", 10)),
+    )
 
     print(f"viewer cache: {cache_path}")
     print(f"ss6 decisions: {ss6_path}")
@@ -76,17 +94,14 @@ def main() -> None:
         ss6_path=ss6_path,
         corrected_path=corrected_path,
         debug_path=debug_path,
+        attempts_path=attempts_path,
         summary_path=summary_path,
-        max_iterations=int(despike_cfg.get("max_iterations", 4)),
-        morph_windows=[int(v) for v in despike_cfg.get("morph_windows", [3, 5])],
-        max_cell_width_pts=int(despike_cfg.get("max_cell_width_pts", 10)),
-        max_half_width_pts=int(despike_cfg.get("max_half_width_pts", 5)),
-        min_height_above_chord_noise_z=float(despike_cfg.get("min_height_above_chord_noise_z", 3.0)),
-        anchor_overshoot_noise_factor=float(despike_cfg.get("anchor_overshoot_noise_factor", 0.5)),
-        allow_spectrum_edge_anchors=bool(despike_cfg.get("allow_spectrum_edge_anchors", False)),
-        recheck_enabled=bool(despike_cfg.get("recheck_enabled", True)),
-        recheck_context_pad_pts=int(despike_cfg.get("recheck_context_pad_pts", 3)),
-        skip_overlapping_corrections=bool(despike_cfg.get("skip_overlapping_corrections", True)),
+        morph_window=int(despike_cfg.get("morph_window", 3)),
+        despike_context_window_pad=int(despike_cfg.get("despike_context_window_pad", 0)),
+        noise_height_factor=float(despike_cfg.get("noise_height_factor", 3.0)),
+        max_iterations=int(despike_cfg.get("max_iterations", 1000)),
+        ss6_config=dict(getattr(cfg, "ss6", {})),
+        metric_context=metric_ctx,
         progress_iter=_progress_iter,
         timings_out=inner_timings,
     )
@@ -95,20 +110,21 @@ def main() -> None:
     summary = dict(artifacts.summary)
     print(f"despike corrected: {corrected_path}")
     print(f"despike debug: {debug_path}")
+    print(f"despike attempts: {attempts_path}")
     print(f"despike summary: {summary_path}")
-    print(f"accepted ss6 spikes: {summary['accepted_ss6_spikes']}")
+    print(f"accepted ss6 parent candidates: {summary['accepted_ss6_parent_candidates']}")
     print(f"spectra with accepted spikes: {summary['spectra_with_accepted_spikes']}")
-    print(f"corrected spikes: {summary['corrected_spikes']}")
-    print(f"skipped candidates: {summary['skipped_candidates']}")
-    print(f"repeated corrections: {summary['repeated_corrections']}")
-    print(f"max_correction_width_pts: {summary['max_correction_width_pts']}")
-    print(f"max_iterations_used: {summary['max_iterations_used']}")
-    print(f"max_iteration_reached_count: {summary['max_iteration_reached_count']}")
-    print(f"skipped_no_parent_contact_cell: {summary['skipped_no_parent_contact_cell']}")
-    print(f"skipped_cell_too_wide: {summary['skipped_cell_too_wide']}")
-    print(f"skipped_chord_overshoots_signal: {summary['skipped_chord_overshoots_signal']}")
-    print(f"skipped_missing_noise: {summary['skipped_missing_noise']}")
-    print(f"skipped_overlaps_previous_correction: {summary['skipped_overlaps_previous_correction']}")
+    print(f"parent corrected: {summary['parent_corrected']}")
+    print(f"parent skipped below noise height: {summary['parent_skipped_below_noise_height']}")
+    print(f"parent skipped no erosion neighbors: {summary['parent_skipped_no_erosion_neighbors']}")
+    print(f"local candidates from dilation contacts: {summary['local_candidates_from_dilation_contacts']}")
+    print(f"local candidates rejected by noise height: {summary['local_candidates_rejected_by_noise_height']}")
+    print(f"local candidates sent to ss6: {summary['local_candidates_sent_to_ss6']}")
+    print(f"local candidates accepted by ss6: {summary['local_candidates_accepted_by_ss6']}")
+    print(f"local candidates corrected: {summary['local_candidates_corrected']}")
+    print(f"total corrections applied: {summary['total_corrections_applied']}")
+    print(f"technical failures: {summary['technical_failures']}")
+    print(f"max pass index used: {summary['max_pass_index_used']}")
     print("Timing summary:")
     print(f"  load config: {timings.get('load config', 0.0):.1f} s")
     print(f"  load cache: {timings.get('load cache', 0.0):.1f} s")

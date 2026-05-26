@@ -55,6 +55,33 @@ else:
     from .experimental_raw_pce import compute_experimental_raw_pce
     from .experimental_residual_pce import compute_experimental_residual_features
     from .metrics import MetricComputationContext, robust_center_scale, sigmoid_support
+    from .morphology import dilation_1d, erosion_1d
+
+
+def _third_diff_metrics(signal: np.ndarray, peak_index: int, noise_value: float, radius: int = 3) -> tuple[float, float]:
+    x = np.asarray(signal, dtype=float)
+    peak = int(peak_index)
+    if x.ndim != 1 or x.size < 5 or not (0 <= peak < x.size):
+        return float("nan"), float("nan")
+    d3 = np.diff(x, n=3)
+    if d3.size == 0:
+        return float("nan"), float("nan")
+    left = max(0, peak - int(radius) - 1)
+    right = min(d3.size - 1, peak + int(radius) - 1)
+    if right < left:
+        return float("nan"), float("nan")
+    seg = np.abs(d3[left : right + 1])
+    scale = max(float(noise_value), 1e-12) if np.isfinite(noise_value) and noise_value > 0.0 else float("nan")
+    if not np.isfinite(scale):
+        return float("nan"), float("nan")
+    return float(np.max(seg) / scale), float(np.sum(seg) / scale)
+
+
+def _morph_gradient_1d(signal: np.ndarray, window: int = 3) -> np.ndarray:
+    x = np.asarray(signal, dtype=float).reshape(1, 1, -1)
+    dil = np.asarray(dilation_1d(x, int(window)).reshape(-1), dtype=float)
+    ero = np.asarray(erosion_1d(x, int(window)).reshape(-1), dtype=float)
+    return np.asarray(dil - ero, dtype=float)
 
 
 def _group_valid_count(rows: list[dict[str, object]], columns: list[str]) -> int:
@@ -312,6 +339,15 @@ def compute_all_experimental_features_from_config(
             out_row.update(edge_features)
             edge_status = str(edge_features.get("exp_edge_variants_status", ""))
             edge_time += time.perf_counter() - t_part
+
+        peak_index = int(row.get("peak_index", -1))
+        d3raw_m, d3raw_s = _third_diff_metrics(raw, peak_index, noise_value, radius=3)
+        grad_sig = _morph_gradient_1d(raw, window=3)
+        d3grad_m, d3grad_s = _third_diff_metrics(grad_sig, peak_index, noise_value, radius=3)
+        out_row["d3rawM"] = float(d3raw_m) if np.isfinite(d3raw_m) else np.nan
+        out_row["d3rawS"] = float(d3raw_s) if np.isfinite(d3raw_s) else np.nan
+        out_row["d3gradM"] = float(d3grad_m) if np.isfinite(d3grad_m) else np.nan
+        out_row["d3gradS"] = float(d3grad_s) if np.isfinite(d3grad_s) else np.nan
 
         if "missing_raw_signal" in {raw_status, resid_status, edge_status}:
             missing_raw_signal += 1

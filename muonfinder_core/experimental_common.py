@@ -66,6 +66,10 @@ DEFAULT_EXPERIMENTAL_FEATURES: dict[str, Any] = {
         "exp_raw_pce_savgol5",
         "exp_resid3_pce",
         "exp_resid3_height_noise_z",
+        "d3rawM",
+        "d3rawS",
+        "d3gradM",
+        "d3gradS",
         "exp_resid3_above_3noise",
         "exp_edge_percent_0_90_evidence_signed_modernnorm",
         "exp_edge_noise_from_0_evidence_signed_selfnorm",
@@ -76,6 +80,10 @@ DEFAULT_EXPERIMENTAL_FEATURES: dict[str, Any] = {
         "exp_edge_legacy_evidence_signed_modernnorm": "eel",
         "exp_resid3_height_noise_z": "erhnz",
         "exp_raw_pce_none": "erpn",
+        "d3rawM": "d3rawM",
+        "d3rawS": "d3rawS",
+        "d3gradM": "d3gradM",
+        "d3gradS": "d3gradS",
     },
 }
 

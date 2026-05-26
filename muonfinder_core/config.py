@@ -129,6 +129,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "exp_raw_pce_savgol5",
             "exp_resid3_pce",
             "exp_resid3_height_noise_z",
+            "d3rawM",
+            "d3rawS",
+            "d3gradM",
+            "d3gradS",
             "exp_resid3_above_3noise",
             "exp_edge_percent_0_90",
             "exp_edge_noise_from_0",
@@ -184,24 +188,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "ss6_eel": "eel",
             "ss6_edge": "edge",
         },
+        "write_pce_metric_audit": False,
     },
     "despike": {
         "enabled": False,
         "source": "ss6",
         "corrected_path": "outputs_core/despike_corrected.npz",
         "debug_path": "outputs_core/despike_debug.csv",
+        "attempts_path": "outputs_core/despike_attempts.csv",
         "summary_path": "outputs_core/despike_summary.json",
-        "method": "morph_contact_cells",
-        "morph_windows": [3, 5],
-        "max_iterations": 4,
-        "max_cell_width_pts": 10,
-        "max_half_width_pts": 5,
-        "min_height_above_chord_noise_z": 3.0,
-        "anchor_overshoot_noise_factor": 0.5,
-        "allow_spectrum_edge_anchors": False,
-        "recheck_enabled": True,
-        "recheck_context_pad_pts": 3,
-        "skip_overlapping_corrections": True,
+        "morph_window": 3,
+        "despike_context_window_pad": 0,
+        "noise_height_factor": 3.0,
+        "max_iterations": 1000,
     },
     "ss4": {
         "ss_blue_max": 0.95,
@@ -304,7 +303,7 @@ def _resolve_path_values(cfg: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             continue
         repo_candidate = (repo_root / path).resolve()
         ss6[key] = str(repo_candidate if repo_candidate.exists() else candidate)
-    for key in ("corrected_path", "debug_path", "summary_path"):
+    for key in ("corrected_path", "debug_path", "attempts_path", "summary_path"):
         value = despike.get(key)
         if value in (None, "") or not isinstance(value, str):
             continue

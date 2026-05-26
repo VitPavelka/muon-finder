@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from collections import Counter
 from pathlib import Path
@@ -88,6 +89,92 @@ def _experimental_refresh_decision(
     return False, "fresh"
 
 
+def _missing_required_experimental_columns(path: Path, required_columns: list[str]) -> list[str]:
+    if not path.exists():
+        return list(required_columns)
+    rows, columns = load_extra_feature_rows(path)
+    _ = rows
+    present = set(columns)
+    return [col for col in required_columns if col not in present]
+
+
+def _pce_debug_chosen_value(row: dict[str, Any]) -> float:
+    direct = _safe_float(row.get("pce_t098_chosen_value", np.nan))
+    if np.isfinite(direct):
+        return direct
+    debug = row.get("pce_t98_debug", {})
+    if isinstance(debug, dict):
+        return _safe_float(debug.get("chosen_value", np.nan))
+    return float("nan")
+
+
+def _write_pce_audit(
+    *,
+    rows: list[dict[str, Any]],
+    outputs: list[dict[str, Any]],
+    ss6_cfg: dict[str, Any],
+    out_path: Path,
+) -> tuple[int, int]:
+    pce_field = str(ss6_cfg.get("metric_names", {}).get("pce", "pce_negpref_t098_evidence_signed")).strip() or "pce_negpref_t098_evidence_signed"
+    fieldnames = [
+        "source_y",
+        "source_x",
+        "compact_y",
+        "compact_x",
+        "peak_index",
+        "candidate_id",
+        "pce_debug_chosen_value",
+        "configured_pce_field",
+        "configured_pce_value",
+        "ss6_pce",
+        "pce_annotation_value",
+        "mismatch_type",
+    ]
+    audit_rows: list[dict[str, Any]] = []
+    audited = 0
+    for row, out in zip(rows, outputs):
+        configured_value = _safe_float(row.get(pce_field, np.nan))
+        ss6_pce = _safe_float(out.get("ss6_pce", np.nan))
+        if not np.isfinite(ss6_pce):
+            continue
+        audited += 1
+        debug_chosen = _pce_debug_chosen_value(row)
+        mismatch_types: list[str] = []
+        if not np.isfinite(configured_value):
+            mismatch_types.append("configured_field_missing")
+        elif abs(configured_value - ss6_pce) > 1e-12:
+            mismatch_types.append("configured_vs_ss6")
+        if np.isfinite(debug_chosen) and np.isfinite(configured_value):
+            if debug_chosen < 0.0 < configured_value:
+                mismatch_types.append("raw_negative_vs_configured_positive")
+            elif debug_chosen > 0.0 > configured_value:
+                mismatch_types.append("raw_positive_vs_configured_negative")
+        if mismatch_types:
+            audit_rows.append(
+                {
+                    "source_y": int(row.get("source_y", row.get("y", -1))),
+                    "source_x": int(row.get("source_x", row.get("x", -1))),
+                    "compact_y": int(row.get("y", -1)),
+                    "compact_x": int(row.get("x", -1)),
+                    "peak_index": int(row.get("peak_index", -1)),
+                    "candidate_id": row.get("candidate_id", ""),
+                    "pce_debug_chosen_value": debug_chosen,
+                    "configured_pce_field": pce_field,
+                    "configured_pce_value": configured_value,
+                    "ss6_pce": ss6_pce,
+                    "pce_annotation_value": configured_value,
+                    "mismatch_type": "|".join(mismatch_types),
+                }
+            )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for audit_row in audit_rows:
+            writer.writerow(audit_row)
+    return audited, len(audit_rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute experimental SS6 rule-based decisions from viewer cache and experimental features.")
     parser.add_argument("--config", type=Path, default=Path("config_core.json"), help="Core config; used to resolve viewer_cache_path, experimental features, and SS6 output paths.")
@@ -122,6 +209,14 @@ def main() -> None:
         force_experimental=bool(args.force_experimental_recompute),
         skip_experimental_recompute=bool(args.no_experimental_recompute),
     )
+    required_exp_columns = ["d3rawM", "d3rawS", "d3gradM", "d3gradS"]
+    if not recompute_exp:
+        missing_exp_cols = _missing_required_experimental_columns(exp_path, required_exp_columns)
+        if missing_exp_cols:
+            if bool(args.no_experimental_recompute):
+                raise ValueError(f"Experimental features CSV missing required columns: {missing_exp_cols}")
+            recompute_exp = True
+            recompute_reason = "missing_required_d3_columns"
     stage_t0 = time.perf_counter()
     print("load viewer cache...")
     cache = load_viewer_cache(cache_path)
@@ -194,6 +289,13 @@ def main() -> None:
     )
     accepted = sum(int(row.get("ss6_accept", 0)) == 1 for row in outputs)
     timings["write outputs"] = time.perf_counter() - stage_t0
+    audited_count = 0
+    mismatch_count = 0
+    audit_path = out_path.with_name("pce_metric_audit.csv")
+    if bool(ss6_cfg.get("write_pce_metric_audit", False)):
+        audited_count, mismatch_count = _write_pce_audit(rows=rows, outputs=outputs, ss6_cfg=ss6_cfg, out_path=audit_path)
+    elif audit_path.exists():
+        audit_path.unlink()
 
     save_histograms = bool(ss6_cfg.get("save_histograms", True)) and not bool(args.no_histograms)
     stage_t0 = time.perf_counter()
@@ -245,6 +347,9 @@ def main() -> None:
         "extra_feature_join_info": join_info,
         "histograms_dir": str(ss6_cfg.get("histograms_dir", "")),
         "generated_histogram_files": generated_hist_files,
+        "pce_metric_audit_path": (str(audit_path) if bool(ss6_cfg.get("write_pce_metric_audit", False)) else ""),
+        "pce_metric_audited_rows": int(audited_count),
+        "pce_metric_mismatches": int(mismatch_count),
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     stage_t0 = time.perf_counter()
@@ -257,6 +362,11 @@ def main() -> None:
     print(f"ss6 decisions rows: {len(outputs)}")
     print(f"ss6 accepted: {accepted}")
     print(f"ss6 rejected: {len(outputs) - accepted}")
+    if bool(ss6_cfg.get("write_pce_metric_audit", False)):
+        print(f"pce metric audit: {audited_count} audited, {mismatch_count} mismatches")
+        print(f"pce metric audit csv: {audit_path}")
+    else:
+        print("pce metric audit: disabled")
     if generated_hist_files:
         print(f"ss6 histogram files: {len(generated_hist_files)}")
     print(f"ss6 output: {out_path}")

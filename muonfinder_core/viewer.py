@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Any
+import json
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
@@ -21,7 +22,7 @@ if __package__ in {None, ""}:
     from muonfinder_core.cap_metrics import join_extra_feature_rows, load_extra_feature_rows
     from muonfinder_core.cache import load_viewer_cache
     from muonfinder_core.config import load_config
-    from muonfinder_core.despike import load_despike_bundle
+    from muonfinder_core.despike import get_contact_context_bounds, load_despike_bundle
     from muonfinder_core.metrics import EDGE_ALL_LEVELS_ASC, EDGE_DENSE_LEVELS_ASC
     from muonfinder_core.plotting import candidate_status_color
     from muonfinder_core.ss6_decision import SS6_BRANCH_DEFINITIONS, SS6_KNOWN_BRANCHES
@@ -30,7 +31,7 @@ else:
     from .cap_metrics import join_extra_feature_rows, load_extra_feature_rows
     from .cache import load_viewer_cache
     from .config import load_config
-    from .despike import load_despike_bundle
+    from .despike import get_contact_context_bounds, load_despike_bundle
     from .metrics import EDGE_ALL_LEVELS_ASC, EDGE_DENSE_LEVELS_ASC
     from .plotting import candidate_status_color
     from .ss6_decision import SS6_BRANCH_DEFINITIONS, SS6_KNOWN_BRANCHES
@@ -56,6 +57,7 @@ CHECKBOX_ORDER = [
     "dilation contacts",
     "erosion contacts",
     "despike chords",
+    "despike metrics",
     "noise filter",
     "Experimental metrics",
     "metrics",
@@ -110,6 +112,10 @@ def _experimental_metric_label(column: str, aliases: dict[str, str]) -> str:
     alias = str(aliases.get(column, "")).strip()
     if alias:
         return alias
+    if column in {"d3rawM", "d3rawS", "d3gradM", "d3gradS"}:
+        return column
+    if "_" not in str(column) and len(str(column)) <= 12:
+        return str(column)
     parts = [part for part in str(column).strip().split("_") if part]
     acronym = ""
     for part in parts:
@@ -132,6 +138,26 @@ def _experimental_metric_text(row: dict[str, Any], column: str) -> str | None:
         return None
     text = str(raw).strip()
     return text if text else None
+
+
+def metric_bool(row: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = row.get(key)
+    if isinstance(value, bool):
+        return bool(value)
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "nan", "none", "null"}:
+            return bool(default)
+        if text in {"1", "true", "yes"}:
+            return True
+        if text in {"0", "false", "no"}:
+            return False
+    numeric = metric_float(row, key)
+    if not np.isfinite(numeric):
+        return bool(default)
+    return int(numeric) == 1
 
 
 def _viewer_active_decision(row: dict[str, Any], active_profile: str) -> tuple[str, str]:
@@ -190,10 +216,12 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     small_rows = [dict(row) for row in cache.get("small_morphology", [])]
     overlays = cache.get("overlays", {})
     chords = [dict(row) for row in cache.get("despike_chords", [])]
+    despike_attempts: list[dict[str, Any]] = []
     active_profile = str(getattr(cfg, "decision_profile", metadata.get("decision_profile", "ss4"))).strip().lower()
     viewer_cfg = dict(getattr(cfg, "viewer", {}) if cfg is not None else {})
     experimental_cfg = dict(getattr(cfg, "experimental_features", {}) if cfg is not None else {})
     ss6_cfg = dict(getattr(cfg, "ss6", {}) if cfg is not None else {})
+    ss6_metric_names = dict(ss6_cfg.get("metric_names", {}))
     despike_cfg = dict(getattr(cfg, "despike", {}) if cfg is not None else {})
     experimental_columns = [str(col) for col in experimental_cfg.get("viewer_columns", []) if str(col).strip()]
     ss6_columns = [str(col) for col in ss6_cfg.get("viewer_columns", []) if str(col).strip()]
@@ -266,8 +294,10 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             despike_bundle = load_despike_bundle(despike_path)
             corrected = np.asarray(despike_bundle.get("corrected_spectra", corrected), dtype=float)
             chords = [dict(row) for row in despike_bundle.get("despike_chords", [])] or chords
+            despike_attempts = [dict(row) for row in despike_bundle.get("despike_attempt_rows", [])]
             print(f"despike corrected path: {despike_path}")
             print(f"despike chords loaded: {len(chords)}")
+            print(f"despike attempts loaded: {len(despike_attempts)}")
         else:
             print("despike corrected file not found. Run compute_despike first.")
     morph_windows = sorted(int(v) for v in metadata.get("morphology_windows", sorted(overlays.get("dilation", {}).keys())))
@@ -315,6 +345,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     current = {"y": 0, "x": 0, "morph_idx": 0, "chord_idx": 0}
     frozen = {"state": False}
     spectrum_home = {"xlim": None, "ylim": None}
+    preserve_spec_limits = {"state": False}
     if H > 1 or W > 1:
         iy, ix = np.unravel_index(int(np.nanargmax(score_map)), score_map.shape)
         current["y"] = int(iy)
@@ -383,17 +414,37 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             if int(chord.get("y", -1)) == int(current["y"]) and int(chord.get("x", -1)) == int(current["x"])
         ]
 
-    def current_chord_index() -> int:
-        spectrum_chords = current_spectrum_chords()
-        if not spectrum_chords:
-            return 0
-        return int(current["chord_idx"] % len(spectrum_chords))
+    def current_spectrum_attempts() -> list[dict[str, Any]]:
+        rows = [
+            dict(item)
+            for item in despike_attempts
+            if int(item.get("compact_y", -1)) == int(current["y"]) and int(item.get("compact_x", -1)) == int(current["x"])
+        ]
+        active = [
+            row
+            for row in rows
+            if str(row.get("status", "")).strip() != "no_local_ss6_positive_candidate_remaining_in_any_context"
+        ]
+        active.sort(
+            key=lambda item: (
+                int(item.get("stage_index", 0) or 0),
+                int(item.get("attempt_index_within_stage", 0) or 0),
+                int(item.get("detected_peak_index", -1) or -1),
+            )
+        )
+        return active
 
-    def current_chord() -> dict[str, Any] | None:
-        spectrum_chords = current_spectrum_chords()
-        if not spectrum_chords:
+    def current_attempt_index() -> int:
+        spectrum_attempts = current_spectrum_attempts()
+        if not spectrum_attempts:
+            return 0
+        return int(current["chord_idx"] % len(spectrum_attempts))
+
+    def current_attempt() -> dict[str, Any] | None:
+        spectrum_attempts = current_spectrum_attempts()
+        if not spectrum_attempts:
             return None
-        return spectrum_chords[current_chord_index()]
+        return spectrum_attempts[current_attempt_index()]
 
     map_im = ax_map.imshow(score_map, cmap="viridis", origin="upper", interpolation="nearest", vmin=map_vmin, vmax=map_vmax)
     located_scatter = ax_map.scatter([], [], s=26, c="#d62728", marker="s", linewidths=0.0, alpha=0.90)
@@ -524,13 +575,15 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     def _set_suptitle() -> None:
         compact = (int(current["y"]), int(current["x"]))
         source = coord_map.get(compact, compact)
-        spectrum_chords = current_spectrum_chords()
-        chord_count = len(spectrum_chords)
-        chord_index = current_chord_index() + 1 if chord_count else 0
+        spectrum_attempts = current_spectrum_attempts()
+        attempt = current_attempt()
+        attempt_count = len(spectrum_attempts)
+        attempt_index = current_attempt_index() + 1 if attempt_count else 0
+        attempt_window = int(despike_cfg.get("morph_window", 3))
         fig.suptitle(
             f"spectrum @ compact(y={compact[0]}, x={compact[1]}) -> "
             f"source(y={source[0]}, x={source[1]}) | "
-            f"despike chord {chord_index}/{chord_count} (a/x) | morph window {current_window()} (z/c)",
+            f"despike attempt {attempt_index}/{attempt_count} (a/x) | morph window {attempt_window}",
             fontsize=13,
             fontweight="bold",
             y=0.965,
@@ -586,10 +639,9 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             return int(left), int(right)
         return int(row.get("start", 0)), int(row.get("end", 0))
 
-    def _contact_context_bounds(row: dict[str, Any], pad: int = 4) -> tuple[int, int]:
-        left = max(0, int(row.get("start", 0)) - int(pad))
-        right = min(len(x_axis) - 1, int(row.get("end", 0)) + int(pad))
-        return left, right
+    def _contact_context_bounds(row: dict[str, Any], pad: int | None = None) -> tuple[int, int]:
+        use_pad = int(despike_cfg.get("despike_context_window_pad", 0) if pad is None else pad)
+        return get_contact_context_bounds(row, len(x_axis), pad=use_pad)
 
     def _draw_pce_overlay(rows: list[dict[str, Any]]) -> None:
         legend_handles: list[Any] = []
@@ -857,12 +909,29 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
 
     def _draw_contacts(rows: list[dict[str, Any]], indices: list[int], marker: str, color: str, size: float) -> None:
         points: set[int] = set()
-        for row in rows:
-            left, right = _contact_context_bounds(row)
-            for idx in indices:
-                ii = int(idx)
-                if left <= ii <= right:
-                    points.add(ii)
+        attempt = current_attempt()
+        if attempt is not None:
+            field = "context_dilation_contacts" if marker == "^" else "context_erosion_contacts"
+            raw_points = attempt.get(field, "")
+            parsed: list[int] = []
+            if isinstance(raw_points, str) and raw_points.strip():
+                try:
+                    parsed = [int(v) for v in json.loads(raw_points)]
+                except Exception:
+                    parsed = []
+            for ii in parsed:
+                if 0 <= int(ii) < len(x_axis):
+                    points.add(int(ii))
+        else:
+            rows = [row for row in rows if _viewer_active_decision(row, active_profile)[0] == "spike"]
+            for row in rows:
+                if str(row.get("candidate_noise_prefilter_status", "")).strip() == "rejected_noise":
+                    continue
+                left, right = _contact_context_bounds(row)
+                for idx in indices:
+                    ii = int(idx)
+                    if left <= ii <= right:
+                        points.add(ii)
         for idx in sorted(points):
             ax_spec.plot([x_axis[idx]], [raw_sig[idx]], marker=marker, color=color, markersize=size, linestyle="None")
 
@@ -911,9 +980,8 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             if not (0 <= peak < len(raw_sig)):
                 continue
             ss1 = metric_float(row, "spike_score_v1")
-            pce = metric_float(row, "pce_negpref_t098_evidence_signed")
-            if not np.isfinite(pce):
-                pce = metric_float(row, "pce")
+            pce_field = str(ss6_metric_names.get("pce", "pce_negpref_t098_evidence_signed")).strip() or "pce_negpref_t098_evidence_signed"
+            pce = metric_float(row, pce_field)
             edge = metric_float(row, "recdw_sum_0_90_raman_veto_evidence_signed")
             finite_parts: list[str] = []
             if np.isfinite(ss1):
@@ -1052,7 +1120,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "#555555", "linewidth": 0.8},
         )
 
-    def _contact_context_spans(rows: list[dict[str, Any]], pad: int = 4) -> list[tuple[int, int]]:
+    def _contact_context_spans(rows: list[dict[str, Any]], pad: int | None = None) -> list[tuple[int, int]]:
         spans: list[tuple[int, int]] = []
         for row in rows:
             left, right = _contact_context_bounds(row, pad=pad)
@@ -1090,10 +1158,83 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             bbox={"facecolor": "white", "alpha": 0.76, "edgecolor": "#666666", "linewidth": 0.8},
         )
 
+    def _draw_despike_metrics_box(attempt: dict[str, Any] | None) -> None:
+        if not states["despike metrics"] or attempt is None:
+            return
+        detected_peak = int(attempt.get("detected_peak_index", -1) or -1)
+        peak_pos = _x_from_index(x_axis, detected_peak) if detected_peak >= 0 else float("nan")
+        lines = []
+        if np.isfinite(peak_pos):
+            lines.append(f"peak {peak_pos:.1f}")
+        original_branch = str(attempt.get("original_ss6_branch", "")).strip()
+        local_branch = str(attempt.get("local_ss6_branch", attempt.get("ss6_local_branch", ""))).strip()
+        attempt_type = str(attempt.get("attempt_type", "")).strip()
+        if attempt_type == "parent":
+            if original_branch:
+                lines.append(f"ss6 {original_branch}")
+        elif attempt_type == "mask_cleanup":
+            lines.append("mask cleanup")
+        else:
+            if local_branch:
+                lines.append(f"local ss6 {local_branch}")
+        for key in ("ss1", "pce", "edge", "eel", "resid"):
+            val = metric_float(attempt, key)
+            if np.isfinite(val):
+                lines.append(f"{key}={val:.3g}")
+        status = str(attempt.get("status", "")).strip()
+        if status:
+            if status == "corrected_parent":
+                lines.append("corrected")
+            elif status == "corrected_iterative_local_ss6":
+                lines.append("corrected iterative")
+            elif status == "corrected_mask_residual_cleanup":
+                overlap = metric_float(attempt, "corrected_mask_overlap_fraction")
+                hchord = metric_float(attempt, "height_above_chord_noise_z")
+                if np.isfinite(hchord):
+                    lines.append(f"hchord={hchord:.3g}")
+                if np.isfinite(overlap):
+                    lines.append(f"overlap={overlap:.2f}")
+                lines.append("corrected")
+            elif status == "rejected_by_despike_noise_height":
+                lines.append("rejected: noise height")
+                hchord = metric_float(attempt, "height_above_chord_noise_z")
+                if np.isfinite(hchord):
+                    lines.append(f"hchord={hchord:.3g}")
+            elif status == "rejected_mask_residual_below_noise_height":
+                lines.append("rejected: mask residual")
+                hchord = metric_float(attempt, "height_above_chord_noise_z")
+                overlap = metric_float(attempt, "corrected_mask_overlap_fraction")
+                if np.isfinite(hchord):
+                    lines.append(f"hchord={hchord:.3g}")
+                if np.isfinite(overlap):
+                    lines.append(f"overlap={overlap:.2f}")
+            elif status == "local_missing_metric":
+                missing = str(attempt.get("skipped_reason", "")).strip()
+                lines.append(f"missing: {missing}" if missing else "missing metric")
+            elif status.startswith("skipped_"):
+                lines.append(f"skipped: {status.removeprefix('skipped_').replace('_', ' ')}")
+            else:
+                lines.append(status.replace("_", " "))
+        if metric_bool(attempt, "chord_support_adjustment_applied"):
+            lines.append("support adjusted")
+        ax_spec.text(
+            0.015,
+            0.86,
+            "\n".join(lines),
+            transform=ax_spec.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8.6,
+            family="monospace",
+            bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "#17becf", "linewidth": 0.8},
+        )
+
     raw_sig = np.asarray(spectra[current["y"], current["x"], :], dtype=float)
 
     def _draw_spectrum() -> None:
         nonlocal raw_sig
+        prev_xlim = ax_spec.get_xlim() if preserve_spec_limits["state"] else None
+        prev_ylim = ax_spec.get_ylim() if preserve_spec_limits["state"] else None
         ax_spec.clear()
         ax_spec._pce_legend_handles = []  # type: ignore[attr-defined]
         ax_spec._pce_legend_labels = []  # type: ignore[attr-defined]
@@ -1134,7 +1275,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
 
         morph_row = small_by_pixel.get((int(current["y"]), int(current["x"])), {})
         if states["dilation contacts"] or states["erosion contacts"]:
-            for left, right in _contact_context_spans(rows, pad=4):
+            for left, right in _contact_context_spans(rows):
                 li = max(0, min(int(left), len(x_axis) - 1))
                 ri = max(0, min(int(right), len(x_axis) - 1))
                 if ri >= li:
@@ -1179,13 +1320,65 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             _draw_contacts(rows, morph_row.get("erosion_contacts", []), "o", "#111111", 7.5)
 
         if states["despike chords"]:
-            chord = current_chord()
-            if chord is not None:
-                li = int(chord["left"])
-                ri = int(chord["right"])
-                ax_spec.plot([x_axis[li], x_axis[ri]], [float(chord["y_left"]), float(chord["y_right"])], color="#17becf", linewidth=1.9, label="despike chord")
-                ax_spec.plot([x_axis[li]], [float(chord["y_left"])], marker="o", color="#17becf", markersize=5.5, linestyle="None")
-                ax_spec.plot([x_axis[ri]], [float(chord["y_right"])], marker="o", color="#17becf", markersize=5.5, linestyle="None")
+            attempt = current_attempt()
+            if attempt is not None:
+                ctx_left = attempt.get("fixed_context_left", "")
+                if ctx_left == "":
+                    ctx_left = attempt.get("context_left", "")
+                ctx_right = attempt.get("fixed_context_right", "")
+                if ctx_right == "":
+                    ctx_right = attempt.get("context_right", "")
+                cell_left = attempt.get("cell_left", attempt.get("tested_left", ""))
+                cell_right = attempt.get("cell_right", attempt.get("tested_right", ""))
+                left_anchor = attempt.get("left_anchor", attempt.get("left_erosion_contact", ""))
+                right_anchor = attempt.get("right_anchor", attempt.get("right_erosion_contact", ""))
+                detected_peak = attempt.get("detected_peak_index", attempt.get("dilation_contact", ""))
+                status = str(attempt.get("status", ""))
+                if ctx_left != "" and ctx_right != "":
+                    pli = int(ctx_left)
+                    pri = int(ctx_right)
+                    if 0 <= pli < len(x_axis) and 0 <= pri < len(x_axis) and pri >= pli:
+                        ax_spec.axvspan(x_axis[pli], x_axis[pri], color="#bdbdbd", alpha=0.10)
+                try:
+                    context_eros = [int(v) for v in json.loads(str(attempt.get("context_erosion_contacts", "[]")))]
+                except Exception:
+                    context_eros = []
+                try:
+                    context_dils = [int(v) for v in json.loads(str(attempt.get("context_dilation_contacts", "[]")))]
+                except Exception:
+                    context_dils = []
+                if context_dils:
+                    pts = [idx for idx in context_dils if 0 <= idx < len(x_axis)]
+                    if pts:
+                        ax_spec.scatter(x_axis[pts], raw_sig[pts], marker="^", s=34, c="#ff7f0e", alpha=0.8, zorder=4)
+                if context_eros:
+                    pts = [idx for idx in context_eros if 0 <= idx < len(x_axis)]
+                    if pts:
+                        ax_spec.scatter(x_axis[pts], raw_sig[pts], marker="o", s=22, c="#111111", alpha=0.75, zorder=4)
+                if cell_left != "" and cell_right != "":
+                    tli = int(cell_left)
+                    tri = int(cell_right)
+                    if 0 <= tli < len(x_axis) and 0 <= tri < len(x_axis) and tri >= tli:
+                        ax_spec.axvspan(x_axis[tli], x_axis[tri], color="#17becf", alpha=0.14)
+                if detected_peak != "":
+                    dpi = int(detected_peak)
+                    if 0 <= dpi < len(x_axis):
+                        ax_spec.plot([x_axis[dpi]], [raw_sig[dpi]], marker="x", color="#d62728", markersize=7.0, linestyle="None")
+                if left_anchor != "" and right_anchor != "":
+                    li = int(left_anchor)
+                    ri = int(right_anchor)
+                    if 0 <= li < len(x_axis) and 0 <= ri < len(x_axis) and ri > li:
+                        if status.startswith("corrected_"):
+                            yl = float(raw_sig[li])
+                            yr = float(raw_sig[ri])
+                            ax_spec.plot([x_axis[li], x_axis[ri]], [yl, yr], color="#17becf", linewidth=1.9, label="despike chord")
+                        else:
+                            yl = float(raw_sig[li])
+                            yr = float(raw_sig[ri])
+                            ax_spec.plot([x_axis[li], x_axis[ri]], [yl, yr], color="#17becf", linewidth=1.2, linestyle="--", alpha=0.85, label="tested chord")
+                        ax_spec.plot([x_axis[li]], [yl], marker="o", color="#17becf", markersize=5.5, linestyle="None")
+                        ax_spec.plot([x_axis[ri]], [yr], marker="o", color="#17becf", markersize=5.5, linestyle="None")
+        _draw_despike_metrics_box(current_attempt())
 
         ax_spec.set_xlabel("wavenumber", fontsize=11)
         ax_spec.set_ylabel("intensity", fontsize=11)
@@ -1201,8 +1394,12 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         y_span = max(1e-9, float(ylim[1] - ylim[0]))
         spectrum_home["xlim"] = xlim
         spectrum_home["ylim"] = (float(ylim[0] - 0.03 * y_span), float(ylim[1] + 0.18 * y_span))
-        ax_spec.set_xlim(*spectrum_home["xlim"])
-        ax_spec.set_ylim(*spectrum_home["ylim"])
+        if preserve_spec_limits["state"] and prev_xlim is not None and prev_ylim is not None:
+            ax_spec.set_xlim(*prev_xlim)
+            ax_spec.set_ylim(*prev_ylim)
+        else:
+            ax_spec.set_xlim(*spectrum_home["xlim"])
+            ax_spec.set_ylim(*spectrum_home["ylim"])
         if states["noise filter"]:
             _draw_noise_filter(rows, raw_sig)
         if states["metrics"]:
@@ -1225,11 +1422,13 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         _update_map_artists()
         _draw_spectrum()
         _set_suptitle()
+        preserve_spec_limits["state"] = False
         fig.canvas.draw_idle()
 
     def on_toggle(label: str) -> None:
         state_key = display_to_state.get(str(label), str(label))
         states[state_key] = not states[state_key]
+        preserve_spec_limits["state"] = True
         update()
 
     for chk in checks:
@@ -1262,24 +1461,18 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
 
     def on_key(event) -> None:
         key = str(event.key).lower()
-        if key == "z":
-            current["morph_idx"] = (current["morph_idx"] - 1) % len(morph_windows)
-            update()
-            return
-        if key == "c":
-            current["morph_idx"] = (current["morph_idx"] + 1) % len(morph_windows)
-            update()
-            return
         if key == "a":
-            spectrum_chords = current_spectrum_chords()
-            if spectrum_chords:
-                current["chord_idx"] = (current_chord_index() - 1) % len(spectrum_chords)
+            spectrum_attempts = current_spectrum_attempts()
+            if spectrum_attempts:
+                current["chord_idx"] = (current_attempt_index() - 1) % len(spectrum_attempts)
+                preserve_spec_limits["state"] = True
             update()
             return
         if key == "x":
-            spectrum_chords = current_spectrum_chords()
-            if spectrum_chords:
-                current["chord_idx"] = (current_chord_index() + 1) % len(spectrum_chords)
+            spectrum_attempts = current_spectrum_attempts()
+            if spectrum_attempts:
+                current["chord_idx"] = (current_attempt_index() + 1) % len(spectrum_attempts)
+                preserve_spec_limits["state"] = True
             update()
             return
         if key == "home":

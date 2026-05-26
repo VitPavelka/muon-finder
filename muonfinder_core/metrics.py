@@ -142,6 +142,7 @@ def compute_ss1_pce_features(
     gradient_signal: np.ndarray | None,
     seg: CandidateSegment,
     feature_signal_source: str,
+    bg_noise_override: float | None = None,
 ) -> dict[str, Any]:
     src = str(feature_signal_source).strip().lower()
     signal = np.asarray(raw_signal, dtype=float) if src == "raw" or gradient_signal is None else np.asarray(gradient_signal, dtype=float)
@@ -154,6 +155,9 @@ def compute_ss1_pce_features(
     out: dict[str, Any] = {
         "spike_score_v1": float("nan"),
         "pce_negpref_t098_evidence_signed": float("nan"),
+        "pce_t098_chosen_value": float("nan"),
+        "pce_t098_chosen_value_z": float("nan"),
+        "pce_t098_evidence_signed": float("nan"),
     }
     if not (a < p < b):
         return out
@@ -165,8 +169,16 @@ def compute_ss1_pce_features(
     fall = d[max(1, p - a) :]
     rise_slope = float(np.nanmax(rise)) if rise.size else 0.0
     fall_slope = float(np.nanmin(fall)) if fall.size else 0.0
-    bg = estimate_bg_noise(signal, a, b)
-    bg_mad = max(float(bg.value), 1e-12)
+    bg_override = float(bg_noise_override) if bg_noise_override is not None else float("nan")
+    if np.isfinite(bg_override) and bg_override > 0.0:
+        bg_mad = max(float(bg_override), 1e-12)
+        out["bg_noise_override_used"] = 1.0
+        out["bg_noise_override_value"] = float(bg_mad)
+    else:
+        bg = estimate_bg_noise(signal, a, b)
+        bg_mad = max(float(bg.value), 1e-12)
+        out["bg_noise_override_used"] = 0.0
+        out["bg_noise_override_value"] = float("nan")
     out["bg_mad"] = float(bg_mad)
     out["rise_slope_z"] = float(rise_slope / bg_mad)
     out["fall_slope_z"] = float(abs(fall_slope) / bg_mad)
@@ -182,9 +194,15 @@ def compute_ss1_pce_features(
         out["pce_negpref_t098_support01"] = float(pce_support01)
         out["pce_negpref_t098_veto01"] = float(pce_veto01)
         out["pce_negpref_t098_evidence_signed"] = float(_signed_evidence(pce_support01, pce_veto01))
+    debug = build_pce_t98_debug(segment, peak_rel=peak_rel)
+    chosen_value = float(debug.get("chosen_value", np.nan)) if isinstance(debug, dict) else float("nan")
+    out["pce_t098_chosen_value"] = float(chosen_value)
+    if np.isfinite(chosen_value) and np.isfinite(bg_mad) and bg_mad > 0.0:
+        out["pce_t098_chosen_value_z"] = float(chosen_value / bg_mad)
+    out["pce_t098_evidence_signed"] = float(out.get("pce_negpref_t098_evidence_signed", np.nan))
     if np.isfinite(float(out.get("pce_negpref_t098_evidence_signed", np.nan))):
         out["pce"] = float(out["pce_negpref_t098_evidence_signed"])
-    out["pce_t98_debug"] = build_pce_t98_debug(segment, peak_rel=peak_rel)
+    out["pce_t98_debug"] = debug
     return out
 
 
