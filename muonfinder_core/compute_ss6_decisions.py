@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 from collections import Counter
+import gc
 from pathlib import Path
 import time
 from typing import Any
@@ -23,7 +24,7 @@ if __package__ in {None, ""}:
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
 
-    from muonfinder_core.cache import load_viewer_cache
+    from muonfinder_core.cache import load_viewer_cache_light
     from muonfinder_core.cap_metrics import join_extra_feature_rows, load_extra_feature_rows
     from muonfinder_core.compute_all_experimental_features import compute_all_experimental_features_from_config
     from muonfinder_core.config import load_config
@@ -31,7 +32,7 @@ if __package__ in {None, ""}:
     from muonfinder_core.ss6_diagnostics import generate_ss6_histograms
     from muonfinder_core.ss6_decision import compute_ss6_row, ss6_defaults
 else:
-    from .cache import load_viewer_cache
+    from .cache import load_viewer_cache_light
     from .cap_metrics import join_extra_feature_rows, load_extra_feature_rows
     from .compute_all_experimental_features import compute_all_experimental_features_from_config
     from .config import load_config
@@ -176,6 +177,43 @@ def _write_pce_audit(
     return audited, len(audit_rows)
 
 
+def _write_ss6_decision_trace(
+    *,
+    rows: list[dict[str, Any]],
+    outputs: list[dict[str, Any]],
+    ss6_cfg: dict[str, Any],
+    out_path: Path,
+) -> None:
+    metric_names = dict(ss6_cfg.get("metric_names", {}))
+    trace_rows: list[dict[str, Any]] = []
+    for row, out in zip(rows, outputs):
+        trace_row: dict[str, Any] = {
+            "source_y": int(row.get("source_y", row.get("y", -1))),
+            "source_x": int(row.get("source_x", row.get("x", -1))),
+            "compact_y": int(row.get("y", -1)),
+            "compact_x": int(row.get("x", -1)),
+            "peak_index": int(row.get("peak_index", -1)),
+            "candidate_id": row.get("candidate_id", ""),
+            "peak_x": _safe_float(row.get("peak_x", np.nan)),
+            "noise_kept": int(str(row.get("candidate_noise_prefilter_status", "")) != "rejected_noise"),
+            "ss6_accept": int(out.get("ss6_accept", 0)),
+            "ss6_branch": str(out.get("ss6_branch", "")),
+            "ss6_reason": str(out.get("ss6_reason", "")),
+            "branch_fired": str(out.get("ss6_branch", "")),
+        }
+        for metric_key in ("ss1", "pce", "edge", "eel", "resid"):
+            source_col = str(metric_names.get(metric_key, "")).strip()
+            value = _safe_float(row.get(source_col, np.nan))
+            trace_row[f"{metric_key}_source_column"] = source_col
+            trace_row[f"{metric_key}_value"] = value
+            trace_row[f"{metric_key}_finite"] = int(np.isfinite(value))
+        for key, value in out.items():
+            if str(key).startswith("ss6_") and str(key).endswith("_flag"):
+                trace_row[str(key)] = value
+        trace_rows.append(trace_row)
+    write_feature_csv(out_path, trace_rows)
+
+
 def run_ss6_decisions(
     *,
     config_path: Path | str,
@@ -219,13 +257,6 @@ def run_ss6_decisions(
                 raise ValueError(f"Experimental features CSV missing required columns: {missing_exp_cols}")
             recompute_exp = True
             recompute_reason = "missing_required_d3_columns"
-    stage_t0 = time.perf_counter()
-    print("load viewer cache...")
-    cache = load_viewer_cache(cache_path)
-    timings["load cache"] = time.perf_counter() - stage_t0
-    rows = [dict(row) for row in cache.get("candidate_records", [])]
-    print(f"candidate records loaded: {len(rows)}")
-
     if recompute_exp:
         if recompute_reason == "missing":
             print("experimental features: recomputing because file missing")
@@ -241,12 +272,21 @@ def run_ss6_decisions(
             summary_path=Path(str(exp_cfg.get("summary_path", ""))) if str(exp_cfg.get("summary_path", "")).strip() else None,
         )
         timings["experimental features"] = time.perf_counter() - stage_t0
+        gc.collect()
     else:
         print("experimental features: loaded existing file")
         timings["experimental features"] = 0.0
 
     if not exp_path.exists():
         raise FileNotFoundError(f"Experimental features CSV not found after refresh step: {exp_path}")
+
+    stage_t0 = time.perf_counter()
+    print("load viewer cache...")
+    cache = load_viewer_cache_light(cache_path, verbose=True)
+    timings["load cache"] = time.perf_counter() - stage_t0
+    rows = [dict(row) for row in cache.get("candidate_records", [])]
+    print(f"candidate records source: {cache.get('candidate_records_source', 'unknown')}")
+    print(f"candidate records loaded: {len(rows)}")
 
     stage_t0 = time.perf_counter()
     print("load existing experimental features...")
@@ -281,6 +321,9 @@ def run_ss6_decisions(
     stage_t0 = time.perf_counter()
     print("write SS6 decisions CSV...")
     write_feature_csv(out_path, outputs)
+    trace_path = out_path.with_name(f"{out_path.stem}_trace.csv")
+    print("write SS6 trace CSV...")
+    _write_ss6_decision_trace(rows=rows, outputs=outputs, ss6_cfg=ss6_cfg, out_path=trace_path)
     print("write SS6 summary JSON...")
     generated_hist_files: list[str] = []
     branch_counts = Counter(str(row.get("ss6_branch", "")) for row in outputs)
@@ -350,6 +393,7 @@ def run_ss6_decisions(
         "histograms_dir": str(ss6_cfg.get("histograms_dir", "")),
         "generated_histogram_files": generated_hist_files,
         "pce_metric_audit_path": (str(audit_path) if bool(ss6_cfg.get("write_pce_metric_audit", False)) else ""),
+        "ss6_decision_trace_path": str(trace_path),
         "pce_metric_audited_rows": int(audited_count),
         "pce_metric_mismatches": int(mismatch_count),
     }
@@ -372,6 +416,7 @@ def run_ss6_decisions(
     if generated_hist_files:
         print(f"ss6 histogram files: {len(generated_hist_files)}")
     print(f"ss6 output: {out_path}")
+    print(f"ss6 trace: {trace_path}")
     print(f"ss6 summary: {summary_path}")
     timings["total"] = time.perf_counter() - t_start
     return summary, timings

@@ -47,6 +47,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "feature_erosion_window": 20,
     },
     "candidates": {
+        "candidate_detection_mode": "default",
         "score_mode": "max",
         "threshold_method": "quantile",
         "threshold_quantile": 0.1,

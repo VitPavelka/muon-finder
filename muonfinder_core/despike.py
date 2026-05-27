@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .cache import load_viewer_cache
+from .cache import load_viewer_cache_light
 from .cap_metrics import join_extra_feature_rows, load_extra_feature_rows
 from .data_model import CandidateSegment, CorrectionResult, DespikeChord, DespikeStage
 from .experimental_common import select_experimental_noise
@@ -205,6 +205,83 @@ def _mask_overlap_fraction(mask: np.ndarray, left: int, right: int) -> tuple[flo
         return 0.0, False, False
     frac = float(np.mean(seg.astype(float)))
     return frac, bool(frac > 0.0), bool(np.all(seg))
+
+
+def _interval_distance(left_a: int, right_a: int, left_b: int, right_b: int) -> int:
+    if int(right_a) < int(left_b):
+        return int(left_b) - int(right_a)
+    if int(right_b) < int(left_a):
+        return int(left_a) - int(right_b)
+    return 0
+
+
+def _mask_intervals(mask: np.ndarray) -> list[tuple[int, int]]:
+    idx = np.flatnonzero(np.asarray(mask, dtype=bool)).astype(int)
+    if idx.size == 0:
+        return []
+    groups = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+    return [(int(group[0]), int(group[-1])) for group in groups if group.size]
+
+
+def _mask_connection_stats(mask: np.ndarray, left: int, right: int, adjacency_pts: int = 1) -> tuple[int, float, int, int, int]:
+    intervals = _mask_intervals(mask)
+    if not intervals:
+        return 0, 0.0, int(10**9), -1, -1
+    li = int(left)
+    ri = int(right)
+    overlap_count = 0
+    overlap_points = 0
+    best_distance = int(10**9)
+    best_left = -1
+    best_right = -1
+    for mi, mj in intervals:
+        ov_left = max(li, int(mi))
+        ov_right = min(ri, int(mj))
+        if ov_right >= ov_left:
+            overlap_count += 1
+            overlap_points += int(ov_right - ov_left + 1)
+        distance = _interval_distance(li, ri, int(mi), int(mj))
+        if distance < best_distance:
+            best_distance = int(distance)
+            best_left = int(mi)
+            best_right = int(mj)
+    width = max(1, ri - li + 1)
+    overlap_fraction = float(overlap_points / width)
+    if best_distance > int(adjacency_pts):
+        return int(overlap_count), float(overlap_fraction), int(best_distance), int(best_left), int(best_right)
+    return int(overlap_count), float(overlap_fraction), int(best_distance), int(best_left), int(best_right)
+
+
+def _residual_components(residual: np.ndarray, offset: int = 0, eps: float = 1e-12) -> list[dict[str, int | float]]:
+    local = np.asarray(residual, dtype=float)
+    if local.size == 0:
+        return []
+    positive = np.flatnonzero(np.isfinite(local) & (local > float(eps))).astype(int)
+    if positive.size == 0:
+        return []
+    groups = np.split(positive, np.where(np.diff(positive) > 1)[0] + 1)
+    out: list[dict[str, int | float]] = []
+    for group in groups:
+        if group.size == 0:
+            continue
+        start_local = int(group[0])
+        end_local = int(group[-1])
+        segment = np.asarray(local[start_local : end_local + 1], dtype=float)
+        if segment.size == 0:
+            continue
+        rel_peak = int(np.nanargmax(segment))
+        start = int(offset + start_local)
+        end = int(offset + end_local)
+        apex = int(start + rel_peak)
+        out.append(
+            {
+                "start": int(start),
+                "end": int(end),
+                "apex": int(apex),
+                "height": float(segment[rel_peak]),
+            }
+        )
+    return out
 
 
 def _signed_edge_evidence_from_width_sum(value: float, center: float, scale: float, ctx: MetricComputationContext) -> float:
@@ -408,6 +485,7 @@ def _local_missing_metrics(local_row: dict[str, Any], ss6_cfg: dict[str, Any]) -
 def compute_despike_from_cache_and_ss6(
     *,
     cache_path: Path,
+    cache: dict[str, Any] | None = None,
     ss6_path: Path,
     corrected_path: Path | None,
     debug_path: Path | None,
@@ -426,7 +504,8 @@ def compute_despike_from_cache_and_ss6(
     config_path: Path | str | None = None,
 ) -> DespikeArtifacts:
     t0 = time.perf_counter()
-    cache = load_viewer_cache(cache_path)
+    if cache is None:
+        cache = load_viewer_cache_light(cache_path, verbose=True)
     if timings_out is not None:
         timings_out["load cache"] = time.perf_counter() - t0
 
@@ -488,8 +567,14 @@ def compute_despike_from_cache_and_ss6(
         "max_pass_index_used": 0,
         "skipped_overlap_duplicate": 0,
         "mask_cleanup_candidates_tested": 0,
+        "mask_intervals_tested": 0,
         "mask_cleanup_corrected": 0,
         "mask_cleanup_rejected_below_noise_height": 0,
+        "mask_cleanup_rejected_boundary_guard": 0,
+        "mask_cleanup_rejected_no_connection": 0,
+        "mask_cleanup_rejected_missing_parent_noise": 0,
+        "mask_cleanup_rejected_unsafe_geometry": 0,
+        "mask_cleanup_rejected_no_meaningful_change": 0,
         "local_candidates_with_parent_noise": 0,
         "local_candidates_with_missing_parent_noise": 0,
         "noise_ratio_values": [],
@@ -497,7 +582,14 @@ def compute_despike_from_cache_and_ss6(
         "replacement_invariant_violations": 0,
     }
 
-    def _apply_plans(stage_index: int, y: int, x: int, plans: list[dict[str, Any]], corrected_mask: np.ndarray) -> int:
+    def _apply_plans(
+        stage_index: int,
+        y: int,
+        x: int,
+        plans: list[dict[str, Any]],
+        corrected_mask: np.ndarray,
+        corrected_interval_records: list[dict[str, Any]],
+    ) -> int:
         applied = 0
         for attempt_index, plan in enumerate(plans, start=1):
             li = int(plan["left_anchor"])
@@ -529,8 +621,13 @@ def compute_despike_from_cache_and_ss6(
                 out["stage_index"] = int(stage_index)
                 out["attempt_index_within_stage"] = int(attempt_index)
                 out["correction_applied"] = 0
-                out["status"] = "stopped_no_meaningful_change"
-                out["skipped_reason"] = "no_meaningful_change"
+                if str(out.get("attempt_kind", out.get("attempt_type", ""))) == "mask_connected_contact_cleanup":
+                    out["status"] = "rejected_mask_no_meaningful_change"
+                    out["skipped_reason"] = "no_meaningful_change"
+                    summary_counts["mask_cleanup_rejected_no_meaningful_change"] += 1
+                else:
+                    out["status"] = "stopped_no_meaningful_change"
+                    out["skipped_reason"] = "no_meaningful_change"
                 out["raw_peak_value_before"] = float(current_signal[int(plan["detected_peak_index"])])
                 out["corrected_peak_value_after"] = float(current_signal[int(plan["detected_peak_index"])])
                 out["correction_height"] = 0.0
@@ -550,6 +647,17 @@ def compute_despike_from_cache_and_ss6(
             applied += 1
             summary_counts["total_corrections_applied"] += 1
             corrected_mask[li : ri + 1] = True
+            corrected_interval_records.append(
+                {
+                    "left": int(li),
+                    "right": int(ri),
+                    "parent_noise_value": _safe_float(plan.get("parent_noise_value", plan.get("noise_value", np.nan))),
+                    "parent_noise_source": str(plan.get("parent_noise_source", "")),
+                    "candidate_id": str(plan.get("candidate_id", "")),
+                    "attempt_kind": str(plan.get("attempt_kind", plan.get("attempt_type", ""))),
+                    "status": str(plan.get("status", "")),
+                }
+            )
             chords.append(
                 DespikeChord(
                     chord_id=f"despike:{y}:{x}:{stage_index}:{attempt_index}:{li}:{ri}",
@@ -566,13 +674,16 @@ def compute_despike_from_cache_and_ss6(
             out = dict(plan)
             out["stage_index"] = int(stage_index)
             out["attempt_index_within_stage"] = int(attempt_index)
+            out["attempt_kind"] = str(out.get("attempt_kind", out.get("attempt_type", "")))
             out["correction_applied"] = 1
+            out["corrected"] = 1
             out["raw_peak_value_before"] = raw_peak_value_before
             out["corrected_peak_value_after"] = corrected_peak_value_after
             out["correction_height"] = correction_height
             out["chord_crossing_detected"] = int(crossing_detected)
             out["chord_crossing_max"] = float(max_overshoot)
             out["chord_support_adjustment_applied"] = int(support_adjusted)
+            out["support_adjustment_applied"] = int(support_adjusted)
             out["replacement_increases_signal_max"] = float(replacement_increase)
             out["skipped_reason"] = ""
             attempt_rows.append(out)
@@ -586,6 +697,7 @@ def compute_despike_from_cache_and_ss6(
         contexts: list[dict[str, Any]] = []
         spectrum_corrections = 0
         corrected_mask = np.zeros(len(current_signal), dtype=bool)
+        corrected_interval_records: list[dict[str, Any]] = []
 
         for row in pixel_rows:
             peak_idx = int(row.get("peak_index", -1))
@@ -756,6 +868,8 @@ def compute_despike_from_cache_and_ss6(
                         "height_above_chord": float(height_above_chord),
                         "height_above_chord_noise_z": float(height_z),
                         "noise_value": float(noise_value),
+                        "parent_noise_value": float(context["parent_noise_value"]),
+                        "parent_noise_source": str(context["parent_noise_source"]),
                         "chord_crossing_detected": 0,
                         "chord_crossing_max": 0.0,
                         "chord_support_adjustment_applied": 0,
@@ -822,6 +936,8 @@ def compute_despike_from_cache_and_ss6(
                     "height_above_chord": float(height_above_chord),
                     "height_above_chord_noise_z": float(height_z),
                     "noise_value": float(noise_value),
+                    "parent_noise_value": float(context["parent_noise_value"]),
+                    "parent_noise_source": str(context["parent_noise_source"]),
                     "status": "corrected_parent",
                     "score": float(height_z),
                     "ss1": _safe_float(context["row"].get("ss6_ss1")),
@@ -838,7 +954,7 @@ def compute_despike_from_cache_and_ss6(
             item["stage_index"] = 0
             item["attempt_index_within_stage"] = ""
             attempt_rows.append(item)
-        spectrum_corrections += _apply_plans(0, int(y), int(x), kept_parent, corrected_mask)
+        spectrum_corrections += _apply_plans(0, int(y), int(x), kept_parent, corrected_mask, corrected_interval_records)
         summary_counts["parent_corrected"] += len(kept_parent)
 
         max_pass_index = 0
@@ -1203,148 +1319,197 @@ def compute_despike_from_cache_and_ss6(
                 item["stage_index"] = int(pass_index)
                 item["attempt_index_within_stage"] = ""
                 attempt_rows.append(item)
-            applied_local = _apply_plans(int(pass_index), int(y), int(x), kept_local, corrected_mask)
+            applied_local = _apply_plans(int(pass_index), int(y), int(x), kept_local, corrected_mask, corrected_interval_records)
             spectrum_corrections += int(applied_local)
             summary_counts["local_candidates_corrected"] += int(applied_local)
             if applied_local > 0:
                 max_pass_index = int(pass_index)
 
-        current_signal = np.asarray(corrected[y, x, :], dtype=float)
-        _erosion, _dilation, erosion_contacts, dilation_contacts = _compute_contacts(current_signal, morph_window_used)
-        mask_plans: list[dict[str, Any]] = []
-        for context in contexts:
-            context_eros, context_dils = _context_contact_lists(
-                erosion_contacts,
-                dilation_contacts,
-                int(context["context_left"]),
-                int(context["context_right"]),
-            )
-            context_eros_json = _serialize_contact_list(context_eros)
-            context_dils_json = _serialize_contact_list(context_dils)
-            for dilation_peak in _local_dilation_candidates(dilation_contacts, int(context["context_left"]), int(context["context_right"])):
-                geom = _geometry_for_peak(
-                    current_signal,
+        mask_cleanup_pass = int(max_pass_index)
+        while mask_cleanup_pass < int(max_iterations):
+            current_signal = np.asarray(corrected[y, x, :], dtype=float)
+            current_mask_intervals = _mask_intervals(corrected_mask)
+            if not current_mask_intervals:
+                break
+            _erosion, _dilation, erosion_contacts, dilation_contacts = _compute_contacts(current_signal, morph_window_used)
+            mask_plans: list[dict[str, Any]] = []
+            any_candidate_tested = False
+            for mask_left, mask_right in current_mask_intervals:
+                summary_counts["mask_intervals_tested"] += 1
+                interval_records = [
+                    rec for rec in corrected_interval_records
+                    if _interval_distance(int(mask_left), int(mask_right), int(rec.get("left", -1)), int(rec.get("right", -1))) == 0
+                ]
+                interval_noise_values = [
+                    _safe_float(rec.get("parent_noise_value", np.nan))
+                    for rec in interval_records
+                    if np.isfinite(_safe_float(rec.get("parent_noise_value", np.nan))) and _safe_float(rec.get("parent_noise_value", np.nan)) > 0.0
+                ]
+                parent_noise_value = float(min(interval_noise_values)) if interval_noise_values else float("nan")
+                ranked_records = sorted(interval_records, key=lambda rec: _safe_float(rec.get("parent_noise_value", np.inf)))
+                parent_noise_source = str(ranked_records[0].get("parent_noise_source", "")) if ranked_records else ""
+                candidate_id = str(ranked_records[0].get("candidate_id", "")) if ranked_records else ""
+                context_eros, context_dils = _context_contact_lists(
                     erosion_contacts,
                     dilation_contacts,
-                    int(dilation_peak),
-                    int(context["context_left"]),
-                    int(context["context_right"]),
+                    int(mask_left),
+                    int(mask_right),
                 )
-                if geom.right_anchor <= geom.left_anchor:
-                    continue
-                overlap_fraction, overlaps_mask, fully_inside_mask = _mask_overlap_fraction(corrected_mask, int(geom.left_anchor), int(geom.right_anchor))
-                if overlap_fraction < 0.8:
-                    continue
-                summary_counts["mask_cleanup_candidates_tested"] += 1
-                noise_value = float(context["parent_noise_value"])
-                if not np.isfinite(noise_value) or noise_value <= 0.0:
-                    summary_counts["local_candidates_with_missing_parent_noise"] += 1
-                    continue
-                height_above_chord, _ = _height_above_chord(current_signal, int(dilation_peak), geom.left_anchor, geom.right_anchor)
-                height_z = float(height_above_chord / noise_value) if np.isfinite(height_above_chord) else float("nan")
-                if not np.isfinite(height_z) or height_z < float(noise_height_factor):
-                    summary_counts["mask_cleanup_rejected_below_noise_height"] += 1
-                    attempt_rows.append(
-                        {
-                            "source_y": context["source_y"],
-                            "source_x": context["source_x"],
-                            "compact_y": context["compact_y"],
-                            "compact_x": context["compact_x"],
-                            "stage_index": int(max_pass_index + 1),
-                            "attempt_index_within_stage": "",
-                            "attempt_type": "mask_cleanup",
-                            "original_peak_index": context["original_peak_index"],
-                            "detected_peak_index": int(dilation_peak),
-                            "candidate_id": context["candidate_id"],
-                            "original_ss6_branch": context["original_ss6_branch"],
-                            "original_ss6_reason": context["original_ss6_reason"],
-                            "local_ss6_branch": "",
-                            "local_ss6_accept": "",
-                            "context_left": context["context_left"],
-                            "context_right": context["context_right"],
-                            "tested_left": int(geom.cell_left),
-                            "tested_right": int(geom.cell_right),
-                            "left_erosion_contact": int(geom.left_anchor),
-                            "right_erosion_contact": int(geom.right_anchor),
-                            "dilation_contact": int(dilation_peak),
-                            "morph_window_used": int(morph_window_used),
-                            "context_erosion_contacts": context_eros_json,
-                            "context_dilation_contacts": context_dils_json,
-                            "height_above_chord": float(height_above_chord),
-                            "height_above_chord_noise_z": float(height_z),
-                            "noise_value": float(noise_value),
-                            "parent_noise_value": float(context["parent_noise_value"]),
-                            "parent_noise_source": context["parent_noise_source"],
-                            "corrected_mask_overlap_fraction": float(overlap_fraction),
-                            "overlaps_corrected_mask": int(overlaps_mask),
-                            "fully_inside_corrected_mask": int(fully_inside_mask),
-                            "mask_cleanup_candidate": 1,
-                            "mask_cleanup_status": "rejected_mask_residual_below_noise_height",
-                            "chord_crossing_detected": 0,
-                            "chord_crossing_max": 0.0,
-                            "chord_support_adjustment_applied": 0,
-                            "replacement_increases_signal_max": 0.0,
-                            "correction_applied": 0,
-                            "status": "rejected_mask_residual_below_noise_height",
-                            "skipped_reason": "below_noise_height",
-                        }
-                    )
-                    continue
-                mask_plans.append(
-                    {
-                        "source_y": context["source_y"],
-                        "source_x": context["source_x"],
-                        "compact_y": context["compact_y"],
-                        "compact_x": context["compact_x"],
+                context_eros_json = _serialize_contact_list(context_eros)
+                context_dils_json = _serialize_contact_list(context_dils)
+                interval_dilation_peaks = [int(idx) for idx in context_dils if int(mask_left) <= int(idx) <= int(mask_right)]
+                for dilation_peak in interval_dilation_peaks:
+                    left_candidates = [idx for idx in context_eros if int(idx) < int(dilation_peak)]
+                    right_candidates = [idx for idx in context_eros if int(idx) > int(dilation_peak)]
+                    common_fields = {
+                        "source_y": int(contexts[0]["source_y"]) if contexts else int(y),
+                        "source_x": int(contexts[0]["source_x"]) if contexts else int(x),
+                        "compact_y": int(y),
+                        "compact_x": int(x),
+                        "stage_index": int(mask_cleanup_pass + 1),
+                        "attempt_index_within_stage": "",
                         "attempt_type": "mask_cleanup",
-                        "original_peak_index": context["original_peak_index"],
+                        "attempt_kind": "mask_connected_contact_cleanup",
+                        "original_peak_index": int(dilation_peak),
                         "detected_peak_index": int(dilation_peak),
-                        "candidate_id": context["candidate_id"],
-                        "original_ss6_branch": context["original_ss6_branch"],
-                        "original_ss6_reason": context["original_ss6_reason"],
+                        "candidate_id": candidate_id,
+                        "original_ss6_branch": "",
+                        "original_ss6_reason": "",
                         "local_ss6_branch": "",
                         "local_ss6_accept": "",
-                        "context_left": context["context_left"],
-                        "context_right": context["context_right"],
-                        "tested_left": int(geom.cell_left),
-                        "tested_right": int(geom.cell_right),
-                        "left_erosion_contact": int(geom.left_anchor),
-                        "right_erosion_contact": int(geom.right_anchor),
+                        "context_left": int(mask_left),
+                        "context_right": int(mask_right),
+                        "fixed_context_left": int(mask_left),
+                        "fixed_context_right": int(mask_right),
+                        "tested_left": int(mask_left),
+                        "tested_right": int(mask_right),
                         "dilation_contact": int(dilation_peak),
                         "morph_window_used": int(morph_window_used),
                         "context_erosion_contacts": context_eros_json,
                         "context_dilation_contacts": context_dils_json,
-                        "left_anchor": int(geom.left_anchor),
-                        "right_anchor": int(geom.right_anchor),
-                        "cell_left": int(geom.cell_left),
-                        "cell_right": int(geom.cell_right),
-                        "used_context_boundary_anchor": int(geom.used_context_boundary_anchor),
-                        "height_above_chord": float(height_above_chord),
-                        "height_above_chord_noise_z": float(height_z),
-                        "noise_value": float(noise_value),
-                        "parent_noise_value": float(context["parent_noise_value"]),
-                        "parent_noise_source": context["parent_noise_source"],
-                        "corrected_mask_overlap_fraction": float(overlap_fraction),
-                        "overlaps_corrected_mask": int(overlaps_mask),
-                        "fully_inside_corrected_mask": int(fully_inside_mask),
+                        "mask_connected": 1,
+                        "mask_overlap_count": 1,
+                        "corrected_mask_overlap_fraction": 1.0,
+                        "mask_overlap_fraction": 1.0,
+                        "mask_distance_pts": 0,
+                        "mask_interval_start": int(mask_left),
+                        "mask_interval_end": int(mask_right),
+                        "overlaps_corrected_mask": 1,
+                        "fully_inside_corrected_mask": 1,
                         "mask_cleanup_candidate": 1,
-                        "mask_cleanup_status": "corrected_mask_residual_cleanup",
-                        "status": "corrected_mask_residual_cleanup",
-                        "score": float(height_z),
+                        "chord_crossing_detected": 0,
+                        "chord_crossing_max": 0.0,
+                        "chord_support_adjustment_applied": 0,
+                        "support_adjustment_applied": 0,
+                        "replacement_increases_signal_max": 0.0,
+                        "correction_applied": 0,
+                        "corrected": 0,
                     }
-                )
-        if mask_plans:
+                    if not left_candidates or not right_candidates:
+                        summary_counts["mask_cleanup_rejected_boundary_guard"] += 1
+                        attempt_rows.append(
+                            {
+                                **common_fields,
+                                "status": "rejected_mask_cleanup_would_expand_outside_corrected_interval",
+                                "skipped_reason": "would_expand_outside_corrected_interval",
+                            }
+                        )
+                        continue
+                    left_anchor = int(max(left_candidates))
+                    right_anchor = int(min(right_candidates))
+                    if left_anchor < int(mask_left) or right_anchor > int(mask_right) or right_anchor <= left_anchor:
+                        summary_counts["mask_cleanup_rejected_boundary_guard"] += 1
+                        attempt_rows.append(
+                            {
+                                **common_fields,
+                                "left_erosion_contact": int(left_anchor),
+                                "right_erosion_contact": int(right_anchor),
+                                "left_anchor": int(left_anchor),
+                                "right_anchor": int(right_anchor),
+                                "cell_left": int(left_anchor),
+                                "cell_right": int(right_anchor),
+                                "used_context_boundary_anchor": 0,
+                                "status": "rejected_mask_cleanup_would_expand_outside_corrected_interval",
+                                "skipped_reason": "would_expand_outside_corrected_interval",
+                            }
+                        )
+                        continue
+                    any_candidate_tested = True
+                    summary_counts["mask_cleanup_candidates_tested"] += 1
+                    common_fields.update(
+                        {
+                            "tested_left": int(left_anchor),
+                            "tested_right": int(right_anchor),
+                            "left_erosion_contact": int(left_anchor),
+                            "right_erosion_contact": int(right_anchor),
+                            "left_anchor": int(left_anchor),
+                            "right_anchor": int(right_anchor),
+                            "cell_left": int(left_anchor),
+                            "cell_right": int(right_anchor),
+                            "used_context_boundary_anchor": 0,
+                            "noise_value": float(parent_noise_value),
+                            "parent_noise_value": float(parent_noise_value),
+                            "parent_noise_source": str(parent_noise_source),
+                        }
+                    )
+                    if not np.isfinite(parent_noise_value) or parent_noise_value <= 0.0:
+                        summary_counts["mask_cleanup_rejected_missing_parent_noise"] += 1
+                        attempt_rows.append(
+                            {
+                                **common_fields,
+                                "status": "rejected_mask_missing_parent_noise",
+                                "skipped_reason": "missing_parent_noise",
+                            }
+                        )
+                        continue
+                    height_above_chord, _ = _height_above_chord(current_signal, int(dilation_peak), left_anchor, right_anchor)
+                    height_z = float(height_above_chord / parent_noise_value) if np.isfinite(height_above_chord) and parent_noise_value > 0.0 else float("nan")
+                    common_fields.update(
+                        {
+                            "height_above_chord": float(height_above_chord),
+                            "height_above_chord_noise_z": float(height_z),
+                            "residual_height": float(height_above_chord),
+                            "residual_height_noise_z": float(height_z),
+                        }
+                    )
+                    if not np.isfinite(height_z) or height_z < float(noise_height_factor):
+                        summary_counts["mask_cleanup_rejected_below_noise_height"] += 1
+                        attempt_rows.append(
+                            {
+                                **common_fields,
+                                "status": "rejected_mask_residual_below_noise_height",
+                                "skipped_reason": "below_noise_height",
+                            }
+                        )
+                        continue
+                    mask_plans.append(
+                        {
+                            **common_fields,
+                            "status": "corrected_mask_connected_contact_cleanup",
+                            "skipped_reason": "",
+                            "score": float(height_z),
+                            "correction_applied": 1,
+                            "corrected": 1,
+                        }
+                    )
+            if not mask_plans:
+                break
+            next_stage_index = int(mask_cleanup_pass + 1)
             kept_mask, skipped_mask = _resolve_stage_plans(mask_plans)
             for item in skipped_mask:
                 summary_counts["skipped_overlap_duplicate"] += 1
-                item["stage_index"] = int(max_pass_index + 1)
+                item["stage_index"] = int(next_stage_index)
                 item["attempt_index_within_stage"] = ""
+                item["attempt_kind"] = str(item.get("attempt_kind", item.get("attempt_type", "")))
+                item["corrected"] = 0
                 attempt_rows.append(item)
-            applied_mask = _apply_plans(int(max_pass_index + 1), int(y), int(x), kept_mask, corrected_mask)
+            applied_mask = _apply_plans(int(next_stage_index), int(y), int(x), kept_mask, corrected_mask, corrected_interval_records)
             spectrum_corrections += int(applied_mask)
             summary_counts["mask_cleanup_corrected"] += int(applied_mask)
-            if applied_mask > 0:
-                max_pass_index = int(max_pass_index + 1)
+            if applied_mask <= 0:
+                break
+            mask_cleanup_pass = int(next_stage_index)
+            max_pass_index = max(int(max_pass_index), int(next_stage_index))
 
         summary_counts["max_pass_index_used"] = max(int(summary_counts["max_pass_index_used"]), int(max_pass_index))
         per_spectrum_correction_counts[f"{int(y)}:{int(x)}"] = int(spectrum_corrections)
@@ -1382,6 +1547,13 @@ def compute_despike_from_cache_and_ss6(
                 }
             )
 
+    for row in attempt_rows:
+        row["attempt_kind"] = str(row.get("attempt_kind", row.get("attempt_type", "")))
+        if "corrected" not in row:
+            row["corrected"] = int(_safe_float(row.get("correction_applied", 0)) == 1)
+        if "support_adjustment_applied" not in row:
+            row["support_adjustment_applied"] = int(_safe_float(row.get("chord_support_adjustment_applied", 0)) == 1)
+
     if timings_out is not None:
         timings_out["despike correction"] = time.perf_counter() - t0
 
@@ -1406,8 +1578,14 @@ def compute_despike_from_cache_and_ss6(
         "local_candidates_using_context_pce": int(summary_counts["local_candidates_using_context_pce"]),
         "local_candidates_fallback_to_local_pce": int(summary_counts["local_candidates_fallback_to_local_pce"]),
         "mask_cleanup_candidates_tested": int(summary_counts["mask_cleanup_candidates_tested"]),
+        "mask_intervals_tested": int(summary_counts["mask_intervals_tested"]),
         "mask_cleanup_corrected": int(summary_counts["mask_cleanup_corrected"]),
         "mask_cleanup_rejected_below_noise_height": int(summary_counts["mask_cleanup_rejected_below_noise_height"]),
+        "mask_cleanup_rejected_boundary_guard": int(summary_counts["mask_cleanup_rejected_boundary_guard"]),
+        "mask_cleanup_rejected_no_connection": int(summary_counts["mask_cleanup_rejected_no_connection"]),
+        "mask_cleanup_rejected_missing_parent_noise": int(summary_counts["mask_cleanup_rejected_missing_parent_noise"]),
+        "mask_cleanup_rejected_unsafe_geometry": int(summary_counts["mask_cleanup_rejected_unsafe_geometry"]),
+        "mask_cleanup_rejected_no_meaningful_change": int(summary_counts["mask_cleanup_rejected_no_meaningful_change"]),
         "ss1_context_threshold": float(local_context_ss1_threshold),
         "local_candidates_with_parent_noise": int(summary_counts["local_candidates_with_parent_noise"]),
         "local_candidates_with_missing_parent_noise": int(summary_counts["local_candidates_with_missing_parent_noise"]),
@@ -1463,23 +1641,24 @@ def compute_despike_from_cache_and_ss6(
         attempts_path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = [
             "source_y", "source_x", "compact_y", "compact_x",
-            "stage_index", "attempt_index_within_stage", "attempt_type",
+            "stage_index", "attempt_index_within_stage", "attempt_type", "attempt_kind",
             "original_peak_index", "detected_peak_index", "candidate_id",
             "original_ss6_branch", "original_ss6_reason", "local_ss6_branch", "local_ss6_accept",
             "context_left", "context_right", "tested_left", "tested_right",
             "left_erosion_contact", "right_erosion_contact", "dilation_contact", "morph_window_used",
             "context_erosion_contacts", "context_dilation_contacts",
             "left_anchor", "right_anchor", "cell_left", "cell_right", "used_context_boundary_anchor",
+            "mask_interval_start", "mask_interval_end", "mask_overlap_fraction", "mask_overlap_count", "mask_distance_pts", "mask_connected",
             "raw_peak_value_before", "corrected_peak_value_after", "correction_height",
-            "height_above_chord", "height_above_chord_noise_z", "noise_value",
+            "height_above_chord", "height_above_chord_noise_z", "noise_value", "residual_height", "residual_height_noise_z",
             "parent_noise_value", "parent_noise_source", "previous_local_noise_value_if_available", "local_noise_would_have_been", "noise_ratio_local_to_parent", "noise_fallback_used",
             "ss1_pce_noise_used", "ss1_pce_noise_source", "ss1_pce_noise_override_used",
             "context_ss1", "context_ss1_peak_index", "context_ss1_peak_x", "context_ss1_noise_value", "context_ss1_noise_source", "context_ss1_candidate_count", "context_ss1_threshold", "local_ss1_gate_used",
             "context_pce", "context_pce_peak_index", "context_pce_peak_x", "context_pce_left_index", "context_pce_right_index", "context_pce_noise_value", "context_pce_noise_source", "context_pce_candidate_count", "context_pce_status", "context_pce_enabled", "pce_local_audit", "pce_decision_source",
             "corrected_mask_overlap_fraction", "overlaps_corrected_mask", "fully_inside_corrected_mask", "mask_cleanup_candidate", "mask_cleanup_status",
-            "chord_crossing_detected", "chord_crossing_max", "chord_support_adjustment_applied", "replacement_increases_signal_max",
+            "chord_crossing_detected", "chord_crossing_max", "chord_support_adjustment_applied", "support_adjustment_applied", "replacement_increases_signal_max",
             "ss1", "pce", "edge", "eel", "resid",
-            "correction_applied", "status", "skipped_reason",
+            "correction_applied", "corrected", "status", "skipped_reason",
         ]
         with attempts_path.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")

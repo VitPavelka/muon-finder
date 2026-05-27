@@ -49,6 +49,8 @@ def _try_get_xy_from_origins(data, WdfDataType, h: int, w: int):
 
 def load_wdf_map(path: Path) -> SpectrumDataset:
     path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"WDF file not found: {path}")
     try:
         from wdf import Wdf  # type: ignore
         try:
@@ -73,42 +75,10 @@ def load_wdf_map(path: Path) -> SpectrumDataset:
                 ypos=ypos,
                 meta={"backend": "renishaw-wdf", "h": h, "w": w},
             )
-    except ImportError:
-        pass
-    except Exception as exc:
-        print(f"[io] renishaw-wdf failed: {exc!r}; trying renishawWiRE fallback")
-
-    try:
-        from renishawWiRE import WDFReader  # type: ignore
-        reader = WDFReader(str(path))
-        x_axis = np.asarray(reader.xdata, dtype=float)
-        spectra = np.asarray(reader.spectra, dtype=np.float32)
-        if spectra.ndim != 3:
-            raise RuntimeError(f"Expected grid map (H,W,N), got ndim={spectra.ndim}")
-        h, w, _ = spectra.shape
-        xpos = None
-        ypos = None
-        try:
-            xpos = np.asarray(reader.xpos, dtype=float).reshape(h, w)
-            ypos = np.asarray(reader.ypos, dtype=float).reshape(h, w)
-        except Exception:
-            pass
-        try:
-            reader.close()
-        except Exception:
-            pass
-        return SpectrumDataset(
-            path=path,
-            x_axis=x_axis,
-            spectra=spectra,
-            xpos=xpos,
-            ypos=ypos,
-            meta={"backend": "renishawWiRE", "h": h, "w": w},
-        )
     except ImportError as exc:
-        raise RuntimeError(
-            "No WDF reader is installed. Use renishaw-wdf or renishawWiRE."
-        ) from exc
+        raise RuntimeError("renishaw-wdf is required to read WDF files in muonfinder_core.") from exc
+    except Exception as exc:
+        raise RuntimeError(f"renishaw-wdf failed to read WDF file: {path} | {exc!r}") from exc
 
 
 def load_npz_map(path: Path) -> SpectrumDataset:

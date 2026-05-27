@@ -26,7 +26,7 @@ if __package__ in {None, ""}:
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
 
-    from muonfinder_core.cache import load_viewer_cache
+    from muonfinder_core.cache import load_viewer_cache_light
     from muonfinder_core.config import load_config
     from muonfinder_core.experimental_common import (
         _safe_float,
@@ -41,7 +41,7 @@ if __package__ in {None, ""}:
     from muonfinder_core.experimental_residual_pce import compute_experimental_residual_features
     from muonfinder_core.metrics import MetricComputationContext, robust_center_scale, sigmoid_support
 else:
-    from .cache import load_viewer_cache
+    from .cache import load_viewer_cache_light
     from .config import load_config
     from .experimental_common import (
         _safe_float,
@@ -273,7 +273,8 @@ def compute_all_experimental_features_from_config(
     out_path = Path(out_path) if out_path is not None else Path(str(exp_cfg["features_path"]))
     summary_path = Path(summary_path) if summary_path is not None else Path(str(exp_cfg["summary_path"]))
 
-    cache = load_viewer_cache(cache_path)
+    print(f"[cache] experimental features cache path: {cache_path}")
+    cache = load_viewer_cache_light(cache_path, verbose=True)
     all_rows = [dict(row) for row in cache.get("candidate_records", [])]
     used_rows, scope_stats = filter_candidate_rows(all_rows, str(exp_cfg["candidate_scope"]))
     spectra = np.asarray(cache["spectra"], dtype=float)

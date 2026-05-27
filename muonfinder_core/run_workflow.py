@@ -12,10 +12,12 @@ if __package__ in {None, ""}:
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
 
+    from muonfinder_core.config import load_config
     from muonfinder_core.compute_despike import run_compute_despike
     from muonfinder_core.compute_ss6_decisions import run_ss6_decisions
     from muonfinder_core.pipeline import execute_pipeline
 else:
+    from .config import load_config
     from .compute_despike import run_compute_despike
     from .compute_ss6_decisions import run_ss6_decisions
     from .pipeline import execute_pipeline
@@ -25,20 +27,34 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the full MuonFinder core workflow.")
     parser.add_argument("--config", type=Path, default=Path("config_core.json"))
     parser.add_argument("--force", action="store_true", help="Force experimental feature recompute during SS6 stage.")
+    parser.add_argument("--skip-pipeline", action="store_true", help="Reuse the existing viewer cache and skip pipeline execution.")
+    parser.add_argument("--reuse-cache", action="store_true", help="Alias for --skip-pipeline.")
+    parser.add_argument("--force-pipeline", action="store_true", help="Run pipeline even if --skip-pipeline or --reuse-cache is set.")
     parser.add_argument("--skip-ss6", action="store_true", help="Skip SS6 decision stage.")
     parser.add_argument("--skip-despike", action="store_true", help="Skip despike stage.")
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
+    cfg = load_config(cfg_path)
     stage_timings: dict[str, float] = {}
     t_total = time.perf_counter()
+    run_pipeline_stage = bool(args.force_pipeline) or not bool(args.skip_pipeline or args.reuse_cache)
 
     print(f"[workflow] config: {cfg_path}")
+    print(f"[workflow] viewer cache path: {cfg.paths['viewer_cache_path']}")
+    print(f"[workflow] experimental features path: {cfg.experimental_features.get('features_path', '')}")
+    print(f"[workflow] ss6 decisions path: {cfg.ss6.get('decisions_path', '')}")
+    print(f"[workflow] despike corrected path: {cfg.despike.get('corrected_path', '')}")
 
-    print("[workflow] stage 1/3: pipeline")
-    _artifacts, pipeline_timings = execute_pipeline(cfg_path, open_viewer=False)
-    stage_timings["pipeline"] = float(pipeline_timings.get("pipeline", 0.0))
-    stage_timings["viewer cache"] = float(pipeline_timings.get("viewer cache", 0.0))
+    if run_pipeline_stage:
+        print("[workflow] stage 1/3: pipeline")
+        _artifacts, pipeline_timings = execute_pipeline(cfg_path, open_viewer=False)
+        stage_timings["pipeline"] = float(pipeline_timings.get("pipeline", 0.0))
+        stage_timings["viewer cache"] = float(pipeline_timings.get("viewer cache", 0.0))
+    else:
+        print("[workflow] stage 1/3: pipeline skipped, reusing viewer cache")
+        stage_timings["pipeline"] = 0.0
+        stage_timings["viewer cache"] = 0.0
 
     if not bool(args.skip_ss6):
         print("[workflow] stage 2/3: ss6")

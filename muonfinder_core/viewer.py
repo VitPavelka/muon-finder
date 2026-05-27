@@ -70,6 +70,18 @@ OVERLAY_KEY_BY_LABEL = {
     "top-hat": "top_hat",
     "gradient": "gradient",
 }
+
+SS6_BRANCH_MARKER_FACECOLOR = "#ff8c00"
+SS6_BRANCH_MARKER_EDGECOLOR = "#111111"
+ACTIVE_CASE_HIGHLIGHT_COLOR = "#ff8c00"
+
+
+def _fmt_compact_value(value: float) -> str:
+    if not np.isfinite(value):
+        return "nan"
+    return f"{float(value):.4g}"
+
+
 def _x_from_index(x_axis: np.ndarray, idx: float) -> float:
     xp = np.arange(int(x_axis.size), dtype=float)
     return float(np.interp(float(idx), xp, np.asarray(x_axis, dtype=float)))
@@ -158,6 +170,16 @@ def metric_bool(row: dict[str, Any], key: str, default: bool = False) -> bool:
     if not np.isfinite(numeric):
         return bool(default)
     return int(numeric) == 1
+
+
+def _metric_int(row: dict[str, Any], key: str, default: int | None = None) -> int | None:
+    value = metric_float(row, key)
+    if not np.isfinite(value):
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def _viewer_active_decision(row: dict[str, Any], active_profile: str) -> tuple[str, str]:
@@ -421,10 +443,11 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                 map_vmax = None
 
     H, W = score_map.shape
-    current = {"y": 0, "x": 0, "morph_idx": 0, "chord_idx": 0}
+    current = {"y": 0, "x": 0, "morph_idx": 0, "chord_idx": 0, "active_case_candidate_id": "", "active_case_peak_index": -1}
     frozen = {"state": False}
     spectrum_home = {"xlim": None, "ylim": None}
     preserve_spec_limits = {"state": False}
+    cycle_state = {"overlay_key": "", "index": 0}
     if H > 1 or W > 1:
         iy, ix = np.unravel_index(int(np.nanargmax(score_map)), score_map.shape)
         current["y"] = int(iy)
@@ -486,6 +509,16 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     def current_rows() -> list[dict[str, Any]]:
         return rows_by_pixel.get((int(current["y"]), int(current["x"])), [])
 
+    def current_active_case_row() -> dict[str, Any] | None:
+        active_candidate_id = str(current.get("active_case_candidate_id", "")).strip()
+        active_peak_index = int(current.get("active_case_peak_index", -1))
+        for row in current_rows():
+            if active_candidate_id and str(row.get("candidate_id", "")).strip() == active_candidate_id:
+                return row
+            if active_peak_index >= 0 and int(row.get("peak_index", -1)) == active_peak_index:
+                return row
+        return None
+
     def current_spectrum_chords() -> list[dict[str, Any]]:
         return [
             dict(chord)
@@ -525,9 +558,95 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             return None
         return spectrum_attempts[current_attempt_index()]
 
+    def active_overlay_cycle_key() -> str:
+        selected_branch = ss6_branch_state["selected"]
+        if selected_branch is not None:
+            return f"ss6_branch:{selected_branch}"
+        if states["located muon"]:
+            return "located_muon"
+        return ""
+
+    def _unique_cycle_pixels(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        first_by_pixel: dict[tuple[int, int], dict[str, Any]] = {}
+        for row in rows:
+            key = (int(row.get("y", -1)), int(row.get("x", -1)))
+            if key not in first_by_pixel:
+                first_by_pixel[key] = dict(row)
+        return sorted(
+            first_by_pixel.values(),
+            key=lambda row: (int(row.get("y", -1)), int(row.get("x", -1)), int(row.get("peak_index", -1))),
+        )
+
+    def get_active_overlay_cycle_rows() -> tuple[str, list[dict[str, Any]]]:
+        selected_branch = ss6_branch_state["selected"]
+        if selected_branch is not None:
+            rows = [
+                dict(row)
+                for row in candidate_rows
+                if str(row.get("ss6_branch", "")).strip() == str(selected_branch)
+            ]
+            return f"ss6_branch:{selected_branch}", _unique_cycle_pixels(rows)
+        if states["located muon"]:
+            rows = [
+                dict(row)
+                for row in candidate_rows
+                if _viewer_active_decision(row, active_profile)[0] == "spike"
+            ]
+            return "located_muon", _unique_cycle_pixels(rows)
+        return "", []
+
+    def _reset_overlay_cycle_if_needed() -> None:
+        overlay_key = active_overlay_cycle_key()
+        if cycle_state["overlay_key"] != overlay_key:
+            cycle_state["overlay_key"] = overlay_key
+            cycle_state["index"] = 0
+
+    def jump_to_case(case_row: dict[str, Any]) -> None:
+        current["x"] = int(case_row.get("x", current["x"]))
+        current["y"] = int(case_row.get("y", current["y"]))
+        current["chord_idx"] = 0
+        current["active_case_candidate_id"] = str(case_row.get("candidate_id", "")).strip()
+        current["active_case_peak_index"] = int(case_row.get("peak_index", -1))
+
+    def cycle_active_overlay_case(step: int) -> None:
+        overlay_key, rows = get_active_overlay_cycle_rows()
+        if not overlay_key:
+            print("no active overlay selected for cycling")
+            return
+        if not rows:
+            print(f"{overlay_key}: no cases to cycle")
+            return
+        if cycle_state["overlay_key"] != overlay_key:
+            cycle_state["overlay_key"] = overlay_key
+            cycle_state["index"] = 0
+        else:
+            cycle_state["index"] = int((int(cycle_state["index"]) + int(step)) % len(rows))
+        row = rows[int(cycle_state["index"])]
+        jump_to_case(row)
+        peak_idx = int(row.get("peak_index", -1))
+        peak_pos = _x_from_index(x_axis, peak_idx) if 0 <= peak_idx < len(x_axis) else float("nan")
+        source_y = int(row.get("source_y", row.get("y", -1)))
+        source_x = int(row.get("source_x", row.get("x", -1)))
+        peak_text = f" peak={peak_pos:.1f}" if np.isfinite(peak_pos) else ""
+        print(
+            f"{overlay_key}: {int(cycle_state['index']) + 1}/{len(rows)} | "
+            f"compact=({int(row.get('y', -1))},{int(row.get('x', -1))}) "
+            f"source=({source_y},{source_x}){peak_text}"
+        )
+
     map_im = ax_map.imshow(score_map, cmap="viridis", origin="upper", interpolation="nearest", vmin=map_vmin, vmax=map_vmax)
     located_scatter = ax_map.scatter([], [], s=26, c="#d62728", marker="s", linewidths=0.0, alpha=0.90)
-    ss6_branch_scatter = ax_map.scatter([], [], s=48, c="#17becf", marker="s", linewidths=0.8, edgecolors="#111111", alpha=0.92)
+    ss6_branch_scatter = ax_map.scatter(
+        [],
+        [],
+        s=48,
+        c=SS6_BRANCH_MARKER_FACECOLOR,
+        marker="s",
+        linewidths=0.8,
+        edgecolors=SS6_BRANCH_MARKER_EDGECOLOR,
+        alpha=0.92,
+        zorder=5,
+    )
     cursor_marker, = ax_map.plot(
         [current["x"]],
         [current["y"]],
@@ -537,6 +656,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         markeredgecolor="white",
         markeredgewidth=1.6,
         linestyle="None",
+        zorder=8,
     )
     ax_map.set_title("score map", fontsize=13)
     ax_map.set_xlabel("x (pixel)", fontsize=11)
@@ -614,9 +734,21 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             fontsize=8.8,
             color="#333333",
         )
+        ax_ss6_info.text(
+            0.01,
+            0.12,
+            "h/j: overlay spectra  |  a/x: despike attempts",
+            transform=ax_ss6_info.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=8.2,
+            color="#555555",
+        )
 
     def _apply_ss6_branch_selection(branch_name: str | None) -> None:
         ss6_branch_state["selected"] = branch_name
+        cycle_state["overlay_key"] = ""
+        cycle_state["index"] = 0
         if branch_name is None:
             ss6_branch_state["message"] = "Overlay off."
         elif int(branch_counts.get(branch_name, 0)) <= 0:
@@ -1073,7 +1205,14 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
 
     def _draw_metrics(rows: list[dict[str, Any]], raw_sig: np.ndarray) -> None:
         metric_rows = [row for row in rows if str(row.get("candidate_noise_prefilter_status", "")) != "rejected_noise"]
-        metric_rows.sort(key=lambda row: int(row.get("peak_index", 0)))
+        active_case = current_active_case_row()
+        active_candidate_id = str(active_case.get("candidate_id", "")).strip() if active_case is not None else ""
+        metric_rows.sort(
+            key=lambda row: (
+                0 if active_candidate_id and str(row.get("candidate_id", "")).strip() == active_candidate_id else 1,
+                int(row.get("peak_index", 0)),
+            )
+        )
         if not metric_rows:
             return
         x_min, x_max = ax_spec.get_xlim()
@@ -1100,6 +1239,9 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             if not finite_parts:
                 continue
             color = _viewer_candidate_color(row, active_profile)
+            is_active_case = active_candidate_id and str(row.get("candidate_id", "")).strip() == active_candidate_id
+            if is_active_case:
+                color = ACTIVE_CASE_HIGHLIGHT_COLOR
             x_pos = float(x_axis[peak])
             _decision, reason = _viewer_active_decision(row, active_profile)
             label = "\n".join(finite_parts + ([reason] if reason else []))
@@ -1276,11 +1418,12 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         original_branch = str(attempt.get("original_ss6_branch", "")).strip()
         local_branch = str(attempt.get("local_ss6_branch", attempt.get("ss6_local_branch", ""))).strip()
         attempt_type = str(attempt.get("attempt_type", "")).strip()
+        attempt_kind = str(attempt.get("attempt_kind", attempt_type)).strip()
         status = str(attempt.get("status", "")).strip()
         if attempt_type == "parent":
             if original_branch:
                 lines.append(f"ss6 {original_branch}")
-        elif attempt_type == "mask_cleanup":
+        elif attempt_kind == "mask_connected_contact_cleanup" or attempt_type == "mask_cleanup":
             lines.append("mask cleanup")
         else:
             if status == "context_ss1_low":
@@ -1298,13 +1441,26 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                 lines.append("corrected")
             elif status == "context_ss1_low":
                 lines.append("reason=context_ss1_low")
-            elif status == "corrected_mask_residual_cleanup":
-                overlap = metric_float(attempt, "corrected_mask_overlap_fraction")
-                hchord = metric_float(attempt, "height_above_chord_noise_z")
+            elif status in {"corrected_mask_residual_cleanup", "corrected_mask_connected_contact_cleanup"}:
+                overlap = metric_float(attempt, "mask_overlap_fraction")
+                if not np.isfinite(overlap):
+                    overlap = metric_float(attempt, "corrected_mask_overlap_fraction")
+                hchord = metric_float(attempt, "residual_height_noise_z")
+                if not np.isfinite(hchord):
+                    hchord = metric_float(attempt, "height_above_chord_noise_z")
+                resid_h = metric_float(attempt, "residual_height")
+                parent_noise = metric_float(attempt, "parent_noise_value")
+                dist = metric_float(attempt, "mask_distance_pts")
                 if np.isfinite(hchord):
                     lines.append(f"hchord={hchord:.3g}")
+                if np.isfinite(resid_h):
+                    lines.append(f"h={resid_h:.3g}")
+                if np.isfinite(parent_noise):
+                    lines.append(f"pnoise={parent_noise:.3g}")
                 if np.isfinite(overlap):
                     lines.append(f"overlap={overlap:.2f}")
+                if np.isfinite(dist) and dist >= 0:
+                    lines.append(f"dist={dist:.0f}")
                 lines.append("corrected")
             elif status == "rejected_by_despike_noise_height":
                 lines.append("rejected: noise height")
@@ -1313,10 +1469,32 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                     lines.append(f"hchord={hchord:.3g}")
             elif status == "rejected_mask_residual_below_noise_height":
                 lines.append("rejected: mask residual")
-                hchord = metric_float(attempt, "height_above_chord_noise_z")
-                overlap = metric_float(attempt, "corrected_mask_overlap_fraction")
+                hchord = metric_float(attempt, "residual_height_noise_z")
+                if not np.isfinite(hchord):
+                    hchord = metric_float(attempt, "height_above_chord_noise_z")
+                overlap = metric_float(attempt, "mask_overlap_fraction")
+                if not np.isfinite(overlap):
+                    overlap = metric_float(attempt, "corrected_mask_overlap_fraction")
                 if np.isfinite(hchord):
                     lines.append(f"hchord={hchord:.3g}")
+                if np.isfinite(overlap):
+                    lines.append(f"overlap={overlap:.2f}")
+            elif status == "rejected_mask_no_connection":
+                lines.append("rejected: no connection")
+                dist = metric_float(attempt, "mask_distance_pts")
+                if np.isfinite(dist) and dist >= 0:
+                    lines.append(f"dist={dist:.0f}")
+            elif status == "rejected_mask_missing_parent_noise":
+                lines.append("rejected: missing parent noise")
+            elif status == "rejected_mask_cleanup_would_expand_outside_corrected_interval":
+                lines.append("rejected: would expand outside interval")
+            elif status == "rejected_mask_unsafe_geometry":
+                lines.append("rejected: unsafe geometry")
+            elif status == "rejected_mask_no_meaningful_change":
+                lines.append("rejected: no change")
+            elif status == "rejected_mask_boundary_guard":
+                lines.append("rejected: boundary guard")
+                overlap = metric_float(attempt, "mask_overlap_fraction")
                 if np.isfinite(overlap):
                     lines.append(f"overlap={overlap:.2f}")
             elif status == "local_missing_metric":
@@ -1380,9 +1558,24 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                 ax_spec.axvline(x_axis[int(row["start"])], color="#2ca02c", linestyle="--", linewidth=1.2, alpha=0.95)
                 ax_spec.axvline(x_axis[int(row["end"])], color="#2ca02c", linestyle="--", linewidth=1.2, alpha=0.95)
         if states["spike peaks"]:
+            active_case = current_active_case_row()
+            active_candidate_id = str(active_case.get("candidate_id", "")).strip() if active_case is not None else ""
             for row in rows:
                 color = _viewer_candidate_color(row, active_profile)
-                ax_spec.axvline(x_axis[int(row["peak_index"])], color=color, linestyle="--", linewidth=1.5)
+                is_active_case = active_candidate_id and str(row.get("candidate_id", "")).strip() == active_candidate_id
+                line_color = ACTIVE_CASE_HIGHLIGHT_COLOR if is_active_case else color
+                line_width = 2.2 if is_active_case else 1.5
+                ax_spec.axvline(x_axis[int(row["peak_index"])], color=line_color, linestyle="--", linewidth=line_width)
+                if is_active_case:
+                    ax_spec.plot(
+                        [x_axis[int(row["peak_index"])]],
+                        [raw_sig[int(row["peak_index"])]],
+                        marker="o",
+                        color=ACTIVE_CASE_HIGHLIGHT_COLOR,
+                        markersize=5.5,
+                        linestyle="None",
+                        zorder=6,
+                    )
 
         morph_row = small_by_pixel.get((int(current["y"]), int(current["x"])), {})
         if states["dilation contacts"] or states["erosion contacts"]:
@@ -1403,7 +1596,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                 src = dbg.get("edge_noise_source")
                 val = metric_float(dbg, "edge_noise_value")
                 if src and np.isfinite(val):
-                    noise_line = f"noise = {val:.1f} ({src})"
+                    noise_line = f"noise = {_fmt_compact_value(val)} ({src})"
                     break
             if noise_line:
                 ax_spec.text(
@@ -1433,19 +1626,22 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         if states["despike chords"]:
             attempt = current_attempt()
             if attempt is not None:
-                ctx_left = attempt.get("fixed_context_left", "")
-                if ctx_left == "":
-                    ctx_left = attempt.get("context_left", "")
-                ctx_right = attempt.get("fixed_context_right", "")
-                if ctx_right == "":
-                    ctx_right = attempt.get("context_right", "")
-                cell_left = attempt.get("cell_left", attempt.get("tested_left", ""))
-                cell_right = attempt.get("cell_right", attempt.get("tested_right", ""))
-                left_anchor = attempt.get("left_anchor", attempt.get("left_erosion_contact", ""))
-                right_anchor = attempt.get("right_anchor", attempt.get("right_erosion_contact", ""))
-                detected_peak = attempt.get("detected_peak_index", attempt.get("dilation_contact", ""))
+                ctx_left = _metric_int(attempt, "fixed_context_left", _metric_int(attempt, "context_left"))
+                ctx_right = _metric_int(attempt, "fixed_context_right", _metric_int(attempt, "context_right"))
+                cell_left = _metric_int(attempt, "cell_left", _metric_int(attempt, "tested_left"))
+                cell_right = _metric_int(attempt, "cell_right", _metric_int(attempt, "tested_right"))
+                left_anchor = _metric_int(attempt, "left_anchor", _metric_int(attempt, "left_erosion_contact"))
+                right_anchor = _metric_int(attempt, "right_anchor", _metric_int(attempt, "right_erosion_contact"))
+                detected_peak = _metric_int(attempt, "detected_peak_index", _metric_int(attempt, "dilation_contact"))
+                mask_left = _metric_int(attempt, "mask_interval_start")
+                mask_right = _metric_int(attempt, "mask_interval_end")
                 status = str(attempt.get("status", ""))
-                if ctx_left != "" and ctx_right != "":
+                if mask_left is not None and mask_right is not None:
+                    pli = int(mask_left)
+                    pri = int(mask_right)
+                    if 0 <= pli < len(x_axis) and 0 <= pri < len(x_axis) and pri >= pli:
+                        ax_spec.axvspan(x_axis[pli], x_axis[pri], color="#ffb347", alpha=0.12)
+                if ctx_left is not None and ctx_right is not None:
                     pli = int(ctx_left)
                     pri = int(ctx_right)
                     if 0 <= pli < len(x_axis) and 0 <= pri < len(x_axis) and pri >= pli:
@@ -1466,16 +1662,16 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                     pts = [idx for idx in context_eros if 0 <= idx < len(x_axis)]
                     if pts:
                         ax_spec.scatter(x_axis[pts], raw_sig[pts], marker="o", s=22, c="#111111", alpha=0.75, zorder=4)
-                if cell_left != "" and cell_right != "":
+                if cell_left is not None and cell_right is not None:
                     tli = int(cell_left)
                     tri = int(cell_right)
                     if 0 <= tli < len(x_axis) and 0 <= tri < len(x_axis) and tri >= tli:
                         ax_spec.axvspan(x_axis[tli], x_axis[tri], color="#17becf", alpha=0.14)
-                if detected_peak != "":
+                if detected_peak is not None:
                     dpi = int(detected_peak)
                     if 0 <= dpi < len(x_axis):
                         ax_spec.plot([x_axis[dpi]], [raw_sig[dpi]], marker="x", color="#d62728", markersize=7.0, linestyle="None")
-                if left_anchor != "" and right_anchor != "":
+                if left_anchor is not None and right_anchor is not None:
                     li = int(left_anchor)
                     ri = int(right_anchor)
                     if 0 <= li < len(x_axis) and 0 <= ri < len(x_axis) and ri > li:
@@ -1530,6 +1726,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             ax_spec.legend(handles, labels, loc="upper right", fontsize=9, framealpha=0.92)
 
     def update() -> None:
+        _reset_overlay_cycle_if_needed()
         _update_map_artists()
         _draw_spectrum()
         _set_suptitle()
@@ -1557,6 +1754,8 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         current["x"] = x
         current["y"] = y
         current["chord_idx"] = 0
+        current["active_case_candidate_id"] = ""
+        current["active_case_peak_index"] = -1
         update()
 
     def on_click(event) -> None:
@@ -1567,6 +1766,8 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         current["x"] = int(np.clip(round(event.xdata), 0, W - 1))
         current["y"] = int(np.clip(round(event.ydata), 0, H - 1))
         current["chord_idx"] = 0
+        current["active_case_candidate_id"] = ""
+        current["active_case_peak_index"] = -1
         frozen["state"] = not frozen["state"]
         update()
 
@@ -1586,6 +1787,16 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                 preserve_spec_limits["state"] = True
             update()
             return
+        if key == "h":
+            preserve_spec_limits["state"] = False
+            cycle_active_overlay_case(-1)
+            update()
+            return
+        if key == "j":
+            preserve_spec_limits["state"] = False
+            cycle_active_overlay_case(1)
+            update()
+            return
         if key == "home":
             if spectrum_home["xlim"] is not None and spectrum_home["ylim"] is not None:
                 ax_spec.set_xlim(*spectrum_home["xlim"])
@@ -1598,6 +1809,8 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             current["x"] = int(np.clip(int(current["x"]) + dx, 0, W - 1))
             current["y"] = int(np.clip(int(current["y"]) + dy, 0, H - 1))
             current["chord_idx"] = 0
+            current["active_case_candidate_id"] = ""
+            current["active_case_peak_index"] = -1
             update()
 
     fig.canvas.mpl_connect("motion_notify_event", on_move)

@@ -23,6 +23,7 @@ if __package__ in {None, ""}:
     from muonfinder_core.candidates import (
         CandidateSegment,
         extract_top_hat_candidates,
+        extract_top_hat_candidates_local_1d,
         prepare_primary_candidates,
         score_map_from_top_hat,
         threshold_score_map,
@@ -48,6 +49,7 @@ else:
     from .candidates import (
         CandidateSegment,
         extract_top_hat_candidates,
+        extract_top_hat_candidates_local_1d,
         prepare_primary_candidates,
         score_map_from_top_hat,
         threshold_score_map,
@@ -121,6 +123,7 @@ def _prepare_candidate_rows(
     raw: np.ndarray,
     overlays: dict[str, dict[int, np.ndarray]],
     candidates_by_pixel: dict[tuple[int, int], list[CandidateSegment]],
+    candidate_audit_by_pixel: dict[tuple[int, int], dict[str, Any]],
     cfg: CoreConfig,
     source_coords_map: dict[tuple[int, int], tuple[int, int]],
 ) -> tuple[
@@ -267,6 +270,15 @@ def _prepare_candidate_rows(
             "noise_reference_method": prefilter_summary.get("noise_reference_method"),
         }
         summary_by_pixel[(int(y), int(x))] = prefilter_summary
+        candidate_audit_by_pixel.setdefault((int(y), int(x)), {}).update(
+            {
+                "post_noise_prefilter_candidates": int(prefilter_summary.get("n_candidates_after_noise_prefilter", 0)),
+                "noise_prefilter_rejected_candidates": int(prefilter_summary.get("n_candidates_rejected_by_noise_prefilter", 0)),
+                "per_spectrum_noise_value": _safe_float(prefilter_summary.get("noise_height_morph_range")),
+                "per_spectrum_noise_source": str(prefilter_summary.get("noise_reference_method", "")),
+                "per_spectrum_noise_status": str(prefilter_summary.get("noise_reference_status", "")),
+            }
+        )
         pixel_iter.set_postfix(
             candidates=len(out_rows),
             kept=sum(1 for row in out_rows if str(row.get("candidate_noise_prefilter_status", "")) != "rejected_noise"),
@@ -397,6 +409,7 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
         "gradient": {window: payload.gradient for window, payload in morph.items()},
     }
     th_window = int(cfg.morphology["tophat_window"])
+    detection_mode = str(cfg.candidates.get("candidate_detection_mode", "default")).strip().lower()
 
     t0 = time.perf_counter()
     score_map = score_map_from_top_hat(overlays["top_hat"][th_window], mode=str(cfg.candidates.get("score_mode", "max")))
@@ -414,7 +427,10 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
     )
 
     candidate_mask = np.asarray(score_map >= threshold, dtype=bool)
-    processed_mask = np.asarray(candidate_mask, dtype=bool)
+    if detection_mode == "local_1d":
+        processed_mask = np.ones_like(candidate_mask, dtype=bool)
+    else:
+        processed_mask = np.asarray(candidate_mask, dtype=bool)
     processed_spectra = int(np.count_nonzero(processed_mask))
     if bool(cfg.data.get("use_compact_coords_view", True)) and cfg.paths.get("coords_csv"):
         processed_mask = np.zeros_like(candidate_mask, dtype=bool)
@@ -423,23 +439,51 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
         processed_spectra = int(np.count_nonzero(processed_mask))
 
     t0 = time.perf_counter()
-    _, candidates_by_pixel = extract_top_hat_candidates(
-        x_axis=np.asarray(dataset.x_axis, dtype=float),
-        top_hat=np.asarray(overlays["top_hat"][th_window], dtype=float),
-        candidate_mask=processed_mask,
-        raw_spectra=np.asarray(raw, dtype=float),
-        max_width_pts=int(cfg.candidates.get("max_width_pts", 24)),
-        k_mad_pixel=float(cfg.candidates.get("k_mad_pixel", 8.0)),
-        min_peak=float(cfg.candidates.get("min_peak", 80.0)),
-        baseline_window=int(cfg.morphology.get("baseline_window", 5)),
-        edge_k_mad=float(cfg.candidates.get("edge_k_mad", 2.0)),
-        pad_pts=int(cfg.candidates.get("pad_pts", 0)),
-    )
+    candidate_audit_by_pixel: dict[tuple[int, int], dict[str, Any]] = {}
+    if detection_mode == "local_1d":
+        _, candidates_by_pixel, candidate_audit_by_pixel = extract_top_hat_candidates_local_1d(
+            x_axis=np.asarray(dataset.x_axis, dtype=float),
+            top_hat=np.asarray(overlays["top_hat"][th_window], dtype=float),
+            processed_mask=processed_mask,
+            raw_spectra=np.asarray(raw, dtype=float),
+            max_width_pts=int(cfg.candidates.get("max_width_pts", 24)),
+            min_peak=float(cfg.candidates.get("min_peak", 80.0)),
+            baseline_window=int(cfg.morphology.get("baseline_window", 5)),
+            edge_k_mad=float(cfg.candidates.get("edge_k_mad", 2.0)),
+            pad_pts=int(cfg.candidates.get("pad_pts", 0)),
+            threshold_method=str(cfg.candidates.get("threshold_method", "quantile")),
+            threshold_quantile=float(cfg.candidates.get("threshold_quantile", 0.1)),
+            threshold_k_mad=float(cfg.candidates.get("threshold_k_mad", 20.0)),
+            threshold_min_abs=cfg.candidates.get("threshold_min_abs"),
+            noise_height_factor=float(cfg.noise.get("noise_height_factor", 3.0)),
+            noise_window=int(cfg.morphology.get("noise_window", 3)),
+        )
+    else:
+        _, candidates_by_pixel, candidate_audit_by_pixel = extract_top_hat_candidates(
+            x_axis=np.asarray(dataset.x_axis, dtype=float),
+            top_hat=np.asarray(overlays["top_hat"][th_window], dtype=float),
+            candidate_mask=processed_mask,
+            raw_spectra=np.asarray(raw, dtype=float),
+            max_width_pts=int(cfg.candidates.get("max_width_pts", 24)),
+            k_mad_pixel=float(cfg.candidates.get("k_mad_pixel", 8.0)),
+            min_peak=float(cfg.candidates.get("min_peak", 80.0)),
+            baseline_window=int(cfg.morphology.get("baseline_window", 5)),
+            edge_k_mad=float(cfg.candidates.get("edge_k_mad", 2.0)),
+            pad_pts=int(cfg.candidates.get("pad_pts", 0)),
+        )
     raw_candidate_count = sum(len(v) for v in candidates_by_pixel.values())
+    candidate_mask = np.zeros_like(candidate_mask, dtype=bool)
+    for (yy, xx), audit in candidate_audit_by_pixel.items():
+        if int(audit.get("raw_candidate_score_peaks", 0) or 0) > 0:
+            candidate_mask[int(yy), int(xx)] = True
     _phase_print(
         "candidate detection",
         t0,
-        extra=f"processed_spectra={processed_spectra} candidate_pixels={len(candidates_by_pixel)} raw_candidates={raw_candidate_count}",
+        extra=(
+            f"mode={detection_mode} processed_spectra={processed_spectra} "
+            f"candidate_pixels={int(np.count_nonzero(candidate_mask))} raw_candidates={raw_candidate_count} "
+            f"tophat_window={th_window}"
+        ),
     )
 
     t0 = time.perf_counter()
@@ -447,6 +491,7 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
         raw=np.asarray(raw, dtype=float),
         overlays=overlays,
         candidates_by_pixel=candidates_by_pixel,
+        candidate_audit_by_pixel=candidate_audit_by_pixel,
         cfg=cfg,
         source_coords_map=source_coords_map,
     )
@@ -499,6 +544,7 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
         row for row in finite_edge_rows
         if bool((row.get("edge_debug", {}) if isinstance(row.get("edge_debug", {}), dict) else {}).get("edge_context_expanded"))
     ]
+    candidate_audit_path = _candidate_detection_audit_path(cfg)
     metadata = {
         "input_path": str(dataset.path),
         "decision_profile": str(cfg.decision_profile),
@@ -521,6 +567,8 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
         "rejected_by_both": int(rejected_both),
         "n_noise_kept_candidates": int(len(noise_kept_rows)),
         "n_noise_kept_with_finite_edge": int(len(finite_edge_rows)),
+        "candidate_detection_mode": str(detection_mode),
+        "candidate_detection_audit_path": str(candidate_audit_path),
         "prefilter_summaries": {
             f"{y},{x}": value for (y, x), value in prefilter_summary_by_pixel.items()
         },
@@ -537,6 +585,26 @@ def run_pipeline(cfg: CoreConfig) -> PipelineArtifacts:
     print(
         f"[{_ts()}] [summary] noise_reference ok={sufficient_noise_refs} insufficient={insufficient_noise_refs}"
     )
+    candidate_audit_path = _write_candidate_detection_audit(
+        cfg,
+        processed_mask=processed_mask,
+        source_coords_map=source_coords_map,
+        candidate_audit_by_pixel=candidate_audit_by_pixel,
+        tophat_window=int(th_window),
+        detection_mode=str(detection_mode),
+    )
+    raw_peak_zero = sum(1 for audit in candidate_audit_by_pixel.values() if int(audit.get("raw_candidate_score_peaks", 0) or 0) == 0)
+    noise_kept_zero = sum(1 for audit in candidate_audit_by_pixel.values() if int(audit.get("post_noise_prefilter_candidates", 0) or 0) == 0)
+    noise_values = [_safe_float(audit.get("per_spectrum_noise_value")) for audit in candidate_audit_by_pixel.values()]
+    threshold_values = [_safe_float(audit.get("candidate_threshold_used")) for audit in candidate_audit_by_pixel.values()]
+    print(
+        f"[{_ts()}] [summary] candidate detection audit: "
+        f"spectra_processed={processed_spectra} spectra_with_zero_raw_peaks={raw_peak_zero} "
+        f"spectra_with_zero_noise_kept_candidates={noise_kept_zero} "
+        f"median_noise={_median_or_nan(noise_values):.6g} median_threshold={_median_or_nan(threshold_values):.6g} "
+        f"top_hat_window_used={th_window} mode={detection_mode}"
+    )
+    print(f"[{_ts()}] [audit] candidate_detection_audit -> {candidate_audit_path}")
     print(f"[{_ts()}] [summary] edge_finite_for_noise_kept={len(finite_edge_rows)}/{len(noise_kept_rows)}")
     print(
         f"[{_ts()}] [summary] pce_finite_for_noise_kept={len(finite_pce_rows)}/{len(noise_kept_rows)} "
@@ -621,6 +689,88 @@ def _write_missing_edge_audit(cfg: CoreConfig, rows: list[dict[str, Any]]) -> No
                     "edge_noise_range": dbg.get("edge_noise_range"),
                 }
             )
+
+
+def _candidate_detection_audit_path(cfg: CoreConfig) -> Path:
+    output_dir = Path(cfg.paths["output_dir"])
+    viewer_cache_stem = Path(str(cfg.paths.get("viewer_cache_path", "viewer_cache.npz"))).stem
+    suffix = viewer_cache_stem[len("viewer_cache") :] if viewer_cache_stem.startswith("viewer_cache") else ""
+    return output_dir / f"candidate_detection_audit{suffix}.csv"
+
+
+def _write_candidate_detection_audit(
+    cfg: CoreConfig,
+    *,
+    processed_mask: np.ndarray,
+    source_coords_map: dict[tuple[int, int], tuple[int, int]],
+    candidate_audit_by_pixel: dict[tuple[int, int], dict[str, Any]],
+    tophat_window: int,
+    detection_mode: str,
+) -> Path:
+    out_path = _candidate_detection_audit_path(cfg)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "compact_y",
+        "compact_x",
+        "source_y",
+        "source_x",
+        "candidate_detection_mode",
+        "tophat_window_used",
+        "min_peak_used",
+        "noise_height_factor_used",
+        "raw_candidate_score_peaks",
+        "raw_candidate_score_points",
+        "post_filter_candidates",
+        "post_noise_prefilter_candidates",
+        "noise_prefilter_rejected_candidates",
+        "per_spectrum_noise_value",
+        "per_spectrum_noise_source",
+        "per_spectrum_noise_status",
+        "candidate_threshold_used",
+        "effective_threshold",
+        "score_threshold_used",
+        "mad_threshold_used",
+        "noise_threshold_used",
+        "mad_threshold_ignored_in_local_1d",
+        "max_candidate_score",
+        "noise_reference_n_points",
+    ]
+    ys, xs = np.where(np.asarray(processed_mask, dtype=bool))
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for cy, cx in zip(ys.tolist(), xs.tolist()):
+            source_y, source_x = source_coords_map.get((int(cy), int(cx)), (int(cy), int(cx)))
+            audit = dict(candidate_audit_by_pixel.get((int(cy), int(cx)), {}))
+            writer.writerow(
+                {
+                    "compact_y": int(cy),
+                    "compact_x": int(cx),
+                    "source_y": int(source_y),
+                    "source_x": int(source_x),
+                    "candidate_detection_mode": str(detection_mode),
+                    "tophat_window_used": int(tophat_window),
+                    "min_peak_used": _safe_float(audit.get("min_peak_used")),
+                    "noise_height_factor_used": _safe_float(audit.get("noise_height_factor_used")),
+                    "raw_candidate_score_peaks": int(audit.get("raw_candidate_score_peaks", 0) or 0),
+                    "raw_candidate_score_points": int(audit.get("raw_candidate_score_points", 0) or 0),
+                    "post_filter_candidates": int(audit.get("post_filter_candidates", 0) or 0),
+                    "post_noise_prefilter_candidates": int(audit.get("post_noise_prefilter_candidates", 0) or 0),
+                    "noise_prefilter_rejected_candidates": int(audit.get("noise_prefilter_rejected_candidates", 0) or 0),
+                    "per_spectrum_noise_value": _safe_float(audit.get("per_spectrum_noise_value")),
+                    "per_spectrum_noise_source": str(audit.get("per_spectrum_noise_source", "")),
+                    "per_spectrum_noise_status": str(audit.get("per_spectrum_noise_status", "")),
+                    "candidate_threshold_used": _safe_float(audit.get("candidate_threshold_used")),
+                    "effective_threshold": _safe_float(audit.get("effective_threshold")),
+                    "score_threshold_used": _safe_float(audit.get("score_threshold_used")),
+                    "mad_threshold_used": _safe_float(audit.get("mad_threshold_used")),
+                    "noise_threshold_used": _safe_float(audit.get("noise_threshold_used")),
+                    "mad_threshold_ignored_in_local_1d": int(audit.get("mad_threshold_ignored_in_local_1d", 0) or 0),
+                    "max_candidate_score": _safe_float(audit.get("max_candidate_score")),
+                    "noise_reference_n_points": int(audit.get("noise_reference_n_points", 0) or 0),
+                }
+            )
+    return out_path
 
 
 def _legacy_candidate_rows(legacy_debug_path: Path) -> list[dict[str, Any]]:

@@ -20,12 +20,12 @@ if __package__ in {None, ""}:
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
 
-    from muonfinder_core.cache import load_viewer_cache
+    from muonfinder_core.cache import load_viewer_cache_light
     from muonfinder_core.config import load_config
     from muonfinder_core.despike import compute_despike_from_cache_and_ss6
     from muonfinder_core.metrics import MetricComputationContext
 else:
-    from .cache import load_viewer_cache
+    from .cache import load_viewer_cache_light
     from .config import load_config
     from .despike import compute_despike_from_cache_and_ss6
     from .metrics import MetricComputationContext
@@ -71,7 +71,7 @@ def run_compute_despike(
     summary_path = Path(summary_out) if summary_out is not None else Path(str(despike_cfg["summary_path"]))
 
     t0 = time.perf_counter()
-    cache = load_viewer_cache(cache_path)
+    cache = load_viewer_cache_light(cache_path, verbose=True)
     timings["inspect cache"] = time.perf_counter() - t0
     viewer_cache_shape = list(np.asarray(cache.get("spectra", np.asarray([]))).shape)
 
@@ -93,6 +93,8 @@ def run_compute_despike(
     print(f"config path: {cfg_path}")
     print(f"viewer cache path: {cache_path}")
     print(f"viewer cache shape: {tuple(viewer_cache_shape)}")
+    print(f"candidate records source: {cache.get('candidate_records_source', 'unknown')}")
+    print(f"candidate records count: {len(cache.get('candidate_records', []))}")
     print(f"ss6 decisions path: {ss6_path}")
     print(f"despike corrected path: {corrected_path}")
     print(f"despike attempts path: {attempts_path}")
@@ -106,6 +108,7 @@ def run_compute_despike(
     print("despike correction...")
     artifacts = compute_despike_from_cache_and_ss6(
         cache_path=cache_path,
+        cache=cache,
         ss6_path=ss6_path,
         corrected_path=corrected_path,
         debug_path=debug_path,
