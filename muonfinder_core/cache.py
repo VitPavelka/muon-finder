@@ -1,24 +1,88 @@
 from __future__ import annotations
 
+import tempfile
+import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
 from .data_model import PipelineArtifacts
 from .utils import dumps_json, loads_json
 
+_CHUNK_SIZE = 4 * 1024 * 1024
 
-def save_viewer_cache(path: Path | str, artifacts: PipelineArtifacts) -> None:
-    out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+def _fmt_mib(num_bytes: int) -> str:
+    return f"{float(num_bytes) / (1024.0 * 1024.0):.1f} MiB"
+
+
+class _CacheWriteProgress:
+    def __init__(self, total_bytes: int, total_chunks: int) -> None:
+        self.total_bytes = int(max(0, total_bytes))
+        self.total_chunks = int(max(1, total_chunks))
+        self._bytes_done = 0
+        self._chunks_done = 0
+        self._last_print = time.perf_counter()
+        self._bar = None
+        if tqdm is not None:
+            self._bar = tqdm(
+                total=self.total_bytes if self.total_bytes > 0 else None,
+                desc="viewer cache",
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                dynamic_ncols=True,
+                mininterval=0.25,
+            )
+
+    def update(self, nbytes: int) -> None:
+        self._bytes_done += int(max(0, nbytes))
+        self._chunks_done += 1
+        if self._bar is not None:
+            self._bar.update(int(max(0, nbytes)))
+            return
+        now = time.perf_counter()
+        if now - self._last_print >= 5.0 or self._chunks_done >= self.total_chunks:
+            self._last_print = now
+            print(
+                f"[viewer-cache] writing viewer cache: "
+                f"{self._chunks_done}/{self.total_chunks} chunks "
+                f"({_fmt_mib(self._bytes_done)}/{_fmt_mib(self.total_bytes)})"
+            )
+
+    def close(self) -> None:
+        if self._bar is not None:
+            self._bar.close()
+
+
+def _build_cache_metadata(artifacts: PipelineArtifacts, config_path: Path | str | None) -> dict[str, Any]:
+    metadata = dict(artifacts.metadata)
+    metadata["viewer_cache_identity"] = {
+        "input_data_path": str(artifacts.dataset.path),
+        "spectra_shape": [int(v) for v in np.asarray(artifacts.spectra).shape],
+        "corrected_shape": [int(v) for v in np.asarray(artifacts.corrected_spectra).shape],
+        "x_axis_length": int(np.asarray(artifacts.x_axis).size),
+        "created_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config_path": (str(Path(config_path)) if config_path is not None else ""),
+    }
+    return metadata
+
+
+def _build_viewer_cache_payload(artifacts: PipelineArtifacts, config_path: Path | str | None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "x_axis": np.asarray(artifacts.x_axis),
         "spectra": np.asarray(artifacts.spectra),
         "corrected_spectra": np.asarray(artifacts.corrected_spectra),
         "score_map": np.asarray(artifacts.score_map),
         "candidate_mask": np.asarray(artifacts.candidate_mask, dtype=np.uint8),
-        "metadata_json": np.array([dumps_json(artifacts.metadata)], dtype=object),
+        "metadata_json": np.array([dumps_json(_build_cache_metadata(artifacts, config_path))], dtype=object),
         "candidate_records_json": np.array([dumps_json(_flatten_records(artifacts.candidate_records_by_pixel))], dtype=object),
         "candidates_json": np.array([dumps_json(_flatten_candidates(artifacts.candidates_by_pixel))], dtype=object),
         "coord_map_json": np.array([dumps_json(_coord_map_rows(artifacts.source_coords_map))], dtype=object),
@@ -29,7 +93,40 @@ def save_viewer_cache(path: Path | str, artifacts: PipelineArtifacts) -> None:
     for overlay_name, by_window in artifacts.overlays.items():
         for window, arr in by_window.items():
             payload[f"overlay_{overlay_name}_w{int(window)}"] = np.asarray(arr)
-    np.savez_compressed(out_path, **payload)
+    return payload
+
+
+def _write_npz_payload(out_path: Path, payload: dict[str, Any]) -> None:
+    with tempfile.TemporaryDirectory(prefix="viewer_cache_") as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
+        staged: list[tuple[str, Path, int]] = []
+        for key, value in payload.items():
+            tmp_file = tmpdir / f"{key}.npy"
+            with tmp_file.open("wb") as f:
+                np.save(f, np.asarray(value), allow_pickle=True)
+            staged.append((key, tmp_file, int(tmp_file.stat().st_size)))
+        total_bytes = sum(size for _key, _path, size in staged)
+        total_chunks = sum(max(1, (size + _CHUNK_SIZE - 1) // _CHUNK_SIZE) for _key, _path, size in staged)
+        progress = _CacheWriteProgress(total_bytes=total_bytes, total_chunks=total_chunks)
+        try:
+            with zipfile.ZipFile(out_path, mode="w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                for key, tmp_file, _size in staged:
+                    with tmp_file.open("rb") as src, zf.open(f"{key}.npy", mode="w", force_zip64=True) as dst:
+                        while True:
+                            chunk = src.read(_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                            progress.update(len(chunk))
+        finally:
+            progress.close()
+
+
+def save_viewer_cache(path: Path | str, artifacts: PipelineArtifacts, config_path: Path | str | None = None) -> None:
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _build_viewer_cache_payload(artifacts, config_path=config_path)
+    _write_npz_payload(out_path, payload)
 
 
 def load_viewer_cache(path: Path | str) -> dict[str, Any]:

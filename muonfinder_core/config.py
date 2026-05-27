@@ -199,6 +199,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "summary_path": "outputs_core/despike_summary.json",
         "morph_window": 3,
         "despike_context_window_pad": 0,
+        "pce_context": False,
         "noise_height_factor": 3.0,
         "max_iterations": 1000,
     },

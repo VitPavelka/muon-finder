@@ -6,6 +6,7 @@ import json
 from collections import Counter
 from pathlib import Path
 import time
+from typing import Any
 
 import numpy as np
 
@@ -175,29 +176,30 @@ def _write_pce_audit(
     return audited, len(audit_rows)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Compute experimental SS6 rule-based decisions from viewer cache and experimental features.")
-    parser.add_argument("--config", type=Path, default=Path("config_core.json"), help="Core config; used to resolve viewer_cache_path, experimental features, and SS6 output paths.")
-    parser.add_argument("--cache", type=Path, default=None, help="Optional explicit viewer cache path.")
-    parser.add_argument("--experimental-features", type=Path, default=None, help="Optional explicit experimental_features.csv path.")
-    parser.add_argument("--out", type=Path, default=None, help="Optional SS6 CSV output path.")
-    parser.add_argument("--summary-out", type=Path, default=None, help="Optional SS6 summary JSON output path.")
-    parser.add_argument("--force-experimental-recompute", action="store_true", help="Always recompute experimental features before SS6.")
-    parser.add_argument("--no-experimental-recompute", action="store_true", help="Reuse existing experimental features and fail clearly if missing.")
-    parser.add_argument("--no-histograms", action="store_true", help="Skip SS6 histogram generation.")
-    args = parser.parse_args()
-
+def run_ss6_decisions(
+    *,
+    config_path: Path | str,
+    cache_path: Path | None = None,
+    experimental_features_path: Path | None = None,
+    out_path: Path | None = None,
+    summary_out: Path | None = None,
+    force_experimental_recompute: bool = False,
+    no_experimental_recompute: bool = False,
+    no_histograms: bool = False,
+) -> tuple[dict[str, Any], dict[str, float]]:
     timings: dict[str, float] = {}
     t_start = time.perf_counter()
     stage_t0 = time.perf_counter()
-    cfg = load_config(args.config)
+    cfg_path = Path(config_path)
+    print(f"config path: {cfg_path}")
+    cfg = load_config(cfg_path)
     timings["load config"] = time.perf_counter() - stage_t0
     ss6_cfg = ss6_defaults(getattr(cfg, "ss6", {}))
     exp_cfg = dict(getattr(cfg, "experimental_features", {}))
-    cache_path = Path(args.cache) if args.cache is not None else Path(str(cfg.paths["viewer_cache_path"]))
-    exp_path = Path(args.experimental_features) if args.experimental_features is not None else Path(str(exp_cfg.get("features_path", "")))
-    out_path = Path(args.out) if args.out is not None else Path(str(ss6_cfg["decisions_path"]))
-    summary_path = Path(args.summary_out) if args.summary_out is not None else Path(str(ss6_cfg["summary_path"]))
+    cache_path = Path(cache_path) if cache_path is not None else Path(str(cfg.paths["viewer_cache_path"]))
+    exp_path = Path(experimental_features_path) if experimental_features_path is not None else Path(str(exp_cfg.get("features_path", "")))
+    out_path = Path(out_path) if out_path is not None else Path(str(ss6_cfg["decisions_path"]))
+    summary_path = Path(summary_out) if summary_out is not None else Path(str(ss6_cfg["summary_path"]))
     auto_recompute = bool(exp_cfg.get("auto_recompute", True))
     print(f"viewer cache: {cache_path}")
     print(f"experimental features path: {exp_path}")
@@ -206,14 +208,14 @@ def main() -> None:
         cache_path=cache_path,
         exp_path=exp_path,
         auto_recompute=auto_recompute,
-        force_experimental=bool(args.force_experimental_recompute),
-        skip_experimental_recompute=bool(args.no_experimental_recompute),
+        force_experimental=bool(force_experimental_recompute),
+        skip_experimental_recompute=bool(no_experimental_recompute),
     )
     required_exp_columns = ["d3rawM", "d3rawS", "d3gradM", "d3gradS"]
     if not recompute_exp:
         missing_exp_cols = _missing_required_experimental_columns(exp_path, required_exp_columns)
         if missing_exp_cols:
-            if bool(args.no_experimental_recompute):
+            if bool(no_experimental_recompute):
                 raise ValueError(f"Experimental features CSV missing required columns: {missing_exp_cols}")
             recompute_exp = True
             recompute_reason = "missing_required_d3_columns"
@@ -297,7 +299,7 @@ def main() -> None:
     elif audit_path.exists():
         audit_path.unlink()
 
-    save_histograms = bool(ss6_cfg.get("save_histograms", True)) and not bool(args.no_histograms)
+    save_histograms = bool(ss6_cfg.get("save_histograms", True)) and not bool(no_histograms)
     stage_t0 = time.perf_counter()
     if save_histograms:
         print("generating SS6 histograms...")
@@ -371,10 +373,36 @@ def main() -> None:
         print(f"ss6 histogram files: {len(generated_hist_files)}")
     print(f"ss6 output: {out_path}")
     print(f"ss6 summary: {summary_path}")
+    timings["total"] = time.perf_counter() - t_start
+    return summary, timings
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compute experimental SS6 rule-based decisions from viewer cache and experimental features.")
+    parser.add_argument("--config", type=Path, default=Path("config_core.json"), help="Core config; used to resolve viewer_cache_path, experimental features, and SS6 output paths.")
+    parser.add_argument("--cache", type=Path, default=None, help="Optional explicit viewer cache path.")
+    parser.add_argument("--experimental-features", type=Path, default=None, help="Optional explicit experimental_features.csv path.")
+    parser.add_argument("--out", type=Path, default=None, help="Optional SS6 CSV output path.")
+    parser.add_argument("--summary-out", type=Path, default=None, help="Optional SS6 summary JSON output path.")
+    parser.add_argument("--force-experimental-recompute", action="store_true", help="Always recompute experimental features before SS6.")
+    parser.add_argument("--no-experimental-recompute", action="store_true", help="Reuse existing experimental features and fail clearly if missing.")
+    parser.add_argument("--no-histograms", action="store_true", help="Skip SS6 histogram generation.")
+    args = parser.parse_args()
+    summary, timings = run_ss6_decisions(
+        config_path=args.config,
+        cache_path=args.cache,
+        experimental_features_path=args.experimental_features,
+        out_path=args.out,
+        summary_out=args.summary_out,
+        force_experimental_recompute=bool(args.force_experimental_recompute),
+        no_experimental_recompute=bool(args.no_experimental_recompute),
+        no_histograms=bool(args.no_histograms),
+    )
+    _ = summary
     print("Timing summary:")
     for key in ("load config", "load cache", "experimental features", "load experimental rows", "join rows", "SS6 decisions", "write outputs", "histograms"):
         print(f"  {key}: {timings.get(key, 0.0):.1f} s")
-    print(f"  total: {time.perf_counter() - t_start:.1f} s")
+    print(f"  total: {timings.get('total', 0.0):.1f} s")
 
 
 if __name__ == "__main__":

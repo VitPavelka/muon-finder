@@ -206,6 +206,71 @@ def _dedup_legend(handles: list[Any], labels: list[str]) -> tuple[list[Any], lis
     return out_h, out_l
 
 
+def _compatible_signal_cube(candidate: Any, reference_shape: tuple[int, ...]) -> bool:
+    arr = np.asarray(candidate)
+    return tuple(arr.shape) == tuple(reference_shape)
+
+
+def _filter_despike_rows_for_shape(
+    rows: list[dict[str, Any]],
+    *,
+    h: int,
+    w: int,
+    n: int,
+    y_key: str,
+    x_key: str,
+) -> tuple[list[dict[str, Any]], int]:
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    index_keys = (
+        "original_peak_index",
+        "detected_peak_index",
+        "context_left",
+        "context_right",
+        "tested_left",
+        "tested_right",
+        "left_erosion_contact",
+        "right_erosion_contact",
+        "dilation_contact",
+        "left_anchor",
+        "right_anchor",
+        "cell_left",
+        "cell_right",
+        "context_ss1_peak_index",
+        "context_pce_peak_index",
+        "context_pce_left_index",
+        "context_pce_right_index",
+    )
+    for row in rows:
+        try:
+            y = int(row.get(y_key, -1))
+            x = int(row.get(x_key, -1))
+        except Exception:
+            dropped += 1
+            continue
+        if not (0 <= y < h and 0 <= x < w):
+            dropped += 1
+            continue
+        bad_index = False
+        for key in index_keys:
+            value = row.get(key, "")
+            if value in {"", None}:
+                continue
+            try:
+                idx = int(value)
+            except Exception:
+                bad_index = True
+                break
+            if not (0 <= idx < n):
+                bad_index = True
+                break
+        if bad_index:
+            dropped += 1
+            continue
+        kept.append(row)
+    return kept, dropped
+
+
 def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     x_axis = np.asarray(cache["x_axis"], dtype=float)
     spectra = np.asarray(cache["spectra"], dtype=float)
@@ -292,12 +357,26 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         despike_path = Path(despike_path_raw)
         if despike_path.exists():
             despike_bundle = load_despike_bundle(despike_path)
-            corrected = np.asarray(despike_bundle.get("corrected_spectra", corrected), dtype=float)
-            chords = [dict(row) for row in despike_bundle.get("despike_chords", [])] or chords
-            despike_attempts = [dict(row) for row in despike_bundle.get("despike_attempt_rows", [])]
+            corrected_candidate = np.asarray(despike_bundle.get("corrected_spectra", corrected), dtype=float)
             print(f"despike corrected path: {despike_path}")
-            print(f"despike chords loaded: {len(chords)}")
-            print(f"despike attempts loaded: {len(despike_attempts)}")
+            if _compatible_signal_cube(corrected_candidate, tuple(spectra.shape)):
+                corrected = corrected_candidate
+                raw_chords = [dict(row) for row in despike_bundle.get("despike_chords", [])]
+                raw_attempts = [dict(row) for row in despike_bundle.get("despike_attempt_rows", [])]
+                h, w, n = map(int, spectra.shape)
+                chords, dropped_chords = _filter_despike_rows_for_shape(raw_chords, h=h, w=w, n=n, y_key="y", x_key="x")
+                despike_attempts, dropped_attempts = _filter_despike_rows_for_shape(raw_attempts, h=h, w=w, n=n, y_key="compact_y", x_key="compact_x")
+                print(f"despike chords loaded: {len(chords)}")
+                print(f"despike attempts loaded: {len(despike_attempts)}")
+                if dropped_chords:
+                    print(f"[viewer] ignored {dropped_chords} despike chord rows outside viewer cache shape")
+                if dropped_attempts:
+                    print(f"[viewer] ignored {dropped_attempts} despike attempt rows outside viewer cache shape")
+            else:
+                print("[viewer] ignored despike corrected data because shape does not match viewer cache")
+                print(f"viewer cache shape: {tuple(spectra.shape)}")
+                print(f"despike corrected shape: {tuple(corrected_candidate.shape)}")
+                print(f"despike corrected path: {despike_path}")
         else:
             print("despike corrected file not found. Run compute_despike first.")
     morph_windows = sorted(int(v) for v in metadata.get("morphology_windows", sorted(overlays.get("dilation", {}).keys())))
@@ -647,21 +726,23 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         legend_handles: list[Any] = []
         legend_labels: list[str] = []
         first = True
-        for row in rows:
-            if str(row.get("candidate_noise_prefilter_status", "")) == "rejected_noise":
-                continue
-            debug = row.get("pce_t98_debug", {})
-            if not isinstance(debug, dict):
-                continue
+
+        def _draw_single_pce_debug(debug: dict[str, Any], start: int, context_left: int | None = None, context_right: int | None = None, peak_idx: int | None = None) -> None:
+            nonlocal first
             x_rel = [int(v) for v in debug.get("curve_x_rel", [])]
             y_vals = np.asarray(debug.get("curve_y", []), dtype=float)
             if not x_rel or y_vals.size != len(x_rel):
-                continue
-            start = int(row.get("start", 0))
+                return
             x_plot_idx = np.asarray([start + int(v) for v in x_rel], dtype=int)
             if np.any(x_plot_idx < 0) or np.any(x_plot_idx >= len(x_axis)):
-                continue
-            ax_spec.axvspan(x_axis[int(x_plot_idx[0])], x_axis[int(x_plot_idx[-1])], color="#666666", alpha=0.08, zorder=0)
+                return
+            if context_left is not None and context_right is not None:
+                li = int(max(0, context_left))
+                ri = int(min(len(x_axis) - 1, context_right))
+                if ri >= li:
+                    ax_spec.axvspan(x_axis[li], x_axis[ri], color="#666666", alpha=0.08, zorder=0)
+            else:
+                ax_spec.axvspan(x_axis[int(x_plot_idx[0])], x_axis[int(x_plot_idx[-1])], color="#666666", alpha=0.08, zorder=0)
             line, = ax_spec.plot(x_axis[x_plot_idx], y_vals, color="black", linewidth=1.4, alpha=0.95, zorder=2, label="curvature")
             apex_idx_rel = int(debug.get("apex_idx_rel", 1))
             chosen_idx_rel = int(debug.get("chosen_idx_rel", 1))
@@ -676,8 +757,11 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                 pos = rel - 1
                 if not (0 <= pos < y_vals.size):
                     return None
+                abs_idx = start + rel
+                if not (0 <= abs_idx < len(x_axis)):
+                    return None
                 return ax_spec.plot(
-                    [x_axis[start + rel]],
+                    [x_axis[abs_idx]],
                     [y_vals[pos]],
                     marker=marker,
                     color=color,
@@ -695,6 +779,8 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             rr = start + local_right_rel
             if 0 <= ll < len(x_axis) and 0 <= rr < len(x_axis) and rr >= ll:
                 ax_spec.axvspan(x_axis[ll], x_axis[rr], color="#999999", alpha=0.06, zorder=1)
+            if peak_idx is not None and 0 <= int(peak_idx) < len(x_axis):
+                ax_spec.axvline(x_axis[int(peak_idx)], color="#d62728", linestyle=":", linewidth=1.1, alpha=0.8, zorder=3)
             if first:
                 legend_handles.append(line)
                 legend_labels.append("curvature")
@@ -708,6 +794,27 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                         legend_handles.append(handle)
                         legend_labels.append(label)
                 first = False
+        attempt = current_attempt()
+        if attempt is not None:
+            debug = attempt.get("pce_t98_debug_local", {})
+            if isinstance(debug, dict) and debug:
+                _draw_single_pce_debug(
+                    debug,
+                    start=int(attempt.get("tested_left", attempt.get("cell_left", 0))),
+                    context_left=int(attempt.get("context_left", attempt.get("tested_left", 0))),
+                    context_right=int(attempt.get("context_right", attempt.get("tested_right", 0))),
+                    peak_idx=int(attempt.get("detected_peak_index", -1)),
+                )
+                ax_spec._pce_legend_handles = legend_handles  # type: ignore[attr-defined]
+                ax_spec._pce_legend_labels = legend_labels  # type: ignore[attr-defined]
+                return
+        for row in rows:
+            if str(row.get("candidate_noise_prefilter_status", "")) == "rejected_noise":
+                continue
+            debug = row.get("pce_t98_debug", {})
+            if not isinstance(debug, dict):
+                continue
+            _draw_single_pce_debug(debug, start=int(row.get("start", 0)))
         ax_spec._pce_legend_handles = legend_handles  # type: ignore[attr-defined]
         ax_spec._pce_legend_labels = legend_labels  # type: ignore[attr-defined]
 
@@ -1169,24 +1276,28 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         original_branch = str(attempt.get("original_ss6_branch", "")).strip()
         local_branch = str(attempt.get("local_ss6_branch", attempt.get("ss6_local_branch", ""))).strip()
         attempt_type = str(attempt.get("attempt_type", "")).strip()
+        status = str(attempt.get("status", "")).strip()
         if attempt_type == "parent":
             if original_branch:
                 lines.append(f"ss6 {original_branch}")
         elif attempt_type == "mask_cleanup":
             lines.append("mask cleanup")
         else:
-            if local_branch:
+            if status == "context_ss1_low":
+                lines.append("local rejected")
+            elif local_branch:
                 lines.append(f"local ss6 {local_branch}")
         for key in ("ss1", "pce", "edge", "eel", "resid"):
             val = metric_float(attempt, key)
             if np.isfinite(val):
                 lines.append(f"{key}={val:.3g}")
-        status = str(attempt.get("status", "")).strip()
         if status:
             if status == "corrected_parent":
                 lines.append("corrected")
             elif status == "corrected_iterative_local_ss6":
-                lines.append("corrected iterative")
+                lines.append("corrected")
+            elif status == "context_ss1_low":
+                lines.append("reason=context_ss1_low")
             elif status == "corrected_mask_residual_cleanup":
                 overlap = metric_float(attempt, "corrected_mask_overlap_fraction")
                 hchord = metric_float(attempt, "height_above_chord_noise_z")

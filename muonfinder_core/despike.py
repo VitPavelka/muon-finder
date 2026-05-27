@@ -275,6 +275,8 @@ def _build_local_ss6_row(
     global_edge_center: float,
     global_edge_scale: float,
     parent_noise_source: str = "",
+    ss1_override: float | None = None,
+    pce_override: float | None = None,
 ) -> dict[str, Any]:
     seg = CandidateSegment(
         y=int(base_row.get("y", -1)),
@@ -334,12 +336,61 @@ def _build_local_ss6_row(
     else:
         row["exp_edge_legacy_evidence_signed_modernnorm"] = row.get("exp_edge_legacy_evidence_signed_modernnorm", np.nan)
     row["exp_resid3_height_noise_z"] = row.get("exp_resid3_height_noise_z", np.nan)
+    if ss1_override is not None and np.isfinite(float(ss1_override)):
+        row["spike_score_v1"] = float(ss1_override)
+    if pce_override is not None and np.isfinite(float(pce_override)):
+        row["pce_local_audit"] = _safe_float(row.get("pce_negpref_t098_evidence_signed"))
+        row["pce_negpref_t098_evidence_signed"] = float(pce_override)
+        row["pce_t098_evidence_signed"] = float(pce_override)
+        row["pce"] = float(pce_override)
     ss6_row = compute_ss6_row(row, ss6_cfg)
     row.update(ss6_row)
     row["ss6_local_accept"] = int(ss6_row.get("ss6_accept", 0))
     row["ss6_local_branch"] = str(ss6_row.get("ss6_branch", ""))
     row["ss6_local_pce"] = ss6_row.get("ss6_pce", np.nan)
     return row
+
+
+def _compute_context_metrics(
+    *,
+    signal: np.ndarray,
+    gradient_signal: np.ndarray,
+    base_row: dict[str, Any],
+    context_left: int,
+    context_right: int,
+    peak_idx: int,
+    noise_value: float,
+    noise_source: str,
+) -> dict[str, Any]:
+    seg = CandidateSegment(
+        y=int(base_row.get("y", -1)),
+        x=int(base_row.get("x", -1)),
+        peak_index=int(peak_idx),
+        start=int(context_left),
+        end=int(context_right),
+        peak_height=float(signal[int(peak_idx)]),
+        area=float(max(0.0, signal[int(peak_idx)])),
+    )
+    features = compute_ss1_pce_features(
+        raw_signal=np.asarray(signal, dtype=float),
+        gradient_signal=np.asarray(gradient_signal, dtype=float),
+        seg=seg,
+        feature_signal_source="gradient",
+        bg_noise_override=(float(noise_value) if np.isfinite(noise_value) and float(noise_value) > 0.0 else None),
+    )
+    return {
+        "context_ss1": _safe_float(features.get("spike_score_v1")),
+        "context_pce": _safe_float(features.get("pce_negpref_t098_evidence_signed")),
+        "context_pce_status": ("ok" if np.isfinite(_safe_float(features.get("pce_negpref_t098_evidence_signed"))) else "fallback_to_local_pce"),
+        "context_pce_left_index": int(context_left),
+        "context_pce_right_index": int(context_right),
+        "context_pce_peak_index": int(peak_idx),
+        "context_pce_noise_value": float(noise_value) if np.isfinite(noise_value) else np.nan,
+        "context_pce_noise_source": str(noise_source),
+        "context_pce_debug": (features.get("pce_t98_debug", {}) if isinstance(features.get("pce_t98_debug", {}), dict) else {}),
+        "context_ss1_noise_value": float(noise_value) if np.isfinite(noise_value) else np.nan,
+        "context_ss1_noise_source": str(noise_source),
+    }
 
 
 def _local_missing_metrics(local_row: dict[str, Any], ss6_cfg: dict[str, Any]) -> str:
@@ -366,10 +417,13 @@ def compute_despike_from_cache_and_ss6(
     despike_context_window_pad: int,
     noise_height_factor: float,
     max_iterations: int,
+    ss1_context_threshold: float = 0.95,
+    pce_context_enabled: bool = False,
     ss6_config: dict[str, Any] | None = None,
     metric_context: MetricComputationContext | None = None,
     progress_iter: Callable[[list[tuple[tuple[int, int], list[dict[str, Any]]]]], Any] | None = None,
     timings_out: dict[str, float] | None = None,
+    config_path: Path | str | None = None,
 ) -> DespikeArtifacts:
     t0 = time.perf_counter()
     cache = load_viewer_cache(cache_path)
@@ -408,6 +462,8 @@ def compute_despike_from_cache_and_ss6(
     global_edge_center, global_edge_scale = robust_center_scale(edge_raw_values)
     ss6_cfg = ss6_defaults(ss6_config or {})
     morph_window_used = int(morph_window)
+    local_context_ss1_threshold = float(ss1_context_threshold)
+    pce_context_enabled = bool(pce_context_enabled)
 
     summary_counts = {
         "accepted_ss6_parent_candidates": int(len(accepted_rows)),
@@ -415,10 +471,17 @@ def compute_despike_from_cache_and_ss6(
         "parent_skipped_below_noise_height": 0,
         "parent_skipped_no_erosion_neighbors": 0,
         "local_candidates_from_dilation_contacts": 0,
+        "local_candidates_passed_noise_height": 0,
         "local_candidates_rejected_by_noise_height": 0,
+        "local_contexts_with_context_ss1": 0,
+        "local_candidates_rejected_by_context_ss1_low": 0,
         "local_candidates_sent_to_ss6": 0,
         "local_candidates_accepted_by_ss6": 0,
         "local_candidates_corrected": 0,
+        "local_context_pce_computed": 0,
+        "local_context_pce_missing": 0,
+        "local_candidates_using_context_pce": 0,
+        "local_candidates_fallback_to_local_pce": 0,
         "total_corrections_applied": 0,
         "spectra_with_corrections": 0,
         "technical_failures": 0,
@@ -793,6 +856,7 @@ def compute_despike_from_cache_and_ss6(
                 )
                 context_eros_json = _serialize_contact_list(context_eros)
                 context_dils_json = _serialize_contact_list(context_dils)
+                passed_noise_candidates: list[dict[str, Any]] = []
                 for dilation_peak in _local_dilation_candidates(dilation_contacts, int(context["context_left"]), int(context["context_right"])):
                     summary_counts["local_candidates_from_dilation_contacts"] += 1
                     geom = _geometry_for_peak(
@@ -869,7 +933,136 @@ def compute_despike_from_cache_and_ss6(
                             }
                         )
                         continue
+                    summary_counts["local_candidates_passed_noise_height"] += 1
+                    passed_noise_candidates.append(
+                        {
+                            "dilation_peak": int(dilation_peak),
+                            "geom": geom,
+                            "height_above_chord": float(height_above_chord),
+                            "height_above_chord_noise_z": float(height_z),
+                            "noise_value": float(noise_value),
+                            "local_noise_would_have_been": float(local_noise_would_have_been) if np.isfinite(local_noise_would_have_been) else np.nan,
+                            "previous_local_noise_fallback": bool(previous_local_noise_fallback),
+                        }
+                    )
+                if not passed_noise_candidates:
+                    continue
+                strongest_candidate = max(
+                    passed_noise_candidates,
+                    key=lambda item: (_safe_float(item.get("height_above_chord_noise_z")), _safe_float(item.get("height_above_chord"))),
+                )
+                context_metrics = _compute_context_metrics(
+                    signal=current_signal,
+                    gradient_signal=gradient_signal,
+                    base_row=context["row"],
+                    context_left=int(context["context_left"]),
+                    context_right=int(context["context_right"]),
+                    peak_idx=int(strongest_candidate["dilation_peak"]),
+                    noise_value=float(context["parent_noise_value"]),
+                    noise_source=str(context["parent_noise_source"]),
+                )
+                summary_counts["local_contexts_with_context_ss1"] += 1
+                context_ss1 = _safe_float(context_metrics.get("context_ss1"))
+                context_pce = _safe_float(context_metrics.get("context_pce"))
+                context_pce_status = ("disabled" if not pce_context_enabled else str(context_metrics.get("context_pce_status", "fallback_to_local_pce")))
+                if pce_context_enabled and np.isfinite(context_pce):
+                    summary_counts["local_context_pce_computed"] += 1
+                elif pce_context_enabled:
+                    summary_counts["local_context_pce_missing"] += 1
+                context_ss1_fields = {
+                    "context_ss1": context_ss1,
+                    "context_ss1_peak_index": int(strongest_candidate["dilation_peak"]),
+                    "context_ss1_peak_x": _peak_shift(np.asarray(cache["x_axis"], dtype=float), int(strongest_candidate["dilation_peak"])),
+                    "context_ss1_noise_value": _safe_float(context_metrics.get("context_ss1_noise_value")),
+                    "context_ss1_noise_source": str(context_metrics.get("context_ss1_noise_source", "")),
+                    "context_ss1_candidate_count": int(len(passed_noise_candidates)),
+                    "context_ss1_threshold": float(local_context_ss1_threshold),
+                    "local_ss1_gate_used": float(local_context_ss1_threshold),
+                    "context_pce": context_pce,
+                    "context_pce_peak_index": int(context_metrics.get("context_pce_peak_index", strongest_candidate["dilation_peak"])),
+                    "context_pce_peak_x": _peak_shift(np.asarray(cache["x_axis"], dtype=float), int(context_metrics.get("context_pce_peak_index", strongest_candidate["dilation_peak"]))),
+                    "context_pce_left_index": int(context_metrics.get("context_pce_left_index", context["context_left"])),
+                    "context_pce_right_index": int(context_metrics.get("context_pce_right_index", context["context_right"])),
+                    "context_pce_noise_value": _safe_float(context_metrics.get("context_pce_noise_value")),
+                    "context_pce_noise_source": str(context_metrics.get("context_pce_noise_source", "")),
+                    "context_pce_candidate_count": int(len(passed_noise_candidates)),
+                    "context_pce_status": context_pce_status,
+                    "context_pce_enabled": int(bool(pce_context_enabled)),
+                    "context_pce_debug": context_metrics.get("context_pce_debug", {}),
+                }
+                local_ss6_cfg = dict(ss6_cfg)
+                local_ss6_cfg["ss1_gate"] = float(local_context_ss1_threshold)
+                if not np.isfinite(context_ss1) or context_ss1 < float(local_context_ss1_threshold):
+                    summary_counts["local_candidates_rejected_by_context_ss1_low"] += int(len(passed_noise_candidates))
+                    for candidate in passed_noise_candidates:
+                        geom = candidate["geom"]
+                        local_noise_would_have_been = _safe_float(candidate.get("local_noise_would_have_been"))
+                        previous_local_noise_fallback = bool(candidate.get("previous_local_noise_fallback"))
+                        attempt_rows.append(
+                            {
+                                "source_y": context["source_y"],
+                                "source_x": context["source_x"],
+                                "compact_y": context["compact_y"],
+                                "compact_x": context["compact_x"],
+                                "stage_index": int(pass_index),
+                                "attempt_index_within_stage": "",
+                                "attempt_type": "iterative_local_ss6",
+                                "original_peak_index": context["original_peak_index"],
+                                "detected_peak_index": int(candidate["dilation_peak"]),
+                                "candidate_id": context["candidate_id"],
+                                "original_ss6_branch": context["original_ss6_branch"],
+                                "original_ss6_reason": context["original_ss6_reason"],
+                                "local_ss6_branch": "",
+                                "local_ss6_accept": 0,
+                                "context_left": context["context_left"],
+                                "context_right": context["context_right"],
+                                "tested_left": int(geom.cell_left),
+                                "tested_right": int(geom.cell_right),
+                                "left_erosion_contact": int(geom.left_anchor),
+                                "right_erosion_contact": int(geom.right_anchor),
+                                "dilation_contact": int(candidate["dilation_peak"]),
+                                "morph_window_used": int(morph_window_used),
+                                "context_erosion_contacts": context_eros_json,
+                                "context_dilation_contacts": context_dils_json,
+                                "height_above_chord": float(candidate["height_above_chord"]),
+                                "height_above_chord_noise_z": float(candidate["height_above_chord_noise_z"]),
+                                "noise_value": float(candidate["noise_value"]),
+                                "parent_noise_value": float(context["parent_noise_value"]),
+                                "parent_noise_source": context["parent_noise_source"],
+                                "previous_local_noise_value_if_available": local_noise_would_have_been,
+                                "local_noise_would_have_been": local_noise_would_have_been,
+                                "noise_ratio_local_to_parent": (float(local_noise_would_have_been / context["parent_noise_value"]) if np.isfinite(local_noise_would_have_been) and np.isfinite(context["parent_noise_value"]) and float(context["parent_noise_value"]) > 0.0 else np.nan),
+                                "noise_fallback_used": int(bool(context["noise_fallback_used"]) or bool(previous_local_noise_fallback)),
+                                "ss1_pce_noise_used": float(context["parent_noise_value"]) if np.isfinite(float(context["parent_noise_value"])) else np.nan,
+                                "ss1_pce_noise_source": str(context["parent_noise_source"]),
+                                "ss1_pce_noise_override_used": 1 if np.isfinite(float(context["parent_noise_value"])) and float(context["parent_noise_value"]) > 0.0 else 0,
+                                "chord_crossing_detected": 0,
+                                "chord_crossing_max": 0.0,
+                                "chord_support_adjustment_applied": 0,
+                                "replacement_increases_signal_max": 0.0,
+                                "correction_applied": 0,
+                                "status": "context_ss1_low",
+                                "skipped_reason": "context_ss1_low",
+                                "ss1": context_ss1,
+                                **context_ss1_fields,
+                            }
+                        )
+                    continue
+                for candidate in passed_noise_candidates:
                     summary_counts["local_candidates_sent_to_ss6"] += 1
+                    dilation_peak = int(candidate["dilation_peak"])
+                    geom = candidate["geom"]
+                    height_above_chord = float(candidate["height_above_chord"])
+                    height_z = float(candidate["height_above_chord_noise_z"])
+                    noise_value = float(candidate["noise_value"])
+                    local_noise_would_have_been = _safe_float(candidate.get("local_noise_would_have_been"))
+                    previous_local_noise_fallback = bool(candidate.get("previous_local_noise_fallback"))
+                    use_context_pce = bool(pce_context_enabled and np.isfinite(context_pce))
+                    pce_decision_source = "context" if use_context_pce else "local"
+                    if use_context_pce:
+                        summary_counts["local_candidates_using_context_pce"] += 1
+                    elif pce_context_enabled:
+                        summary_counts["local_candidates_fallback_to_local_pce"] += 1
                     local_row = _build_local_ss6_row(
                         signal=current_signal,
                         gradient_signal=gradient_signal,
@@ -877,11 +1070,13 @@ def compute_despike_from_cache_and_ss6(
                         peak_idx=int(dilation_peak),
                         geom=geom,
                         noise_value=float(noise_value),
-                        ss6_cfg=ss6_cfg,
+                        ss6_cfg=local_ss6_cfg,
                         metric_ctx=metric_ctx,
                         global_edge_center=float(global_edge_center),
                         global_edge_scale=float(global_edge_scale),
                         parent_noise_source=str(context["parent_noise_source"]),
+                        ss1_override=context_ss1,
+                        pce_override=(context_pce if use_context_pce else None),
                     )
                     local_accept = int(_safe_float(local_row.get("ss6_accept", 0)))
                     local_branch = str(local_row.get("ss6_branch", "")).strip()
@@ -932,11 +1127,15 @@ def compute_despike_from_cache_and_ss6(
                                 "correction_applied": 0,
                                 "status": ("local_missing_metric" if local_branch == "missing_metric" else "local_ss6_rejected"),
                                 "skipped_reason": (missing_metrics if local_branch == "missing_metric" else local_branch),
-                                "ss1": _safe_float(local_row.get("ss6_ss1")),
+                                "ss1": context_ss1,
                                 "pce": _safe_float(local_row.get("ss6_pce")),
                                 "edge": _safe_float(local_row.get("ss6_edge")),
                                 "eel": _safe_float(local_row.get("ss6_eel")),
                                 "resid": _safe_float(local_row.get("ss6_resid")),
+                                "pce_local_audit": _safe_float(local_row.get("pce_local_audit", local_row.get("pce_negpref_t098_evidence_signed"))),
+                                "pce_decision_source": pce_decision_source,
+                                "pce_t98_debug_local": (local_row.get("pce_t98_debug", {}) if isinstance(local_row.get("pce_t98_debug", {}), dict) else {}),
+                                **context_ss1_fields,
                             }
                         )
                         continue
@@ -984,11 +1183,15 @@ def compute_despike_from_cache_and_ss6(
                             "ss1_pce_noise_override_used": int(_safe_float(local_row.get("ss1_pce_noise_override_used", 0))),
                             "status": "corrected_iterative_local_ss6",
                             "score": float(height_z),
-                            "ss1": _safe_float(local_row.get("ss6_ss1")),
+                            "ss1": context_ss1,
                             "pce": _safe_float(local_row.get("ss6_pce")),
                             "edge": _safe_float(local_row.get("ss6_edge")),
                             "eel": _safe_float(local_row.get("ss6_eel")),
                             "resid": _safe_float(local_row.get("ss6_resid")),
+                            "pce_local_audit": _safe_float(local_row.get("pce_local_audit", local_row.get("pce_negpref_t098_evidence_signed"))),
+                            "pce_decision_source": pce_decision_source,
+                            "pce_t98_debug_local": (local_row.get("pce_t98_debug", {}) if isinstance(local_row.get("pce_t98_debug", {}), dict) else {}),
+                            **context_ss1_fields,
                         }
                     )
 
@@ -1189,13 +1392,23 @@ def compute_despike_from_cache_and_ss6(
         "parent_skipped_below_noise_height": int(summary_counts["parent_skipped_below_noise_height"]),
         "parent_skipped_no_erosion_neighbors": int(summary_counts["parent_skipped_no_erosion_neighbors"]),
         "local_candidates_from_dilation_contacts": int(summary_counts["local_candidates_from_dilation_contacts"]),
+        "local_candidates_passed_noise_height": int(summary_counts["local_candidates_passed_noise_height"]),
         "local_candidates_rejected_by_noise_height": int(summary_counts["local_candidates_rejected_by_noise_height"]),
+        "local_contexts_with_context_ss1": int(summary_counts["local_contexts_with_context_ss1"]),
+        "local_candidates_rejected_by_context_ss1_low": int(summary_counts["local_candidates_rejected_by_context_ss1_low"]),
+        "local_candidates_rejected_by_context_ss1": int(summary_counts["local_candidates_rejected_by_context_ss1_low"]),
         "local_candidates_sent_to_ss6": int(summary_counts["local_candidates_sent_to_ss6"]),
         "local_candidates_accepted_by_ss6": int(summary_counts["local_candidates_accepted_by_ss6"]),
         "local_candidates_corrected": int(summary_counts["local_candidates_corrected"]),
+        "pce_context_enabled": bool(pce_context_enabled),
+        "local_context_pce_computed": int(summary_counts["local_context_pce_computed"]),
+        "local_context_pce_missing": int(summary_counts["local_context_pce_missing"]),
+        "local_candidates_using_context_pce": int(summary_counts["local_candidates_using_context_pce"]),
+        "local_candidates_fallback_to_local_pce": int(summary_counts["local_candidates_fallback_to_local_pce"]),
         "mask_cleanup_candidates_tested": int(summary_counts["mask_cleanup_candidates_tested"]),
         "mask_cleanup_corrected": int(summary_counts["mask_cleanup_corrected"]),
         "mask_cleanup_rejected_below_noise_height": int(summary_counts["mask_cleanup_rejected_below_noise_height"]),
+        "ss1_context_threshold": float(local_context_ss1_threshold),
         "local_candidates_with_parent_noise": int(summary_counts["local_candidates_with_parent_noise"]),
         "local_candidates_with_missing_parent_noise": int(summary_counts["local_candidates_with_missing_parent_noise"]),
         "median_noise_ratio_local_to_parent_if_available": (float(np.median(np.asarray(summary_counts["noise_ratio_values"], dtype=float))) if summary_counts["noise_ratio_values"] else float("nan")),
@@ -1212,6 +1425,11 @@ def compute_despike_from_cache_and_ss6(
             "attempts_path": str(attempts_path) if attempts_path is not None else "",
             "summary_path": str(summary_path) if summary_path is not None else "",
         },
+        "viewer_cache_path": str(cache_path),
+        "viewer_cache_shape": [int(v) for v in np.asarray(cache["spectra"]).shape],
+        "corrected_shape": [int(v) for v in np.asarray(corrected).shape],
+        "config_path": (str(Path(config_path)) if config_path is not None else ""),
+        "viewer_cache_identity": dict(cache.get("metadata", {})).get("viewer_cache_identity", {}),
         "join_info": join_info,
     }
 
@@ -1256,6 +1474,8 @@ def compute_despike_from_cache_and_ss6(
             "height_above_chord", "height_above_chord_noise_z", "noise_value",
             "parent_noise_value", "parent_noise_source", "previous_local_noise_value_if_available", "local_noise_would_have_been", "noise_ratio_local_to_parent", "noise_fallback_used",
             "ss1_pce_noise_used", "ss1_pce_noise_source", "ss1_pce_noise_override_used",
+            "context_ss1", "context_ss1_peak_index", "context_ss1_peak_x", "context_ss1_noise_value", "context_ss1_noise_source", "context_ss1_candidate_count", "context_ss1_threshold", "local_ss1_gate_used",
+            "context_pce", "context_pce_peak_index", "context_pce_peak_x", "context_pce_left_index", "context_pce_right_index", "context_pce_noise_value", "context_pce_noise_source", "context_pce_candidate_count", "context_pce_status", "context_pce_enabled", "pce_local_audit", "pce_decision_source",
             "corrected_mask_overlap_fraction", "overlaps_corrected_mask", "fully_inside_corrected_mask", "mask_cleanup_candidate", "mask_cleanup_status",
             "chord_crossing_detected", "chord_crossing_max", "chord_support_adjustment_applied", "replacement_increases_signal_max",
             "ss1", "pce", "edge", "eel", "resid",

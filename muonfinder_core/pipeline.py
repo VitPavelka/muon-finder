@@ -818,25 +818,41 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the clean MuonFinder core pipeline.")
     parser.add_argument("--config", required=True, help="Path to config_core.json")
     args = parser.parse_args()
-    cfg = load_config(Path(args.config))
+    execute_pipeline(Path(args.config), open_viewer=True)
+
+
+def execute_pipeline(config_path: Path | str, open_viewer: bool = False) -> tuple[PipelineArtifacts, dict[str, float]]:
+    cfg_path = Path(config_path)
+    print(f"config path: {cfg_path}")
+    cfg = load_config(cfg_path)
+    timings: dict[str, float] = {}
+    t0 = time.perf_counter()
     artifacts = run_pipeline(cfg)
+    timings["pipeline"] = time.perf_counter() - t0
     t0 = time.perf_counter()
     if bool(cfg.outputs.get("save_viewer_cache", True)):
-        save_viewer_cache(Path(cfg.paths["viewer_cache_path"]), artifacts)
+        save_viewer_cache(Path(cfg.paths["viewer_cache_path"]), artifacts, config_path=cfg_path)
         _phase_print("viewer cache write", t0, extra=str(cfg.paths["viewer_cache_path"]))
+        timings["viewer cache"] = time.perf_counter() - t0
+    else:
+        timings["viewer cache"] = 0.0
     t0 = time.perf_counter()
     _write_light_debug(cfg, artifacts)
     if bool(cfg.outputs.get("despike_debug_lite_enabled", cfg.outputs.get("save_light_debug", True))):
         _phase_print("light debug write", t0, extra=str(cfg.paths["light_debug_path"]))
+        timings["light debug"] = time.perf_counter() - t0
+    else:
+        timings["light debug"] = 0.0
     print(f"viewer cache: {cfg.paths['viewer_cache_path']}")
     if bool(cfg.outputs.get("despike_debug_lite_enabled", cfg.outputs.get("save_light_debug", True))):
         print(f"light debug: {cfg.paths['light_debug_path']}")
-    if bool(cfg.viewer.get("open_after_pipeline", False)):
+    if open_viewer and bool(cfg.viewer.get("open_after_pipeline", False)):
         import sys
 
         viewer_script = Path(__file__).resolve().with_name("viewer.py")
         viewer_cache = Path(cfg.paths["viewer_cache_path"]).resolve()
         subprocess.Popen([sys.executable, str(viewer_script), "--cache", str(viewer_cache)])
+    return artifacts, timings
 
 
 if __name__ == "__main__":

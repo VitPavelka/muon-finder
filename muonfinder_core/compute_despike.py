@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 try:
     from tqdm import tqdm
@@ -17,10 +20,12 @@ if __package__ in {None, ""}:
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
 
+    from muonfinder_core.cache import load_viewer_cache
     from muonfinder_core.config import load_config
     from muonfinder_core.despike import compute_despike_from_cache_and_ss6
     from muonfinder_core.metrics import MetricComputationContext
 else:
+    from .cache import load_viewer_cache
     from .config import load_config
     from .despike import compute_despike_from_cache_and_ss6
     from .metrics import MetricComputationContext
@@ -41,29 +46,34 @@ def _progress_iter(items):
     return _fallback()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Compute SS6-based despike correction from viewer cache and ss6_decisions.csv.")
-    parser.add_argument("--config", type=Path, default=Path("config_core.json"))
-    parser.add_argument("--cache", type=Path, default=None)
-    parser.add_argument("--ss6", type=Path, default=None)
-    parser.add_argument("--corrected-out", type=Path, default=None)
-    parser.add_argument("--debug-out", type=Path, default=None)
-    parser.add_argument("--summary-out", type=Path, default=None)
-    args = parser.parse_args()
-
+def run_compute_despike(
+    *,
+    config_path: Path | str,
+    cache_path: Path | None = None,
+    ss6_path: Path | None = None,
+    corrected_out: Path | None = None,
+    debug_out: Path | None = None,
+    summary_out: Path | None = None,
+) -> tuple[Any, dict[str, Any], dict[str, float]]:
     timings: dict[str, float] = {}
     t_total = time.perf_counter()
+    cfg_path = Path(config_path)
+    t0 = time.perf_counter()
+    cfg = load_config(cfg_path)
+    timings["load config"] = time.perf_counter() - t0
+
+    despike_cfg = dict(getattr(cfg, "despike", {}))
+    cache_path = Path(cache_path) if cache_path is not None else Path(str(cfg.paths["viewer_cache_path"]))
+    ss6_path = Path(ss6_path) if ss6_path is not None else Path(str(cfg.ss6["decisions_path"]))
+    corrected_path = Path(corrected_out) if corrected_out is not None else Path(str(despike_cfg["corrected_path"]))
+    debug_path = Path(debug_out) if debug_out is not None else Path(str(despike_cfg["debug_path"]))
+    attempts_path = Path(str(despike_cfg["attempts_path"]))
+    summary_path = Path(summary_out) if summary_out is not None else Path(str(despike_cfg["summary_path"]))
 
     t0 = time.perf_counter()
-    cfg = load_config(args.config)
-    timings["load config"] = time.perf_counter() - t0
-    despike_cfg = dict(getattr(cfg, "despike", {}))
-    cache_path = Path(args.cache) if args.cache is not None else Path(str(cfg.paths["viewer_cache_path"]))
-    ss6_path = Path(args.ss6) if args.ss6 is not None else Path(str(cfg.ss6["decisions_path"]))
-    corrected_path = Path(args.corrected_out) if args.corrected_out is not None else Path(str(despike_cfg["corrected_path"]))
-    debug_path = Path(args.debug_out) if args.debug_out is not None else Path(str(despike_cfg["debug_path"]))
-    attempts_path = Path(str(despike_cfg["attempts_path"]))
-    summary_path = Path(args.summary_out) if args.summary_out is not None else Path(str(despike_cfg["summary_path"]))
+    cache = load_viewer_cache(cache_path)
+    timings["inspect cache"] = time.perf_counter() - t0
+    viewer_cache_shape = list(np.asarray(cache.get("spectra", np.asarray([]))).shape)
 
     noise_cfg = dict(getattr(cfg, "noise", {}))
     metric_ctx = MetricComputationContext(
@@ -80,8 +90,13 @@ def main() -> None:
         edge_context_expand_step_pts=int(noise_cfg.get("edge_context_expand_step_pts", 10)),
     )
 
-    print(f"viewer cache: {cache_path}")
-    print(f"ss6 decisions: {ss6_path}")
+    print(f"config path: {cfg_path}")
+    print(f"viewer cache path: {cache_path}")
+    print(f"viewer cache shape: {tuple(viewer_cache_shape)}")
+    print(f"ss6 decisions path: {ss6_path}")
+    print(f"despike corrected path: {corrected_path}")
+    print(f"despike attempts path: {attempts_path}")
+    print(f"despike debug path: {debug_path}")
     print(f"despike source: {despike_cfg.get('source', 'ss6')}")
 
     inner_timings: dict[str, float] = {}
@@ -99,26 +114,61 @@ def main() -> None:
         morph_window=int(despike_cfg.get("morph_window", 3)),
         despike_context_window_pad=int(despike_cfg.get("despike_context_window_pad", 0)),
         noise_height_factor=float(despike_cfg.get("noise_height_factor", 3.0)),
+        ss1_context_threshold=float(despike_cfg.get("ss1_context", 0.95)),
+        pce_context_enabled=bool(despike_cfg.get("pce_context", False)),
         max_iterations=int(despike_cfg.get("max_iterations", 1000)),
         ss6_config=dict(getattr(cfg, "ss6", {})),
         metric_context=metric_ctx,
         progress_iter=_progress_iter,
         timings_out=inner_timings,
+        config_path=cfg_path,
     )
     timings.update(inner_timings)
-
     summary = dict(artifacts.summary)
-    print(f"despike corrected: {corrected_path}")
-    print(f"despike debug: {debug_path}")
-    print(f"despike attempts: {attempts_path}")
-    print(f"despike summary: {summary_path}")
+    timings["total"] = time.perf_counter() - t_total
+    return artifacts, summary, timings
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compute SS6-based despike correction from viewer cache and ss6_decisions.csv.")
+    parser.add_argument("--config", type=Path, default=Path("config_core.json"))
+    parser.add_argument("--cache", type=Path, default=None)
+    parser.add_argument("--ss6", type=Path, default=None)
+    parser.add_argument("--corrected-out", type=Path, default=None)
+    parser.add_argument("--debug-out", type=Path, default=None)
+    parser.add_argument("--summary-out", type=Path, default=None)
+    args = parser.parse_args()
+
+    t_total = time.perf_counter()
+    artifacts, summary, timings = run_compute_despike(
+        config_path=args.config,
+        cache_path=args.cache,
+        ss6_path=args.ss6,
+        corrected_out=args.corrected_out,
+        debug_out=args.debug_out,
+        summary_out=args.summary_out,
+    )
+    output_paths = dict(summary.get("output_paths", {}))
+    print(f"despike corrected: {output_paths.get('corrected_path', '')}")
+    print(f"despike debug: {output_paths.get('debug_path', '')}")
+    print(f"despike attempts: {output_paths.get('attempts_path', '')}")
+    print(f"despike summary: {output_paths.get('summary_path', '')}")
     print(f"accepted ss6 parent candidates: {summary['accepted_ss6_parent_candidates']}")
     print(f"spectra with accepted spikes: {summary['spectra_with_accepted_spikes']}")
     print(f"parent corrected: {summary['parent_corrected']}")
     print(f"parent skipped below noise height: {summary['parent_skipped_below_noise_height']}")
     print(f"parent skipped no erosion neighbors: {summary['parent_skipped_no_erosion_neighbors']}")
     print(f"local candidates from dilation contacts: {summary['local_candidates_from_dilation_contacts']}")
+    print(f"local candidates passed noise height: {summary['local_candidates_passed_noise_height']}")
     print(f"local candidates rejected by noise height: {summary['local_candidates_rejected_by_noise_height']}")
+    print(f"local context ss1 threshold: {summary['ss1_context_threshold']}")
+    print(f"local context pce enabled: {summary['pce_context_enabled']}")
+    print(f"contexts with context ss1: {summary['local_contexts_with_context_ss1']}")
+    print(f"local candidates rejected by context ss1 low: {summary['local_candidates_rejected_by_context_ss1_low']}")
+    print(f"contexts with context pce: {summary['local_context_pce_computed']}")
+    print(f"contexts missing context pce: {summary['local_context_pce_missing']}")
+    print(f"local candidates using context pce: {summary['local_candidates_using_context_pce']}")
+    print(f"local candidates fallback to local pce: {summary['local_candidates_fallback_to_local_pce']}")
     print(f"local candidates sent to ss6: {summary['local_candidates_sent_to_ss6']}")
     print(f"local candidates accepted by ss6: {summary['local_candidates_accepted_by_ss6']}")
     print(f"local candidates corrected: {summary['local_candidates_corrected']}")
