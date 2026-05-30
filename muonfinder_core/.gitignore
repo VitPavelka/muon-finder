@@ -1,0 +1,2 @@
+path_config*.json
+!path_config.example.json

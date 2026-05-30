@@ -224,6 +224,41 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "decision_profile": "ss4",
 }
 
+_PATH_OVERRIDE_SECTIONS: dict[str, tuple[str, ...] | None] = {
+    "paths": None,
+    "cap": ("features_path", "summary_path"),
+    "experimental_features": ("features_path", "summary_path"),
+    "ss6": ("decisions_path", "summary_path", "histograms_dir"),
+    "despike": ("corrected_path", "debug_path", "attempts_path", "summary_path"),
+}
+
+
+def _discover_path_config_path(
+    cfg_path: Path,
+    user_cfg: dict[str, Any],
+    explicit_path_config_path: Path | str | None,
+) -> Path | None:
+    if explicit_path_config_path is not None:
+        candidate = Path(explicit_path_config_path)
+        return candidate if candidate.exists() else None
+    configured = user_cfg.get("path_config")
+    if isinstance(configured, str) and configured.strip():
+        candidate = Path(configured.strip())
+        if not candidate.is_absolute():
+            candidate = (cfg_path.resolve().parent / candidate).resolve()
+        return candidate if candidate.exists() else None
+    cfg_dir = cfg_path.resolve().parent
+    cfg_name = cfg_path.name
+    if cfg_name.startswith("config") and cfg_name.endswith(".json"):
+        suffix = cfg_name[len("config") : -len(".json")]
+        sibling = cfg_dir / f"path_config{suffix}.json"
+        if sibling.exists():
+            return sibling
+    fallback = cfg_dir / "path_config.json"
+    if fallback.exists():
+        return fallback
+    return None
+
 
 def _deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
@@ -232,6 +267,21 @@ def _deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
             out[key] = _deep_merge(dict(out[key]), value)
         else:
             out[key] = value
+    return out
+
+
+def _extract_path_overrides(data: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for section, allowed_keys in _PATH_OVERRIDE_SECTIONS.items():
+        value = data.get(section)
+        if not isinstance(value, dict):
+            continue
+        if allowed_keys is None:
+            out[section] = dict(value)
+            continue
+        filtered = {key: value[key] for key in allowed_keys if key in value}
+        if filtered:
+            out[section] = filtered
     return out
 
 
@@ -283,7 +333,7 @@ def _resolve_path_values(cfg: dict[str, Any], base_dir: Path) -> dict[str, Any]:
             continue
         repo_candidate = (repo_root / path).resolve()
         experimental[key] = str(repo_candidate if repo_candidate.exists() else candidate)
-    for key in ("decisions_path", "summary_path"):
+    for key in ("decisions_path", "summary_path", "histograms_dir"):
         value = ss6.get(key)
         if value in (None, "") or not isinstance(value, str):
             continue
@@ -317,10 +367,15 @@ def _resolve_path_values(cfg: dict[str, Any], base_dir: Path) -> dict[str, Any]:
     return out
 
 
-def load_config(path: Path | str) -> CoreConfig:
+def load_config(path: Path | str, path_config_path: Path | str | None = None) -> CoreConfig:
     cfg_path = Path(path)
     user_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    merged = _resolve_path_values(_deep_merge(DEFAULT_CONFIG, user_cfg), cfg_path.resolve().parent)
+    merged = _deep_merge(DEFAULT_CONFIG, user_cfg)
+    resolved_path_cfg = _discover_path_config_path(cfg_path, user_cfg, path_config_path)
+    if resolved_path_cfg is not None:
+        path_cfg = json.loads(resolved_path_cfg.read_text(encoding="utf-8"))
+        merged = _deep_merge(merged, _extract_path_overrides(path_cfg))
+    merged = _resolve_path_values(merged, cfg_path.resolve().parent)
     return CoreConfig(
         data=dict(merged.get("data", {})),
         paths=dict(merged.get("paths", {})),

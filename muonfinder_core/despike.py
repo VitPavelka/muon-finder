@@ -1518,6 +1518,7 @@ def compute_despike_from_cache_and_ss6(
     if corrected_path is not None:
         corrected_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "raw_spectra": np.asarray(cache["spectra"], dtype=np.float32),
             "corrected_spectra": np.asarray(corrected, dtype=np.float32),
             "x_axis": np.asarray(cache["x_axis"], dtype=float),
             "coord_map_json": np.array([json.dumps(cache.get("coord_map", []), ensure_ascii=False)], dtype=object),
@@ -1583,6 +1584,7 @@ def compute_despike_from_cache_and_ss6(
 def load_despike_bundle(path: Path | str) -> dict[str, Any]:
     data = np.load(Path(path), allow_pickle=True)
     return {
+        "raw_spectra": (np.asarray(data["raw_spectra"]) if "raw_spectra" in data.files else None),
         "corrected_spectra": np.asarray(data["corrected_spectra"]),
         "x_axis": np.asarray(data["x_axis"]) if "x_axis" in data.files else None,
         "coord_map": json.loads(str(np.asarray(data["coord_map_json"]).reshape(-1)[0])) if "coord_map_json" in data.files else [],
