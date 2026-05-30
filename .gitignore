@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 .env
+data/
 
 # OS
 .DS_Store
@@ -50,6 +51,7 @@ debugRAW.json
 despike_debug.json
 edge.json
 EFconfig.json
+configEF.json
 EFdebug.json
 exp.json
 stats100gradient.json
