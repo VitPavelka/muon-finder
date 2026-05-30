@@ -249,7 +249,7 @@ def run_ss6_decisions(
         force_experimental=bool(force_experimental_recompute),
         skip_experimental_recompute=bool(no_experimental_recompute),
     )
-    required_exp_columns = ["d3rawM", "d3rawS", "d3gradM", "d3gradS"]
+    required_exp_columns = ["exp_edge_legacy_evidence_signed_modernnorm", "exp_resid3_height_noise_z"]
     if not recompute_exp:
         missing_exp_cols = _missing_required_experimental_columns(exp_path, required_exp_columns)
         if missing_exp_cols:

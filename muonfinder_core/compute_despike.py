@@ -118,9 +118,9 @@ def run_compute_despike(
         despike_context_window_pad=int(despike_cfg.get("despike_context_window_pad", 0)),
         noise_height_factor=float(despike_cfg.get("noise_height_factor", 3.0)),
         ss1_context_threshold=float(despike_cfg.get("ss1_context", 0.95)),
-        pce_context_enabled=bool(despike_cfg.get("pce_context", False)),
         max_iterations=int(despike_cfg.get("max_iterations", 1000)),
         ss6_config=dict(getattr(cfg, "ss6", {})),
+        local_ss6_overrides=dict(despike_cfg.get("local_ss6_overrides", {})),
         metric_context=metric_ctx,
         progress_iter=_progress_iter,
         timings_out=inner_timings,
@@ -165,16 +165,14 @@ def main() -> None:
     print(f"local candidates passed noise height: {summary['local_candidates_passed_noise_height']}")
     print(f"local candidates rejected by noise height: {summary['local_candidates_rejected_by_noise_height']}")
     print(f"local context ss1 threshold: {summary['ss1_context_threshold']}")
-    print(f"local context pce enabled: {summary['pce_context_enabled']}")
     print(f"contexts with context ss1: {summary['local_contexts_with_context_ss1']}")
     print(f"local candidates rejected by context ss1 low: {summary['local_candidates_rejected_by_context_ss1_low']}")
-    print(f"contexts with context pce: {summary['local_context_pce_computed']}")
-    print(f"contexts missing context pce: {summary['local_context_pce_missing']}")
-    print(f"local candidates using context pce: {summary['local_candidates_using_context_pce']}")
-    print(f"local candidates fallback to local pce: {summary['local_candidates_fallback_to_local_pce']}")
     print(f"local candidates sent to ss6: {summary['local_candidates_sent_to_ss6']}")
     print(f"local candidates accepted by ss6: {summary['local_candidates_accepted_by_ss6']}")
     print(f"local candidates corrected: {summary['local_candidates_corrected']}")
+    print(f"mask residual cleanup intervals tested: {summary['mask_residual_cleanup_intervals_tested']}")
+    print(f"mask residual cleanup corrected: {summary['mask_residual_cleanup_corrected']}")
+    print(f"mask residual cleanup rejected below noise height: {summary['mask_residual_cleanup_rejected_below_noise_height']}")
     print(f"total corrections applied: {summary['total_corrections_applied']}")
     print(f"technical failures: {summary['technical_failures']}")
     print(f"max pass index used: {summary['max_pass_index_used']}")

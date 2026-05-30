@@ -41,12 +41,12 @@ DEFAULT_EXPERIMENTAL_FEATURES: dict[str, Any] = {
     "noise_source": "morph_range",
     "noise_threshold_factor": 3.0,
     "raw_pce": {
-        "enabled": True,
+        "enabled": False,
         "smoothing_modes": ["none", "savgol5", "savgol7"],
         "near_apex_radius_pts": 2,
     },
     "residual_pce": {
-        "enabled": True,
+        "enabled": False,
         "median_window": 3,
         "near_apex_radius_pts": 2,
     },
@@ -62,28 +62,12 @@ DEFAULT_EXPERIMENTAL_FEATURES: dict[str, Any] = {
         "max_noise_levels": 50,
     },
     "viewer_columns": [
-        "exp_raw_pce_none",
-        "exp_raw_pce_savgol5",
-        "exp_resid3_pce",
         "exp_resid3_height_noise_z",
-        "d3rawM",
-        "d3rawS",
-        "d3gradM",
-        "d3gradS",
-        "exp_resid3_above_3noise",
-        "exp_edge_percent_0_90_evidence_signed_modernnorm",
-        "exp_edge_noise_from_0_evidence_signed_selfnorm",
-        "exp_edge_noise_from_1_evidence_signed_selfnorm",
         "exp_edge_legacy_evidence_signed_modernnorm",
     ],
     "viewer_label_aliases": {
         "exp_edge_legacy_evidence_signed_modernnorm": "eel",
         "exp_resid3_height_noise_z": "erhnz",
-        "exp_raw_pce_none": "erpn",
-        "d3rawM": "d3rawM",
-        "d3rawS": "d3rawS",
-        "d3gradM": "d3gradM",
-        "d3gradS": "d3gradS",
     },
 }
 
