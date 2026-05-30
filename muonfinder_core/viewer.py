@@ -124,8 +124,6 @@ def _experimental_metric_label(column: str, aliases: dict[str, str]) -> str:
     alias = str(aliases.get(column, "")).strip()
     if alias:
         return alias
-    if column in {"d3rawM", "d3rawS", "d3gradM", "d3gradS"}:
-        return column
     if "_" not in str(column) and len(str(column)) <= 12:
         return str(column)
     parts = [part for part in str(column).strip().split("_") if part]
@@ -259,9 +257,6 @@ def _filter_despike_rows_for_shape(
         "cell_left",
         "cell_right",
         "context_ss1_peak_index",
-        "context_pce_peak_index",
-        "context_pce_left_index",
-        "context_pce_right_index",
     )
     for row in rows:
         try:
@@ -539,6 +534,7 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         ]
         active.sort(
             key=lambda item: (
+                int(item.get("attempt_sequence", 0) or 0),
                 int(item.get("stage_index", 0) or 0),
                 int(item.get("attempt_index_within_stage", 0) or 0),
                 int(item.get("detected_peak_index", -1) or -1),
@@ -611,10 +607,8 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
     def cycle_active_overlay_case(step: int) -> None:
         overlay_key, rows = get_active_overlay_cycle_rows()
         if not overlay_key:
-            print("no active overlay selected for cycling")
             return
         if not rows:
-            print(f"{overlay_key}: no cases to cycle")
             return
         if cycle_state["overlay_key"] != overlay_key:
             cycle_state["overlay_key"] = overlay_key
@@ -623,16 +617,6 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             cycle_state["index"] = int((int(cycle_state["index"]) + int(step)) % len(rows))
         row = rows[int(cycle_state["index"])]
         jump_to_case(row)
-        peak_idx = int(row.get("peak_index", -1))
-        peak_pos = _x_from_index(x_axis, peak_idx) if 0 <= peak_idx < len(x_axis) else float("nan")
-        source_y = int(row.get("source_y", row.get("y", -1)))
-        source_x = int(row.get("source_x", row.get("x", -1)))
-        peak_text = f" peak={peak_pos:.1f}" if np.isfinite(peak_pos) else ""
-        print(
-            f"{overlay_key}: {int(cycle_state['index']) + 1}/{len(rows)} | "
-            f"compact=({int(row.get('y', -1))},{int(row.get('x', -1))}) "
-            f"source=({source_y},{source_x}){peak_text}"
-        )
 
     map_im = ax_map.imshow(score_map, cmap="viridis", origin="upper", interpolation="nearest", vmin=map_vmin, vmax=map_vmax)
     located_scatter = ax_map.scatter([], [], s=26, c="#d62728", marker="s", linewidths=0.0, alpha=0.90)
@@ -1148,29 +1132,15 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
 
     def _draw_contacts(rows: list[dict[str, Any]], indices: list[int], marker: str, color: str, size: float) -> None:
         points: set[int] = set()
-        attempt = current_attempt()
-        if attempt is not None:
-            field = "context_dilation_contacts" if marker == "^" else "context_erosion_contacts"
-            raw_points = attempt.get(field, "")
-            parsed: list[int] = []
-            if isinstance(raw_points, str) and raw_points.strip():
-                try:
-                    parsed = [int(v) for v in json.loads(raw_points)]
-                except Exception:
-                    parsed = []
-            for ii in parsed:
-                if 0 <= int(ii) < len(x_axis):
-                    points.add(int(ii))
-        else:
-            rows = [row for row in rows if _viewer_active_decision(row, active_profile)[0] == "spike"]
-            for row in rows:
-                if str(row.get("candidate_noise_prefilter_status", "")).strip() == "rejected_noise":
-                    continue
-                left, right = _contact_context_bounds(row)
-                for idx in indices:
-                    ii = int(idx)
-                    if left <= ii <= right:
-                        points.add(ii)
+        rows = [row for row in rows if _viewer_active_decision(row, active_profile)[0] == "spike"]
+        for row in rows:
+            if str(row.get("candidate_noise_prefilter_status", "")).strip() == "rejected_noise":
+                continue
+            left, right = _contact_context_bounds(row)
+            for idx in indices:
+                ii = int(idx)
+                if left <= ii <= right:
+                    points.add(ii)
         for idx in sorted(points):
             ax_spec.plot([x_axis[idx]], [raw_sig[idx]], marker=marker, color=color, markersize=size, linestyle="None")
 
@@ -1423,8 +1393,8 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
         if attempt_type == "parent":
             if original_branch:
                 lines.append(f"ss6 {original_branch}")
-        elif attempt_kind == "mask_connected_contact_cleanup" or attempt_type == "mask_cleanup":
-            lines.append("mask cleanup")
+        elif attempt_kind == "mask_residual_cleanup":
+            lines.append("mask residual cleanup")
         else:
             if status == "context_ss1_low":
                 lines.append("local rejected")
@@ -1434,6 +1404,9 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
             val = metric_float(attempt, key)
             if np.isfinite(val):
                 lines.append(f"{key}={val:.3g}")
+        despike_noise = metric_float(attempt, "despike_noise_value")
+        if np.isfinite(despike_noise):
+            lines.append(f"noise={despike_noise:.3g}")
         if status:
             if status == "corrected_parent":
                 lines.append("corrected")
@@ -1441,26 +1414,13 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                 lines.append("corrected")
             elif status == "context_ss1_low":
                 lines.append("reason=context_ss1_low")
-            elif status in {"corrected_mask_residual_cleanup", "corrected_mask_connected_contact_cleanup"}:
-                overlap = metric_float(attempt, "mask_overlap_fraction")
-                if not np.isfinite(overlap):
-                    overlap = metric_float(attempt, "corrected_mask_overlap_fraction")
-                hchord = metric_float(attempt, "residual_height_noise_z")
-                if not np.isfinite(hchord):
-                    hchord = metric_float(attempt, "height_above_chord_noise_z")
+            elif status == "corrected_mask_residual_cleanup":
                 resid_h = metric_float(attempt, "residual_height")
-                parent_noise = metric_float(attempt, "parent_noise_value")
-                dist = metric_float(attempt, "mask_distance_pts")
-                if np.isfinite(hchord):
-                    lines.append(f"hchord={hchord:.3g}")
+                resid_hz = metric_float(attempt, "residual_height_noise_z")
+                if np.isfinite(resid_hz):
+                    lines.append(f"hchord={resid_hz:.3g}")
                 if np.isfinite(resid_h):
                     lines.append(f"h={resid_h:.3g}")
-                if np.isfinite(parent_noise):
-                    lines.append(f"pnoise={parent_noise:.3g}")
-                if np.isfinite(overlap):
-                    lines.append(f"overlap={overlap:.2f}")
-                if np.isfinite(dist) and dist >= 0:
-                    lines.append(f"dist={dist:.0f}")
                 lines.append("corrected")
             elif status == "rejected_by_despike_noise_height":
                 lines.append("rejected: noise height")
@@ -1469,34 +1429,12 @@ def show_cache(cache: dict[str, Any], cfg: Any | None = None) -> None:
                     lines.append(f"hchord={hchord:.3g}")
             elif status == "rejected_mask_residual_below_noise_height":
                 lines.append("rejected: mask residual")
-                hchord = metric_float(attempt, "residual_height_noise_z")
-                if not np.isfinite(hchord):
-                    hchord = metric_float(attempt, "height_above_chord_noise_z")
-                overlap = metric_float(attempt, "mask_overlap_fraction")
-                if not np.isfinite(overlap):
-                    overlap = metric_float(attempt, "corrected_mask_overlap_fraction")
-                if np.isfinite(hchord):
-                    lines.append(f"hchord={hchord:.3g}")
-                if np.isfinite(overlap):
-                    lines.append(f"overlap={overlap:.2f}")
-            elif status == "rejected_mask_no_connection":
-                lines.append("rejected: no connection")
-                dist = metric_float(attempt, "mask_distance_pts")
-                if np.isfinite(dist) and dist >= 0:
-                    lines.append(f"dist={dist:.0f}")
-            elif status == "rejected_mask_missing_parent_noise":
-                lines.append("rejected: missing parent noise")
-            elif status == "rejected_mask_cleanup_would_expand_outside_corrected_interval":
-                lines.append("rejected: would expand outside interval")
-            elif status == "rejected_mask_unsafe_geometry":
-                lines.append("rejected: unsafe geometry")
-            elif status == "rejected_mask_no_meaningful_change":
-                lines.append("rejected: no change")
-            elif status == "rejected_mask_boundary_guard":
-                lines.append("rejected: boundary guard")
-                overlap = metric_float(attempt, "mask_overlap_fraction")
-                if np.isfinite(overlap):
-                    lines.append(f"overlap={overlap:.2f}")
+                resid_hz = metric_float(attempt, "residual_height_noise_z")
+                resid_h = metric_float(attempt, "residual_height")
+                if np.isfinite(resid_hz):
+                    lines.append(f"hchord={resid_hz:.3g}")
+                if np.isfinite(resid_h):
+                    lines.append(f"h={resid_h:.3g}")
             elif status == "local_missing_metric":
                 missing = str(attempt.get("skipped_reason", "")).strip()
                 lines.append(f"missing: {missing}" if missing else "missing metric")

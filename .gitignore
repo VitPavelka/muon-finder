@@ -32,6 +32,9 @@ debug_feature*.json
 # main
 config.json
 config_core.json
+configAll_backup.json
+configEF.json
+config_core_backup.json
 debug.json
 stats*
 debug2.json

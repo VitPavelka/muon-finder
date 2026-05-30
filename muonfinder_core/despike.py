@@ -89,10 +89,26 @@ def get_contact_context_bounds(row: dict[str, Any], n_points: int, pad: int = 0)
     return int(left), int(right)
 
 
-def _local_noise(signal: np.ndarray, peak_idx: int, pad: int = 6) -> tuple[float, str, bool]:
-    row = {"peak_index": int(peak_idx), "start": max(0, int(peak_idx) - int(pad)), "end": min(len(signal) - 1, int(peak_idx) + int(pad))}
-    info = select_experimental_noise(np.asarray(signal, dtype=float), row, "morph_range")
-    return float(info["exp_noise_value"]), str(info["exp_noise_source"]), bool(info["exp_noise_fallback_used"])
+def _spectrum_despike_noise(
+    signal: np.ndarray,
+    small_morph_row: dict[str, Any] | None,
+    pixel_rows: list[dict[str, Any]],
+) -> tuple[float, str]:
+    small_row = dict(small_morph_row or {})
+    noise_value = _safe_float(small_row.get("noise_height_morph_range", np.nan))
+    noise_source = str(small_row.get("noise_reference_method", "noise_height_morph_range"))
+    if np.isfinite(noise_value) and noise_value > 0.0:
+        return float(noise_value), str(noise_source or "noise_height_morph_range")
+    for row in pixel_rows:
+        candidate_noise = _safe_float(row.get("noise_height_morph_range", row.get("candidate_noise_estimate_used", np.nan)))
+        if np.isfinite(candidate_noise) and candidate_noise > 0.0:
+            return float(candidate_noise), "noise_height_morph_range"
+    info = select_experimental_noise(
+        np.asarray(signal, dtype=float),
+        {"start": 0, "end": max(0, len(signal) - 1)},
+        "bg_mad",
+    )
+    return float(info["exp_noise_value"]), str(info["exp_noise_source"])
 
 
 def _chord_values(left_idx: int, right_idx: int, left_val: float, right_val: float) -> np.ndarray:
@@ -195,63 +211,6 @@ def _context_contact_lists(
     return eros, dils
 
 
-def _mask_overlap_fraction(mask: np.ndarray, left: int, right: int) -> tuple[float, bool, bool]:
-    li = int(left)
-    ri = int(right)
-    if ri < li or li < 0 or ri >= int(mask.size):
-        return 0.0, False, False
-    seg = np.asarray(mask[li : ri + 1], dtype=bool)
-    if seg.size == 0:
-        return 0.0, False, False
-    frac = float(np.mean(seg.astype(float)))
-    return frac, bool(frac > 0.0), bool(np.all(seg))
-
-
-def _interval_distance(left_a: int, right_a: int, left_b: int, right_b: int) -> int:
-    if int(right_a) < int(left_b):
-        return int(left_b) - int(right_a)
-    if int(right_b) < int(left_a):
-        return int(left_a) - int(right_b)
-    return 0
-
-
-def _mask_intervals(mask: np.ndarray) -> list[tuple[int, int]]:
-    idx = np.flatnonzero(np.asarray(mask, dtype=bool)).astype(int)
-    if idx.size == 0:
-        return []
-    groups = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
-    return [(int(group[0]), int(group[-1])) for group in groups if group.size]
-
-
-def _mask_connection_stats(mask: np.ndarray, left: int, right: int, adjacency_pts: int = 1) -> tuple[int, float, int, int, int]:
-    intervals = _mask_intervals(mask)
-    if not intervals:
-        return 0, 0.0, int(10**9), -1, -1
-    li = int(left)
-    ri = int(right)
-    overlap_count = 0
-    overlap_points = 0
-    best_distance = int(10**9)
-    best_left = -1
-    best_right = -1
-    for mi, mj in intervals:
-        ov_left = max(li, int(mi))
-        ov_right = min(ri, int(mj))
-        if ov_right >= ov_left:
-            overlap_count += 1
-            overlap_points += int(ov_right - ov_left + 1)
-        distance = _interval_distance(li, ri, int(mi), int(mj))
-        if distance < best_distance:
-            best_distance = int(distance)
-            best_left = int(mi)
-            best_right = int(mj)
-    width = max(1, ri - li + 1)
-    overlap_fraction = float(overlap_points / width)
-    if best_distance > int(adjacency_pts):
-        return int(overlap_count), float(overlap_fraction), int(best_distance), int(best_left), int(best_right)
-    return int(overlap_count), float(overlap_fraction), int(best_distance), int(best_left), int(best_right)
-
-
 def _residual_components(residual: np.ndarray, offset: int = 0, eps: float = 1e-12) -> list[dict[str, int | float]]:
     local = np.asarray(residual, dtype=float)
     if local.size == 0:
@@ -282,6 +241,46 @@ def _residual_components(residual: np.ndarray, offset: int = 0, eps: float = 1e-
             }
         )
     return out
+
+
+def _merge_corrected_intervals(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    valid: list[dict[str, Any]] = []
+    for record in records:
+        left = int(record.get("left", -1))
+        right = int(record.get("right", -1))
+        if left < 0 or right < left:
+            continue
+        valid.append(
+            {
+                "left": int(left),
+                "right": int(right),
+                "parent_noise_value": _safe_float(record.get("parent_noise_value", np.nan)),
+                "parent_noise_source": str(record.get("parent_noise_source", "")),
+                "candidate_id": str(record.get("candidate_id", "")),
+                "attempt_kind": str(record.get("attempt_kind", "")),
+                "status": str(record.get("status", "")),
+            }
+        )
+    if not valid:
+        return []
+    valid.sort(key=lambda item: (int(item["left"]), int(item["right"])))
+    merged: list[dict[str, Any]] = []
+    current = dict(valid[0])
+    for record in valid[1:]:
+        if int(record["left"]) <= int(current["right"]) + 1:
+            current["right"] = max(int(current["right"]), int(record["right"]))
+            current_noise = _safe_float(current.get("parent_noise_value", np.nan))
+            record_noise = _safe_float(record.get("parent_noise_value", np.nan))
+            if np.isfinite(record_noise) and (not np.isfinite(current_noise) or record_noise > current_noise):
+                current["parent_noise_value"] = float(record_noise)
+                current["parent_noise_source"] = str(record.get("parent_noise_source", ""))
+            if not str(current.get("candidate_id", "")).strip():
+                current["candidate_id"] = str(record.get("candidate_id", ""))
+            continue
+        merged.append(dict(current))
+        current = dict(record)
+    merged.append(dict(current))
+    return merged
 
 
 def _signed_edge_evidence_from_width_sum(value: float, center: float, scale: float, ctx: MetricComputationContext) -> float:
@@ -401,7 +400,7 @@ def _build_local_ss6_row(
     row["noise_height_morph_range"] = float(noise_value) if np.isfinite(noise_value) else np.nan
 
     eel_features = compute_experimental_edge_variants(np.asarray(signal, dtype=float), row, float(noise_value), {"edge_variants": {"enabled": True}})
-    resid_features = compute_experimental_residual_features(np.asarray(signal, dtype=float), row, float(noise_value), {"residual_pce": {"enabled": True, "median_window": 3, "near_apex_radius_pts": 2}, "residual_threshold": {"enabled": True, "median_window": 3, "threshold_noise_factor": 3.0}, "noise_threshold_factor": 3.0})
+    resid_features = compute_experimental_residual_features(np.asarray(signal, dtype=float), row, float(noise_value), {"residual_pce": {"enabled": False, "median_window": 3, "near_apex_radius_pts": 2}, "residual_threshold": {"enabled": True, "median_window": 3, "threshold_noise_factor": 3.0}, "noise_threshold_factor": 3.0})
     row.update(eel_features)
     row.update(resid_features)
     legacy_width = _safe_float(row.get("exp_edge_legacy_width_sum_0_90"))
@@ -428,7 +427,7 @@ def _build_local_ss6_row(
     return row
 
 
-def _compute_context_metrics(
+def _compute_context_ss1(
     *,
     signal: np.ndarray,
     gradient_signal: np.ndarray,
@@ -457,14 +456,6 @@ def _compute_context_metrics(
     )
     return {
         "context_ss1": _safe_float(features.get("spike_score_v1")),
-        "context_pce": _safe_float(features.get("pce_negpref_t098_evidence_signed")),
-        "context_pce_status": ("ok" if np.isfinite(_safe_float(features.get("pce_negpref_t098_evidence_signed"))) else "fallback_to_local_pce"),
-        "context_pce_left_index": int(context_left),
-        "context_pce_right_index": int(context_right),
-        "context_pce_peak_index": int(peak_idx),
-        "context_pce_noise_value": float(noise_value) if np.isfinite(noise_value) else np.nan,
-        "context_pce_noise_source": str(noise_source),
-        "context_pce_debug": (features.get("pce_t98_debug", {}) if isinstance(features.get("pce_t98_debug", {}), dict) else {}),
         "context_ss1_noise_value": float(noise_value) if np.isfinite(noise_value) else np.nan,
         "context_ss1_noise_source": str(noise_source),
     }
@@ -496,8 +487,8 @@ def compute_despike_from_cache_and_ss6(
     noise_height_factor: float,
     max_iterations: int,
     ss1_context_threshold: float = 0.95,
-    pce_context_enabled: bool = False,
     ss6_config: dict[str, Any] | None = None,
+    local_ss6_overrides: dict[str, Any] | None = None,
     metric_context: MetricComputationContext | None = None,
     progress_iter: Callable[[list[tuple[tuple[int, int], list[dict[str, Any]]]]], Any] | None = None,
     timings_out: dict[str, float] | None = None,
@@ -528,6 +519,10 @@ def compute_despike_from_cache_and_ss6(
 
     raw_spectra = np.asarray(cache["spectra"], dtype=np.float32)
     corrected = np.asarray(raw_spectra, dtype=np.float32).copy()
+    small_morphology_by_pixel = {
+        (int(row.get("y", -1)), int(row.get("x", -1))): dict(row)
+        for row in cache.get("small_morphology", [])
+    }
     chords: list[DespikeChord] = []
     debug_rows: list[dict[str, Any]] = []
     attempt_rows: list[dict[str, Any]] = []
@@ -542,7 +537,6 @@ def compute_despike_from_cache_and_ss6(
     ss6_cfg = ss6_defaults(ss6_config or {})
     morph_window_used = int(morph_window)
     local_context_ss1_threshold = float(ss1_context_threshold)
-    pce_context_enabled = bool(pce_context_enabled)
 
     summary_counts = {
         "accepted_ss6_parent_candidates": int(len(accepted_rows)),
@@ -557,27 +551,14 @@ def compute_despike_from_cache_and_ss6(
         "local_candidates_sent_to_ss6": 0,
         "local_candidates_accepted_by_ss6": 0,
         "local_candidates_corrected": 0,
-        "local_context_pce_computed": 0,
-        "local_context_pce_missing": 0,
-        "local_candidates_using_context_pce": 0,
-        "local_candidates_fallback_to_local_pce": 0,
+        "mask_residual_cleanup_intervals_tested": 0,
+        "mask_residual_cleanup_corrected": 0,
+        "mask_residual_cleanup_rejected_below_noise_height": 0,
         "total_corrections_applied": 0,
         "spectra_with_corrections": 0,
         "technical_failures": 0,
         "max_pass_index_used": 0,
         "skipped_overlap_duplicate": 0,
-        "mask_cleanup_candidates_tested": 0,
-        "mask_intervals_tested": 0,
-        "mask_cleanup_corrected": 0,
-        "mask_cleanup_rejected_below_noise_height": 0,
-        "mask_cleanup_rejected_boundary_guard": 0,
-        "mask_cleanup_rejected_no_connection": 0,
-        "mask_cleanup_rejected_missing_parent_noise": 0,
-        "mask_cleanup_rejected_unsafe_geometry": 0,
-        "mask_cleanup_rejected_no_meaningful_change": 0,
-        "local_candidates_with_parent_noise": 0,
-        "local_candidates_with_missing_parent_noise": 0,
-        "noise_ratio_values": [],
         "chord_crossing_adjusted_count": 0,
         "replacement_invariant_violations": 0,
     }
@@ -621,13 +602,8 @@ def compute_despike_from_cache_and_ss6(
                 out["stage_index"] = int(stage_index)
                 out["attempt_index_within_stage"] = int(attempt_index)
                 out["correction_applied"] = 0
-                if str(out.get("attempt_kind", out.get("attempt_type", ""))) == "mask_connected_contact_cleanup":
-                    out["status"] = "rejected_mask_no_meaningful_change"
-                    out["skipped_reason"] = "no_meaningful_change"
-                    summary_counts["mask_cleanup_rejected_no_meaningful_change"] += 1
-                else:
-                    out["status"] = "stopped_no_meaningful_change"
-                    out["skipped_reason"] = "no_meaningful_change"
+                out["status"] = "stopped_no_meaningful_change"
+                out["skipped_reason"] = "no_meaningful_change"
                 out["raw_peak_value_before"] = float(current_signal[int(plan["detected_peak_index"])])
                 out["corrected_peak_value_after"] = float(current_signal[int(plan["detected_peak_index"])])
                 out["correction_height"] = 0.0
@@ -694,6 +670,11 @@ def compute_despike_from_cache_and_ss6(
     t0 = time.perf_counter()
     for (y, x), pixel_rows in iterator:
         current_signal = np.asarray(corrected[y, x, :], dtype=float)
+        despike_noise_value, despike_noise_source = _spectrum_despike_noise(
+            current_signal,
+            small_morphology_by_pixel.get((int(y), int(x))),
+            pixel_rows,
+        )
         contexts: list[dict[str, Any]] = []
         spectrum_corrections = 0
         corrected_mask = np.zeros(len(current_signal), dtype=bool)
@@ -702,11 +683,6 @@ def compute_despike_from_cache_and_ss6(
         for row in pixel_rows:
             peak_idx = int(row.get("peak_index", -1))
             context_left, context_right = get_contact_context_bounds(row, len(current_signal), pad=int(despike_context_window_pad))
-            parent_noise_value = _safe_float(row.get("candidate_noise_estimate_used", row.get("noise_height_morph_range", np.nan)))
-            parent_noise_source = "candidate_noise_estimate_used" if np.isfinite(_safe_float(row.get("candidate_noise_estimate_used", np.nan))) else "noise_height_morph_range"
-            parent_noise_fallback_used = False
-            if not np.isfinite(parent_noise_value) or parent_noise_value <= 0.0:
-                parent_noise_value, parent_noise_source, parent_noise_fallback_used = _local_noise(current_signal, peak_idx, pad=6)
             contexts.append(
                 {
                     "row": row,
@@ -720,9 +696,8 @@ def compute_despike_from_cache_and_ss6(
                     "original_ss6_reason": str(row.get("ss6_reason", "")),
                     "context_left": int(context_left),
                     "context_right": int(context_right),
-                    "parent_noise_value": float(parent_noise_value) if np.isfinite(parent_noise_value) else np.nan,
-                    "parent_noise_source": str(parent_noise_source),
-                    "noise_fallback_used": bool(parent_noise_fallback_used),
+                    "despike_noise_value": float(despike_noise_value) if np.isfinite(despike_noise_value) else np.nan,
+                    "despike_noise_source": str(despike_noise_source),
                 }
             )
 
@@ -761,7 +736,7 @@ def compute_despike_from_cache_and_ss6(
                     }
                 )
                 continue
-            noise_value = float(context["parent_noise_value"])
+            noise_value = float(context["despike_noise_value"])
             geom = _geometry_for_peak(
                 current_signal,
                 erosion_contacts,
@@ -802,6 +777,8 @@ def compute_despike_from_cache_and_ss6(
                         "chord_crossing_max": 0.0,
                         "chord_support_adjustment_applied": 0,
                         "replacement_increases_signal_max": 0.0,
+                        "despike_noise_value": float(context["despike_noise_value"]),
+                        "despike_noise_source": str(context["despike_noise_source"]),
                         "correction_applied": 0,
                         "status": "skipped_parent_no_erosion_neighbors",
                         "skipped_reason": "no_erosion_neighbors",
@@ -868,8 +845,10 @@ def compute_despike_from_cache_and_ss6(
                         "height_above_chord": float(height_above_chord),
                         "height_above_chord_noise_z": float(height_z),
                         "noise_value": float(noise_value),
-                        "parent_noise_value": float(context["parent_noise_value"]),
-                        "parent_noise_source": str(context["parent_noise_source"]),
+                        "parent_noise_value": float(context["despike_noise_value"]),
+                        "parent_noise_source": str(context["despike_noise_source"]),
+                        "despike_noise_value": float(context["despike_noise_value"]),
+                        "despike_noise_source": str(context["despike_noise_source"]),
                         "chord_crossing_detected": 0,
                         "chord_crossing_max": 0.0,
                         "chord_support_adjustment_applied": 0,
@@ -936,8 +915,10 @@ def compute_despike_from_cache_and_ss6(
                     "height_above_chord": float(height_above_chord),
                     "height_above_chord_noise_z": float(height_z),
                     "noise_value": float(noise_value),
-                    "parent_noise_value": float(context["parent_noise_value"]),
-                    "parent_noise_source": str(context["parent_noise_source"]),
+                    "parent_noise_value": float(context["despike_noise_value"]),
+                    "parent_noise_source": str(context["despike_noise_source"]),
+                    "despike_noise_value": float(context["despike_noise_value"]),
+                    "despike_noise_source": str(context["despike_noise_source"]),
                     "status": "corrected_parent",
                     "score": float(height_z),
                     "ss1": _safe_float(context["row"].get("ss6_ss1")),
@@ -958,12 +939,14 @@ def compute_despike_from_cache_and_ss6(
         summary_counts["parent_corrected"] += len(kept_parent)
 
         max_pass_index = 0
-        for pass_index in range(1, int(max_iterations) + 1):
-            current_signal = np.asarray(corrected[y, x, :], dtype=float)
-            gradient_signal = _morph_gradient_1d(current_signal, morph_window_used)
-            _erosion, _dilation, erosion_contacts, dilation_contacts = _compute_contacts(current_signal, morph_window_used)
-            local_plans: list[dict[str, Any]] = []
-            for context in contexts:
+        local_stage_index = 1
+        local_ss6_override_cfg = dict(local_ss6_overrides or {})
+        for context in contexts:
+            context_iteration = 1
+            while context_iteration <= int(max_iterations):
+                current_signal = np.asarray(corrected[y, x, :], dtype=float)
+                gradient_signal = _morph_gradient_1d(current_signal, morph_window_used)
+                _erosion, _dilation, erosion_contacts, dilation_contacts = _compute_contacts(current_signal, morph_window_used)
                 context_eros, context_dils = _context_contact_lists(
                     erosion_contacts,
                     dilation_contacts,
@@ -985,15 +968,7 @@ def compute_despike_from_cache_and_ss6(
                     )
                     if geom.right_anchor <= geom.left_anchor:
                         continue
-                    noise_value = float(context["parent_noise_value"])
-                    local_noise_would_have_been, previous_local_noise_source, previous_local_noise_fallback = _local_noise(current_signal, int(dilation_peak), pad=6)
-                    if np.isfinite(noise_value) and noise_value > 0.0:
-                        summary_counts["local_candidates_with_parent_noise"] += 1
-                        if np.isfinite(local_noise_would_have_been) and local_noise_would_have_been > 0.0:
-                            summary_counts["noise_ratio_values"].append(float(local_noise_would_have_been / noise_value))
-                    else:
-                        summary_counts["local_candidates_with_missing_parent_noise"] += 1
-                        noise_value = float(local_noise_would_have_been)
+                    noise_value = float(context["despike_noise_value"])
                     if not np.isfinite(noise_value) or noise_value <= 0.0:
                         summary_counts["technical_failures"] += 1
                         continue
@@ -1007,7 +982,7 @@ def compute_despike_from_cache_and_ss6(
                                 "source_x": context["source_x"],
                                 "compact_y": context["compact_y"],
                                 "compact_x": context["compact_x"],
-                                "stage_index": int(pass_index),
+                                "stage_index": int(local_stage_index),
                                 "attempt_index_within_stage": "",
                                 "attempt_type": "iterative_local_ss6",
                                 "original_peak_index": context["original_peak_index"],
@@ -1030,12 +1005,10 @@ def compute_despike_from_cache_and_ss6(
                                 "height_above_chord": float(height_above_chord),
                                 "height_above_chord_noise_z": float(height_z),
                                 "noise_value": float(noise_value),
-                                "parent_noise_value": float(context["parent_noise_value"]),
-                                "parent_noise_source": context["parent_noise_source"],
-                                "previous_local_noise_value_if_available": float(local_noise_would_have_been) if np.isfinite(local_noise_would_have_been) else np.nan,
-                                "local_noise_would_have_been": float(local_noise_would_have_been) if np.isfinite(local_noise_would_have_been) else np.nan,
-                                "noise_ratio_local_to_parent": (float(local_noise_would_have_been / context["parent_noise_value"]) if np.isfinite(local_noise_would_have_been) and np.isfinite(context["parent_noise_value"]) and float(context["parent_noise_value"]) > 0.0 else np.nan),
-                                "noise_fallback_used": int(bool(context["noise_fallback_used"]) or bool(previous_local_noise_fallback)),
+                                "parent_noise_value": float(context["despike_noise_value"]),
+                                "parent_noise_source": str(context["despike_noise_source"]),
+                                "despike_noise_value": float(context["despike_noise_value"]),
+                                "despike_noise_source": str(context["despike_noise_source"]),
                                 "ss1_pce_noise_used": "",
                                 "ss1_pce_noise_source": "",
                                 "ss1_pce_noise_override_used": 0,
@@ -1057,34 +1030,50 @@ def compute_despike_from_cache_and_ss6(
                             "height_above_chord": float(height_above_chord),
                             "height_above_chord_noise_z": float(height_z),
                             "noise_value": float(noise_value),
-                            "local_noise_would_have_been": float(local_noise_would_have_been) if np.isfinite(local_noise_would_have_been) else np.nan,
-                            "previous_local_noise_fallback": bool(previous_local_noise_fallback),
                         }
                     )
+
                 if not passed_noise_candidates:
-                    continue
+                    attempt_rows.append(
+                        {
+                            "source_y": context["source_y"],
+                            "source_x": context["source_x"],
+                            "compact_y": context["compact_y"],
+                            "compact_x": context["compact_x"],
+                            "stage_index": int(local_stage_index),
+                            "attempt_index_within_stage": "",
+                            "attempt_type": "iterative_local_ss6",
+                            "attempt_kind": "iterative_local_ss6_stop",
+                            "original_peak_index": context["original_peak_index"],
+                            "detected_peak_index": int(context["original_peak_index"]),
+                            "candidate_id": context["candidate_id"],
+                            "context_left": context["context_left"],
+                            "context_right": context["context_right"],
+                            "despike_noise_value": float(context["despike_noise_value"]),
+                            "despike_noise_source": str(context["despike_noise_source"]),
+                            "correction_applied": 0,
+                            "status": "no_local_noise_candidates",
+                            "skipped_reason": "no_local_noise_candidates",
+                        }
+                    )
+                    break
+
                 strongest_candidate = max(
                     passed_noise_candidates,
                     key=lambda item: (_safe_float(item.get("height_above_chord_noise_z")), _safe_float(item.get("height_above_chord"))),
                 )
-                context_metrics = _compute_context_metrics(
+                context_metrics = _compute_context_ss1(
                     signal=current_signal,
                     gradient_signal=gradient_signal,
                     base_row=context["row"],
                     context_left=int(context["context_left"]),
                     context_right=int(context["context_right"]),
                     peak_idx=int(strongest_candidate["dilation_peak"]),
-                    noise_value=float(context["parent_noise_value"]),
-                    noise_source=str(context["parent_noise_source"]),
+                    noise_value=float(context["despike_noise_value"]),
+                    noise_source=str(context["despike_noise_source"]),
                 )
                 summary_counts["local_contexts_with_context_ss1"] += 1
                 context_ss1 = _safe_float(context_metrics.get("context_ss1"))
-                context_pce = _safe_float(context_metrics.get("context_pce"))
-                context_pce_status = ("disabled" if not pce_context_enabled else str(context_metrics.get("context_pce_status", "fallback_to_local_pce")))
-                if pce_context_enabled and np.isfinite(context_pce):
-                    summary_counts["local_context_pce_computed"] += 1
-                elif pce_context_enabled:
-                    summary_counts["local_context_pce_missing"] += 1
                 context_ss1_fields = {
                     "context_ss1": context_ss1,
                     "context_ss1_peak_index": int(strongest_candidate["dilation_peak"]),
@@ -1094,76 +1083,40 @@ def compute_despike_from_cache_and_ss6(
                     "context_ss1_candidate_count": int(len(passed_noise_candidates)),
                     "context_ss1_threshold": float(local_context_ss1_threshold),
                     "local_ss1_gate_used": float(local_context_ss1_threshold),
-                    "context_pce": context_pce,
-                    "context_pce_peak_index": int(context_metrics.get("context_pce_peak_index", strongest_candidate["dilation_peak"])),
-                    "context_pce_peak_x": _peak_shift(np.asarray(cache["x_axis"], dtype=float), int(context_metrics.get("context_pce_peak_index", strongest_candidate["dilation_peak"]))),
-                    "context_pce_left_index": int(context_metrics.get("context_pce_left_index", context["context_left"])),
-                    "context_pce_right_index": int(context_metrics.get("context_pce_right_index", context["context_right"])),
-                    "context_pce_noise_value": _safe_float(context_metrics.get("context_pce_noise_value")),
-                    "context_pce_noise_source": str(context_metrics.get("context_pce_noise_source", "")),
-                    "context_pce_candidate_count": int(len(passed_noise_candidates)),
-                    "context_pce_status": context_pce_status,
-                    "context_pce_enabled": int(bool(pce_context_enabled)),
-                    "context_pce_debug": context_metrics.get("context_pce_debug", {}),
                 }
                 local_ss6_cfg = dict(ss6_cfg)
+                local_ss6_cfg.update(local_ss6_override_cfg)
                 local_ss6_cfg["ss1_gate"] = float(local_context_ss1_threshold)
                 if not np.isfinite(context_ss1) or context_ss1 < float(local_context_ss1_threshold):
                     summary_counts["local_candidates_rejected_by_context_ss1_low"] += int(len(passed_noise_candidates))
-                    for candidate in passed_noise_candidates:
-                        geom = candidate["geom"]
-                        local_noise_would_have_been = _safe_float(candidate.get("local_noise_would_have_been"))
-                        previous_local_noise_fallback = bool(candidate.get("previous_local_noise_fallback"))
-                        attempt_rows.append(
-                            {
-                                "source_y": context["source_y"],
-                                "source_x": context["source_x"],
-                                "compact_y": context["compact_y"],
-                                "compact_x": context["compact_x"],
-                                "stage_index": int(pass_index),
-                                "attempt_index_within_stage": "",
-                                "attempt_type": "iterative_local_ss6",
-                                "original_peak_index": context["original_peak_index"],
-                                "detected_peak_index": int(candidate["dilation_peak"]),
-                                "candidate_id": context["candidate_id"],
-                                "original_ss6_branch": context["original_ss6_branch"],
-                                "original_ss6_reason": context["original_ss6_reason"],
-                                "local_ss6_branch": "",
-                                "local_ss6_accept": 0,
-                                "context_left": context["context_left"],
-                                "context_right": context["context_right"],
-                                "tested_left": int(geom.cell_left),
-                                "tested_right": int(geom.cell_right),
-                                "left_erosion_contact": int(geom.left_anchor),
-                                "right_erosion_contact": int(geom.right_anchor),
-                                "dilation_contact": int(candidate["dilation_peak"]),
-                                "morph_window_used": int(morph_window_used),
-                                "context_erosion_contacts": context_eros_json,
-                                "context_dilation_contacts": context_dils_json,
-                                "height_above_chord": float(candidate["height_above_chord"]),
-                                "height_above_chord_noise_z": float(candidate["height_above_chord_noise_z"]),
-                                "noise_value": float(candidate["noise_value"]),
-                                "parent_noise_value": float(context["parent_noise_value"]),
-                                "parent_noise_source": context["parent_noise_source"],
-                                "previous_local_noise_value_if_available": local_noise_would_have_been,
-                                "local_noise_would_have_been": local_noise_would_have_been,
-                                "noise_ratio_local_to_parent": (float(local_noise_would_have_been / context["parent_noise_value"]) if np.isfinite(local_noise_would_have_been) and np.isfinite(context["parent_noise_value"]) and float(context["parent_noise_value"]) > 0.0 else np.nan),
-                                "noise_fallback_used": int(bool(context["noise_fallback_used"]) or bool(previous_local_noise_fallback)),
-                                "ss1_pce_noise_used": float(context["parent_noise_value"]) if np.isfinite(float(context["parent_noise_value"])) else np.nan,
-                                "ss1_pce_noise_source": str(context["parent_noise_source"]),
-                                "ss1_pce_noise_override_used": 1 if np.isfinite(float(context["parent_noise_value"])) and float(context["parent_noise_value"]) > 0.0 else 0,
-                                "chord_crossing_detected": 0,
-                                "chord_crossing_max": 0.0,
-                                "chord_support_adjustment_applied": 0,
-                                "replacement_increases_signal_max": 0.0,
-                                "correction_applied": 0,
-                                "status": "context_ss1_low",
-                                "skipped_reason": "context_ss1_low",
-                                "ss1": context_ss1,
-                                **context_ss1_fields,
-                            }
-                        )
-                    continue
+                    attempt_rows.append(
+                        {
+                            "source_y": context["source_y"],
+                            "source_x": context["source_x"],
+                            "compact_y": context["compact_y"],
+                            "compact_x": context["compact_x"],
+                            "stage_index": int(local_stage_index),
+                            "attempt_index_within_stage": "",
+                            "attempt_type": "iterative_local_ss6",
+                            "attempt_kind": "iterative_local_ss6_stop",
+                            "original_peak_index": context["original_peak_index"],
+                            "detected_peak_index": int(strongest_candidate["dilation_peak"]),
+                            "candidate_id": context["candidate_id"],
+                            "context_left": context["context_left"],
+                            "context_right": context["context_right"],
+                            "despike_noise_value": float(context["despike_noise_value"]),
+                            "despike_noise_source": str(context["despike_noise_source"]),
+                            "correction_applied": 0,
+                            "status": "context_ss1_low",
+                            "skipped_reason": "context_ss1_low",
+                            "ss1": context_ss1,
+                            **context_ss1_fields,
+                        }
+                    )
+                    break
+
+                local_plans: list[dict[str, Any]] = []
+                accepted_this_iteration = 0
                 for candidate in passed_noise_candidates:
                     summary_counts["local_candidates_sent_to_ss6"] += 1
                     dilation_peak = int(candidate["dilation_peak"])
@@ -1171,14 +1124,6 @@ def compute_despike_from_cache_and_ss6(
                     height_above_chord = float(candidate["height_above_chord"])
                     height_z = float(candidate["height_above_chord_noise_z"])
                     noise_value = float(candidate["noise_value"])
-                    local_noise_would_have_been = _safe_float(candidate.get("local_noise_would_have_been"))
-                    previous_local_noise_fallback = bool(candidate.get("previous_local_noise_fallback"))
-                    use_context_pce = bool(pce_context_enabled and np.isfinite(context_pce))
-                    pce_decision_source = "context" if use_context_pce else "local"
-                    if use_context_pce:
-                        summary_counts["local_candidates_using_context_pce"] += 1
-                    elif pce_context_enabled:
-                        summary_counts["local_candidates_fallback_to_local_pce"] += 1
                     local_row = _build_local_ss6_row(
                         signal=current_signal,
                         gradient_signal=gradient_signal,
@@ -1190,52 +1135,66 @@ def compute_despike_from_cache_and_ss6(
                         metric_ctx=metric_ctx,
                         global_edge_center=float(global_edge_center),
                         global_edge_scale=float(global_edge_scale),
-                        parent_noise_source=str(context["parent_noise_source"]),
+                        parent_noise_source=str(context["despike_noise_source"]),
                         ss1_override=context_ss1,
-                        pce_override=(context_pce if use_context_pce else None),
+                        pce_override=None,
                     )
                     local_accept = int(_safe_float(local_row.get("ss6_accept", 0)))
                     local_branch = str(local_row.get("ss6_branch", "")).strip()
+                    local_row_common = {
+                        "source_y": context["source_y"],
+                        "source_x": context["source_x"],
+                        "compact_y": context["compact_y"],
+                        "compact_x": context["compact_x"],
+                        "attempt_type": "iterative_local_ss6",
+                        "original_peak_index": context["original_peak_index"],
+                        "detected_peak_index": int(dilation_peak),
+                        "candidate_id": context["candidate_id"],
+                        "original_ss6_branch": context["original_ss6_branch"],
+                        "original_ss6_reason": context["original_ss6_reason"],
+                        "local_ss6_branch": local_branch,
+                        "local_ss6_accept": local_accept,
+                        "context_left": context["context_left"],
+                        "context_right": context["context_right"],
+                        "tested_left": int(geom.cell_left),
+                        "tested_right": int(geom.cell_right),
+                        "left_erosion_contact": int(geom.left_anchor),
+                        "right_erosion_contact": int(geom.right_anchor),
+                        "dilation_contact": int(dilation_peak),
+                        "morph_window_used": int(morph_window_used),
+                        "context_erosion_contacts": context_eros_json,
+                        "context_dilation_contacts": context_dils_json,
+                        "left_anchor": int(geom.left_anchor),
+                        "right_anchor": int(geom.right_anchor),
+                        "cell_left": int(geom.cell_left),
+                        "cell_right": int(geom.cell_right),
+                        "used_context_boundary_anchor": int(geom.used_context_boundary_anchor),
+                        "height_above_chord": float(height_above_chord),
+                        "height_above_chord_noise_z": float(height_z),
+                        "noise_value": float(noise_value),
+                        "parent_noise_value": float(context["despike_noise_value"]),
+                        "parent_noise_source": str(context["despike_noise_source"]),
+                        "despike_noise_value": float(context["despike_noise_value"]),
+                        "despike_noise_source": str(context["despike_noise_source"]),
+                        "ss1_pce_noise_used": _safe_float(local_row.get("ss1_pce_noise_used")),
+                        "ss1_pce_noise_source": str(local_row.get("ss1_pce_noise_source", "")),
+                        "ss1_pce_noise_override_used": int(_safe_float(local_row.get("ss1_pce_noise_override_used", 0))),
+                        "ss1": context_ss1,
+                        "pce": _safe_float(local_row.get("ss6_pce")),
+                        "edge": _safe_float(local_row.get("ss6_edge")),
+                        "eel": _safe_float(local_row.get("ss6_eel")),
+                        "resid": _safe_float(local_row.get("ss6_resid")),
+                        "pce_local_audit": _safe_float(local_row.get("pce_local_audit", local_row.get("pce_negpref_t098_evidence_signed"))),
+                        "score": float(height_z),
+                        **context_ss1_fields,
+                    }
                     if local_accept != 1:
                         missing_metrics = _local_missing_metrics(local_row, ss6_cfg)
                         attempt_rows.append(
                             {
-                                "source_y": context["source_y"],
-                                "source_x": context["source_x"],
-                                "compact_y": context["compact_y"],
-                                "compact_x": context["compact_x"],
-                                "stage_index": int(pass_index),
+                                **local_row_common,
+                                "stage_index": int(local_stage_index),
                                 "attempt_index_within_stage": "",
-                                "attempt_type": "iterative_local_ss6",
-                                "original_peak_index": context["original_peak_index"],
-                                "detected_peak_index": int(dilation_peak),
-                                "candidate_id": context["candidate_id"],
-                                "original_ss6_branch": context["original_ss6_branch"],
-                                "original_ss6_reason": context["original_ss6_reason"],
-                                "local_ss6_branch": local_branch,
-                                "local_ss6_accept": local_accept,
-                                "context_left": context["context_left"],
-                                "context_right": context["context_right"],
-                                "tested_left": int(geom.cell_left),
-                                "tested_right": int(geom.cell_right),
-                                "left_erosion_contact": int(geom.left_anchor),
-                                "right_erosion_contact": int(geom.right_anchor),
-                                "dilation_contact": int(dilation_peak),
-                                "morph_window_used": int(morph_window_used),
-                                "context_erosion_contacts": context_eros_json,
-                                "context_dilation_contacts": context_dils_json,
-                                "height_above_chord": float(height_above_chord),
-                                "height_above_chord_noise_z": float(height_z),
-                                "noise_value": float(noise_value),
-                                "parent_noise_value": float(context["parent_noise_value"]),
-                                "parent_noise_source": context["parent_noise_source"],
-                                "previous_local_noise_value_if_available": float(local_noise_would_have_been) if np.isfinite(local_noise_would_have_been) else np.nan,
-                                "local_noise_would_have_been": float(local_noise_would_have_been) if np.isfinite(local_noise_would_have_been) else np.nan,
-                                "noise_ratio_local_to_parent": (float(local_noise_would_have_been / context["parent_noise_value"]) if np.isfinite(local_noise_would_have_been) and np.isfinite(context["parent_noise_value"]) and float(context["parent_noise_value"]) > 0.0 else np.nan),
-                                "noise_fallback_used": int(bool(context["noise_fallback_used"]) or bool(previous_local_noise_fallback)),
-                                "ss1_pce_noise_used": _safe_float(local_row.get("ss1_pce_noise_used")),
-                                "ss1_pce_noise_source": str(local_row.get("ss1_pce_noise_source", "")),
-                                "ss1_pce_noise_override_used": int(_safe_float(local_row.get("ss1_pce_noise_override_used", 0))),
                                 "chord_crossing_detected": 0,
                                 "chord_crossing_max": 0.0,
                                 "chord_support_adjustment_applied": 0,
@@ -1243,274 +1202,224 @@ def compute_despike_from_cache_and_ss6(
                                 "correction_applied": 0,
                                 "status": ("local_missing_metric" if local_branch == "missing_metric" else "local_ss6_rejected"),
                                 "skipped_reason": (missing_metrics if local_branch == "missing_metric" else local_branch),
-                                "ss1": context_ss1,
-                                "pce": _safe_float(local_row.get("ss6_pce")),
-                                "edge": _safe_float(local_row.get("ss6_edge")),
-                                "eel": _safe_float(local_row.get("ss6_eel")),
-                                "resid": _safe_float(local_row.get("ss6_resid")),
-                                "pce_local_audit": _safe_float(local_row.get("pce_local_audit", local_row.get("pce_negpref_t098_evidence_signed"))),
-                                "pce_decision_source": pce_decision_source,
-                                "pce_t98_debug_local": (local_row.get("pce_t98_debug", {}) if isinstance(local_row.get("pce_t98_debug", {}), dict) else {}),
-                                **context_ss1_fields,
                             }
                         )
                         continue
+                    accepted_this_iteration += 1
                     summary_counts["local_candidates_accepted_by_ss6"] += 1
                     local_plans.append(
+                        {
+                            **local_row_common,
+                            "status": "corrected_iterative_local_ss6",
+                        }
+                    )
+
+                if accepted_this_iteration == 0:
+                    attempt_rows.append(
                         {
                             "source_y": context["source_y"],
                             "source_x": context["source_x"],
                             "compact_y": context["compact_y"],
                             "compact_x": context["compact_x"],
+                            "stage_index": int(local_stage_index),
+                            "attempt_index_within_stage": "",
                             "attempt_type": "iterative_local_ss6",
+                            "attempt_kind": "iterative_local_ss6_stop",
                             "original_peak_index": context["original_peak_index"],
-                            "detected_peak_index": int(dilation_peak),
+                            "detected_peak_index": int(strongest_candidate["dilation_peak"]),
                             "candidate_id": context["candidate_id"],
-                            "original_ss6_branch": context["original_ss6_branch"],
-                            "original_ss6_reason": context["original_ss6_reason"],
-                            "local_ss6_branch": local_branch,
-                            "local_ss6_accept": local_accept,
                             "context_left": context["context_left"],
                             "context_right": context["context_right"],
-                            "tested_left": int(geom.cell_left),
-                            "tested_right": int(geom.cell_right),
-                            "left_erosion_contact": int(geom.left_anchor),
-                            "right_erosion_contact": int(geom.right_anchor),
-                            "dilation_contact": int(dilation_peak),
-                            "morph_window_used": int(morph_window_used),
-                            "context_erosion_contacts": context_eros_json,
-                            "context_dilation_contacts": context_dils_json,
-                            "left_anchor": int(geom.left_anchor),
-                            "right_anchor": int(geom.right_anchor),
-                            "cell_left": int(geom.cell_left),
-                            "cell_right": int(geom.cell_right),
-                            "used_context_boundary_anchor": int(geom.used_context_boundary_anchor),
-                            "height_above_chord": float(height_above_chord),
-                            "height_above_chord_noise_z": float(height_z),
-                            "noise_value": float(noise_value),
-                            "parent_noise_value": float(context["parent_noise_value"]),
-                            "parent_noise_source": context["parent_noise_source"],
-                            "previous_local_noise_value_if_available": float(local_noise_would_have_been) if np.isfinite(local_noise_would_have_been) else np.nan,
-                            "local_noise_would_have_been": float(local_noise_would_have_been) if np.isfinite(local_noise_would_have_been) else np.nan,
-                            "noise_ratio_local_to_parent": (float(local_noise_would_have_been / context["parent_noise_value"]) if np.isfinite(local_noise_would_have_been) and np.isfinite(context["parent_noise_value"]) and float(context["parent_noise_value"]) > 0.0 else np.nan),
-                            "noise_fallback_used": int(bool(context["noise_fallback_used"]) or bool(previous_local_noise_fallback)),
-                            "ss1_pce_noise_used": _safe_float(local_row.get("ss1_pce_noise_used")),
-                            "ss1_pce_noise_source": str(local_row.get("ss1_pce_noise_source", "")),
-                            "ss1_pce_noise_override_used": int(_safe_float(local_row.get("ss1_pce_noise_override_used", 0))),
-                            "status": "corrected_iterative_local_ss6",
-                            "score": float(height_z),
+                            "despike_noise_value": float(context["despike_noise_value"]),
+                            "despike_noise_source": str(context["despike_noise_source"]),
+                            "correction_applied": 0,
+                            "status": "no_local_ss6_accept",
+                            "skipped_reason": "no_local_ss6_accept",
                             "ss1": context_ss1,
-                            "pce": _safe_float(local_row.get("ss6_pce")),
-                            "edge": _safe_float(local_row.get("ss6_edge")),
-                            "eel": _safe_float(local_row.get("ss6_eel")),
-                            "resid": _safe_float(local_row.get("ss6_resid")),
-                            "pce_local_audit": _safe_float(local_row.get("pce_local_audit", local_row.get("pce_negpref_t098_evidence_signed"))),
-                            "pce_decision_source": pce_decision_source,
-                            "pce_t98_debug_local": (local_row.get("pce_t98_debug", {}) if isinstance(local_row.get("pce_t98_debug", {}), dict) else {}),
                             **context_ss1_fields,
                         }
                     )
+                    break
 
-            if not local_plans:
-                break
-            kept_local, skipped_local = _resolve_stage_plans(local_plans)
-            for item in skipped_local:
-                summary_counts["skipped_overlap_duplicate"] += 1
-                item["stage_index"] = int(pass_index)
-                item["attempt_index_within_stage"] = ""
-                attempt_rows.append(item)
-            applied_local = _apply_plans(int(pass_index), int(y), int(x), kept_local, corrected_mask, corrected_interval_records)
-            spectrum_corrections += int(applied_local)
-            summary_counts["local_candidates_corrected"] += int(applied_local)
-            if applied_local > 0:
-                max_pass_index = int(pass_index)
+                kept_local, skipped_local = _resolve_stage_plans(local_plans)
+                for item in skipped_local:
+                    summary_counts["skipped_overlap_duplicate"] += 1
+                    item["stage_index"] = int(local_stage_index)
+                    item["attempt_index_within_stage"] = ""
+                    attempt_rows.append(item)
+                applied_local = _apply_plans(int(local_stage_index), int(y), int(x), kept_local, corrected_mask, corrected_interval_records)
+                spectrum_corrections += int(applied_local)
+                summary_counts["local_candidates_corrected"] += int(applied_local)
+                if applied_local > 0:
+                    max_pass_index = max(int(max_pass_index), int(local_stage_index))
+                    local_stage_index += 1
+                    context_iteration += 1
+                    continue
 
-        mask_cleanup_pass = int(max_pass_index)
-        while mask_cleanup_pass < int(max_iterations):
-            current_signal = np.asarray(corrected[y, x, :], dtype=float)
-            current_mask_intervals = _mask_intervals(corrected_mask)
-            if not current_mask_intervals:
-                break
-            _erosion, _dilation, erosion_contacts, dilation_contacts = _compute_contacts(current_signal, morph_window_used)
-            mask_plans: list[dict[str, Any]] = []
-            any_candidate_tested = False
-            for mask_left, mask_right in current_mask_intervals:
-                summary_counts["mask_intervals_tested"] += 1
-                interval_records = [
-                    rec for rec in corrected_interval_records
-                    if _interval_distance(int(mask_left), int(mask_right), int(rec.get("left", -1)), int(rec.get("right", -1))) == 0
-                ]
-                interval_noise_values = [
-                    _safe_float(rec.get("parent_noise_value", np.nan))
-                    for rec in interval_records
-                    if np.isfinite(_safe_float(rec.get("parent_noise_value", np.nan))) and _safe_float(rec.get("parent_noise_value", np.nan)) > 0.0
-                ]
-                parent_noise_value = float(min(interval_noise_values)) if interval_noise_values else float("nan")
-                ranked_records = sorted(interval_records, key=lambda rec: _safe_float(rec.get("parent_noise_value", np.inf)))
-                parent_noise_source = str(ranked_records[0].get("parent_noise_source", "")) if ranked_records else ""
-                candidate_id = str(ranked_records[0].get("candidate_id", "")) if ranked_records else ""
-                context_eros, context_dils = _context_contact_lists(
-                    erosion_contacts,
-                    dilation_contacts,
-                    int(mask_left),
-                    int(mask_right),
-                )
-                context_eros_json = _serialize_contact_list(context_eros)
-                context_dils_json = _serialize_contact_list(context_dils)
-                interval_dilation_peaks = [int(idx) for idx in context_dils if int(mask_left) <= int(idx) <= int(mask_right)]
-                for dilation_peak in interval_dilation_peaks:
-                    left_candidates = [idx for idx in context_eros if int(idx) < int(dilation_peak)]
-                    right_candidates = [idx for idx in context_eros if int(idx) > int(dilation_peak)]
-                    common_fields = {
-                        "source_y": int(contexts[0]["source_y"]) if contexts else int(y),
-                        "source_x": int(contexts[0]["source_x"]) if contexts else int(x),
-                        "compact_y": int(y),
-                        "compact_x": int(x),
-                        "stage_index": int(mask_cleanup_pass + 1),
+                attempt_rows.append(
+                    {
+                        "source_y": context["source_y"],
+                        "source_x": context["source_x"],
+                        "compact_y": context["compact_y"],
+                        "compact_x": context["compact_x"],
+                        "stage_index": int(local_stage_index),
                         "attempt_index_within_stage": "",
-                        "attempt_type": "mask_cleanup",
-                        "attempt_kind": "mask_connected_contact_cleanup",
-                        "original_peak_index": int(dilation_peak),
-                        "detected_peak_index": int(dilation_peak),
-                        "candidate_id": candidate_id,
-                        "original_ss6_branch": "",
-                        "original_ss6_reason": "",
-                        "local_ss6_branch": "",
-                        "local_ss6_accept": "",
-                        "context_left": int(mask_left),
-                        "context_right": int(mask_right),
-                        "fixed_context_left": int(mask_left),
-                        "fixed_context_right": int(mask_right),
-                        "tested_left": int(mask_left),
-                        "tested_right": int(mask_right),
-                        "dilation_contact": int(dilation_peak),
-                        "morph_window_used": int(morph_window_used),
-                        "context_erosion_contacts": context_eros_json,
-                        "context_dilation_contacts": context_dils_json,
-                        "mask_connected": 1,
-                        "mask_overlap_count": 1,
-                        "corrected_mask_overlap_fraction": 1.0,
-                        "mask_overlap_fraction": 1.0,
-                        "mask_distance_pts": 0,
-                        "mask_interval_start": int(mask_left),
-                        "mask_interval_end": int(mask_right),
-                        "overlaps_corrected_mask": 1,
-                        "fully_inside_corrected_mask": 1,
-                        "mask_cleanup_candidate": 1,
-                        "chord_crossing_detected": 0,
-                        "chord_crossing_max": 0.0,
-                        "chord_support_adjustment_applied": 0,
-                        "support_adjustment_applied": 0,
-                        "replacement_increases_signal_max": 0.0,
+                        "attempt_type": "iterative_local_ss6",
+                        "attempt_kind": "iterative_local_ss6_stop",
+                        "original_peak_index": context["original_peak_index"],
+                        "detected_peak_index": int(strongest_candidate["dilation_peak"]),
+                        "candidate_id": context["candidate_id"],
+                        "context_left": context["context_left"],
+                        "context_right": context["context_right"],
+                        "despike_noise_value": float(context["despike_noise_value"]),
+                        "despike_noise_source": str(context["despike_noise_source"]),
                         "correction_applied": 0,
-                        "corrected": 0,
+                        "status": "no_local_ss6_accept",
+                        "skipped_reason": "no_local_ss6_accept",
+                        "ss1": context_ss1,
+                        **context_ss1_fields,
                     }
-                    if not left_candidates or not right_candidates:
-                        summary_counts["mask_cleanup_rejected_boundary_guard"] += 1
-                        attempt_rows.append(
-                            {
-                                **common_fields,
-                                "status": "rejected_mask_cleanup_would_expand_outside_corrected_interval",
-                                "skipped_reason": "would_expand_outside_corrected_interval",
-                            }
-                        )
-                        continue
-                    left_anchor = int(max(left_candidates))
-                    right_anchor = int(min(right_candidates))
-                    if left_anchor < int(mask_left) or right_anchor > int(mask_right) or right_anchor <= left_anchor:
-                        summary_counts["mask_cleanup_rejected_boundary_guard"] += 1
-                        attempt_rows.append(
-                            {
-                                **common_fields,
-                                "left_erosion_contact": int(left_anchor),
-                                "right_erosion_contact": int(right_anchor),
-                                "left_anchor": int(left_anchor),
-                                "right_anchor": int(right_anchor),
-                                "cell_left": int(left_anchor),
-                                "cell_right": int(right_anchor),
-                                "used_context_boundary_anchor": 0,
-                                "status": "rejected_mask_cleanup_would_expand_outside_corrected_interval",
-                                "skipped_reason": "would_expand_outside_corrected_interval",
-                            }
-                        )
-                        continue
-                    any_candidate_tested = True
-                    summary_counts["mask_cleanup_candidates_tested"] += 1
-                    common_fields.update(
-                        {
-                            "tested_left": int(left_anchor),
-                            "tested_right": int(right_anchor),
-                            "left_erosion_contact": int(left_anchor),
-                            "right_erosion_contact": int(right_anchor),
-                            "left_anchor": int(left_anchor),
-                            "right_anchor": int(right_anchor),
-                            "cell_left": int(left_anchor),
-                            "cell_right": int(right_anchor),
-                            "used_context_boundary_anchor": 0,
-                            "noise_value": float(parent_noise_value),
-                            "parent_noise_value": float(parent_noise_value),
-                            "parent_noise_source": str(parent_noise_source),
-                        }
-                    )
-                    if not np.isfinite(parent_noise_value) or parent_noise_value <= 0.0:
-                        summary_counts["mask_cleanup_rejected_missing_parent_noise"] += 1
-                        attempt_rows.append(
-                            {
-                                **common_fields,
-                                "status": "rejected_mask_missing_parent_noise",
-                                "skipped_reason": "missing_parent_noise",
-                            }
-                        )
-                        continue
-                    height_above_chord, _ = _height_above_chord(current_signal, int(dilation_peak), left_anchor, right_anchor)
-                    height_z = float(height_above_chord / parent_noise_value) if np.isfinite(height_above_chord) and parent_noise_value > 0.0 else float("nan")
-                    common_fields.update(
-                        {
-                            "height_above_chord": float(height_above_chord),
-                            "height_above_chord_noise_z": float(height_z),
-                            "residual_height": float(height_above_chord),
-                            "residual_height_noise_z": float(height_z),
-                        }
-                    )
-                    if not np.isfinite(height_z) or height_z < float(noise_height_factor):
-                        summary_counts["mask_cleanup_rejected_below_noise_height"] += 1
-                        attempt_rows.append(
-                            {
-                                **common_fields,
-                                "status": "rejected_mask_residual_below_noise_height",
-                                "skipped_reason": "below_noise_height",
-                            }
-                        )
-                        continue
-                    mask_plans.append(
-                        {
-                            **common_fields,
-                            "status": "corrected_mask_connected_contact_cleanup",
-                            "skipped_reason": "",
-                            "score": float(height_z),
-                            "correction_applied": 1,
-                            "corrected": 1,
-                        }
-                    )
-            if not mask_plans:
+                )
                 break
-            next_stage_index = int(mask_cleanup_pass + 1)
-            kept_mask, skipped_mask = _resolve_stage_plans(mask_plans)
-            for item in skipped_mask:
-                summary_counts["skipped_overlap_duplicate"] += 1
-                item["stage_index"] = int(next_stage_index)
-                item["attempt_index_within_stage"] = ""
-                item["attempt_kind"] = str(item.get("attempt_kind", item.get("attempt_type", "")))
-                item["corrected"] = 0
-                attempt_rows.append(item)
-            applied_mask = _apply_plans(int(next_stage_index), int(y), int(x), kept_mask, corrected_mask, corrected_interval_records)
-            spectrum_corrections += int(applied_mask)
-            summary_counts["mask_cleanup_corrected"] += int(applied_mask)
-            if applied_mask <= 0:
-                break
-            mask_cleanup_pass = int(next_stage_index)
-            max_pass_index = max(int(max_pass_index), int(next_stage_index))
 
+            else:
+                attempt_rows.append(
+                    {
+                        "source_y": context["source_y"],
+                        "source_x": context["source_x"],
+                        "compact_y": context["compact_y"],
+                        "compact_x": context["compact_x"],
+                        "stage_index": int(local_stage_index),
+                        "attempt_index_within_stage": "",
+                        "attempt_type": "iterative_local_ss6",
+                        "attempt_kind": "iterative_local_ss6_stop",
+                        "original_peak_index": context["original_peak_index"],
+                        "detected_peak_index": int(context["original_peak_index"]),
+                        "candidate_id": context["candidate_id"],
+                        "context_left": context["context_left"],
+                        "context_right": context["context_right"],
+                        "despike_noise_value": float(context["despike_noise_value"]),
+                        "despike_noise_source": str(context["despike_noise_source"]),
+                        "correction_applied": 0,
+                        "status": "max_iterations_reached",
+                        "skipped_reason": "max_iterations_reached",
+                    }
+                )
+
+        residual_stage_index = int(local_stage_index if local_stage_index > 1 else (max_pass_index + 1 if max_pass_index > 0 else 2))
+
+        residual_stage_index = int(max_pass_index) + 1 if max_pass_index > 0 else 2
+        merged_corrected_intervals = _merge_corrected_intervals(corrected_interval_records)
+        residual_cleanup_plans: list[dict[str, Any]] = []
+        for interval in merged_corrected_intervals:
+            interval_left = int(interval["left"])
+            interval_right = int(interval["right"])
+            if interval_right - interval_left < 2:
+                continue
+            summary_counts["mask_residual_cleanup_intervals_tested"] += 1
+            current_signal = np.asarray(corrected[y, x, :], dtype=float)
+            chord = _chord_values(
+                interval_left,
+                interval_right,
+                float(current_signal[interval_left]),
+                float(current_signal[interval_right]),
+            )
+            residual = np.asarray(current_signal[interval_left : interval_right + 1], dtype=float) - np.asarray(chord, dtype=float)
+            components = _residual_components(residual[1:-1], offset=interval_left + 1)
+            parent_noise_value = _safe_float(interval.get("parent_noise_value", np.nan))
+            parent_noise_source = str(interval.get("parent_noise_source", ""))
+            apex_idx = int((interval_left + interval_right) // 2)
+            residual_height = 0.0
+            if components:
+                strongest_component = max(components, key=lambda item: _safe_float(item.get("height", np.nan)))
+                apex_idx = int(strongest_component.get("apex", apex_idx))
+                residual_height = max(0.0, _safe_float(strongest_component.get("height", 0.0)))
+                comp_start = int(strongest_component.get("start", apex_idx))
+                comp_end = int(strongest_component.get("end", apex_idx))
+            else:
+                comp_start = int(apex_idx)
+                comp_end = int(apex_idx)
+            residual_height_noise_z = (
+                float(residual_height / parent_noise_value)
+                if np.isfinite(parent_noise_value) and parent_noise_value > 0.0
+                else float("nan")
+            )
+            common_row = {
+                "source_y": int(y),
+                "source_x": int(x),
+                "compact_y": int(y),
+                "compact_x": int(x),
+                "stage_index": int(residual_stage_index),
+                "attempt_index_within_stage": "",
+                "attempt_type": "mask_cleanup",
+                "attempt_kind": "mask_residual_cleanup",
+                "original_peak_index": int(apex_idx),
+                "detected_peak_index": int(apex_idx),
+                "candidate_id": str(interval.get("candidate_id", "")),
+                "original_ss6_branch": "",
+                "original_ss6_reason": "",
+                "local_ss6_branch": "",
+                "local_ss6_accept": "",
+                "context_left": int(interval_left),
+                "context_right": int(interval_right),
+                "tested_left": int(comp_start),
+                "tested_right": int(comp_end),
+                "left_anchor": int(max(interval_left, comp_start - 1)),
+                "right_anchor": int(min(interval_right, comp_end + 1)),
+                "cell_left": int(comp_start),
+                "cell_right": int(comp_end),
+                "used_context_boundary_anchor": 0,
+                "mask_interval_start": int(interval_left),
+                "mask_interval_end": int(interval_right),
+                "parent_noise_value": float(parent_noise_value) if np.isfinite(parent_noise_value) else np.nan,
+                "parent_noise_source": str(parent_noise_source),
+                "despike_noise_value": float(parent_noise_value) if np.isfinite(parent_noise_value) else np.nan,
+                "despike_noise_source": str(parent_noise_source),
+                "residual_height": float(residual_height),
+                "residual_height_noise_z": float(residual_height_noise_z) if np.isfinite(residual_height_noise_z) else np.nan,
+                "noise_value": float(parent_noise_value) if np.isfinite(parent_noise_value) else np.nan,
+                "chord_crossing_detected": 0,
+                "chord_crossing_max": 0.0,
+                "chord_support_adjustment_applied": 0,
+                "replacement_increases_signal_max": 0.0,
+                "corrected": 0,
+            }
+            if (
+                np.isfinite(residual_height_noise_z)
+                and residual_height_noise_z > float(noise_height_factor)
+                and int(common_row["right_anchor"]) - int(common_row["left_anchor"]) >= 2
+            ):
+                plan = dict(common_row)
+                plan["status"] = "corrected_mask_residual_cleanup"
+                plan["score"] = float(residual_height_noise_z)
+                residual_cleanup_plans.append(plan)
+            else:
+                summary_counts["mask_residual_cleanup_rejected_below_noise_height"] += 1
+                rejected_row = dict(common_row)
+                rejected_row["status"] = "rejected_mask_residual_below_noise_height"
+                rejected_row["skipped_reason"] = "below_noise_height"
+                rejected_row["correction_applied"] = 0
+                attempt_rows.append(rejected_row)
+
+        kept_residual, skipped_residual = _resolve_stage_plans(residual_cleanup_plans)
+        for item in skipped_residual:
+            summary_counts["skipped_overlap_duplicate"] += 1
+            item["stage_index"] = int(residual_stage_index)
+            item["attempt_index_within_stage"] = ""
+            attempt_rows.append(item)
+        applied_residual = _apply_plans(
+            int(residual_stage_index),
+            int(y),
+            int(x),
+            kept_residual,
+            corrected_mask,
+            corrected_interval_records,
+        )
+        spectrum_corrections += int(applied_residual)
+        summary_counts["mask_residual_cleanup_corrected"] += int(applied_residual)
+
+        if kept_residual or merged_corrected_intervals:
+            max_pass_index = max(int(max_pass_index), int(residual_stage_index))
         summary_counts["max_pass_index_used"] = max(int(summary_counts["max_pass_index_used"]), int(max_pass_index))
         per_spectrum_correction_counts[f"{int(y)}:{int(x)}"] = int(spectrum_corrections)
         if spectrum_corrections > 0:
@@ -1547,8 +1456,17 @@ def compute_despike_from_cache_and_ss6(
                 }
             )
 
-    for row in attempt_rows:
+    for seq, row in enumerate(attempt_rows, start=1):
+        row["attempt_sequence"] = int(seq)
         row["attempt_kind"] = str(row.get("attempt_kind", row.get("attempt_type", "")))
+        if not np.isfinite(_safe_float(row.get("despike_noise_value", np.nan))):
+            fallback_noise = _safe_float(row.get("parent_noise_value", row.get("noise_value", np.nan)))
+            if np.isfinite(fallback_noise):
+                row["despike_noise_value"] = float(fallback_noise)
+        if not str(row.get("despike_noise_source", "")).strip():
+            fallback_source = str(row.get("parent_noise_source", "")).strip()
+            if fallback_source:
+                row["despike_noise_source"] = fallback_source
         if "corrected" not in row:
             row["corrected"] = int(_safe_float(row.get("correction_applied", 0)) == 1)
         if "support_adjustment_applied" not in row:
@@ -1572,25 +1490,10 @@ def compute_despike_from_cache_and_ss6(
         "local_candidates_sent_to_ss6": int(summary_counts["local_candidates_sent_to_ss6"]),
         "local_candidates_accepted_by_ss6": int(summary_counts["local_candidates_accepted_by_ss6"]),
         "local_candidates_corrected": int(summary_counts["local_candidates_corrected"]),
-        "pce_context_enabled": bool(pce_context_enabled),
-        "local_context_pce_computed": int(summary_counts["local_context_pce_computed"]),
-        "local_context_pce_missing": int(summary_counts["local_context_pce_missing"]),
-        "local_candidates_using_context_pce": int(summary_counts["local_candidates_using_context_pce"]),
-        "local_candidates_fallback_to_local_pce": int(summary_counts["local_candidates_fallback_to_local_pce"]),
-        "mask_cleanup_candidates_tested": int(summary_counts["mask_cleanup_candidates_tested"]),
-        "mask_intervals_tested": int(summary_counts["mask_intervals_tested"]),
-        "mask_cleanup_corrected": int(summary_counts["mask_cleanup_corrected"]),
-        "mask_cleanup_rejected_below_noise_height": int(summary_counts["mask_cleanup_rejected_below_noise_height"]),
-        "mask_cleanup_rejected_boundary_guard": int(summary_counts["mask_cleanup_rejected_boundary_guard"]),
-        "mask_cleanup_rejected_no_connection": int(summary_counts["mask_cleanup_rejected_no_connection"]),
-        "mask_cleanup_rejected_missing_parent_noise": int(summary_counts["mask_cleanup_rejected_missing_parent_noise"]),
-        "mask_cleanup_rejected_unsafe_geometry": int(summary_counts["mask_cleanup_rejected_unsafe_geometry"]),
-        "mask_cleanup_rejected_no_meaningful_change": int(summary_counts["mask_cleanup_rejected_no_meaningful_change"]),
+        "mask_residual_cleanup_intervals_tested": int(summary_counts["mask_residual_cleanup_intervals_tested"]),
+        "mask_residual_cleanup_corrected": int(summary_counts["mask_residual_cleanup_corrected"]),
+        "mask_residual_cleanup_rejected_below_noise_height": int(summary_counts["mask_residual_cleanup_rejected_below_noise_height"]),
         "ss1_context_threshold": float(local_context_ss1_threshold),
-        "local_candidates_with_parent_noise": int(summary_counts["local_candidates_with_parent_noise"]),
-        "local_candidates_with_missing_parent_noise": int(summary_counts["local_candidates_with_missing_parent_noise"]),
-        "median_noise_ratio_local_to_parent_if_available": (float(np.median(np.asarray(summary_counts["noise_ratio_values"], dtype=float))) if summary_counts["noise_ratio_values"] else float("nan")),
-        "max_noise_ratio_local_to_parent_if_available": (float(np.max(np.asarray(summary_counts["noise_ratio_values"], dtype=float))) if summary_counts["noise_ratio_values"] else float("nan")),
         "total_corrections_applied": int(summary_counts["total_corrections_applied"]),
         "spectra_with_corrections": int(summary_counts["spectra_with_corrections"]),
         "technical_failures": int(summary_counts["technical_failures"]),
@@ -1641,21 +1544,20 @@ def compute_despike_from_cache_and_ss6(
         attempts_path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = [
             "source_y", "source_x", "compact_y", "compact_x",
-            "stage_index", "attempt_index_within_stage", "attempt_type", "attempt_kind",
+            "attempt_sequence", "stage_index", "attempt_index_within_stage", "attempt_type", "attempt_kind",
             "original_peak_index", "detected_peak_index", "candidate_id",
             "original_ss6_branch", "original_ss6_reason", "local_ss6_branch", "local_ss6_accept",
             "context_left", "context_right", "tested_left", "tested_right",
             "left_erosion_contact", "right_erosion_contact", "dilation_contact", "morph_window_used",
             "context_erosion_contacts", "context_dilation_contacts",
             "left_anchor", "right_anchor", "cell_left", "cell_right", "used_context_boundary_anchor",
-            "mask_interval_start", "mask_interval_end", "mask_overlap_fraction", "mask_overlap_count", "mask_distance_pts", "mask_connected",
+            "mask_interval_start", "mask_interval_end",
             "raw_peak_value_before", "corrected_peak_value_after", "correction_height",
             "height_above_chord", "height_above_chord_noise_z", "noise_value", "residual_height", "residual_height_noise_z",
-            "parent_noise_value", "parent_noise_source", "previous_local_noise_value_if_available", "local_noise_would_have_been", "noise_ratio_local_to_parent", "noise_fallback_used",
+            "parent_noise_value", "parent_noise_source", "despike_noise_value", "despike_noise_source",
             "ss1_pce_noise_used", "ss1_pce_noise_source", "ss1_pce_noise_override_used",
             "context_ss1", "context_ss1_peak_index", "context_ss1_peak_x", "context_ss1_noise_value", "context_ss1_noise_source", "context_ss1_candidate_count", "context_ss1_threshold", "local_ss1_gate_used",
-            "context_pce", "context_pce_peak_index", "context_pce_peak_x", "context_pce_left_index", "context_pce_right_index", "context_pce_noise_value", "context_pce_noise_source", "context_pce_candidate_count", "context_pce_status", "context_pce_enabled", "pce_local_audit", "pce_decision_source",
-            "corrected_mask_overlap_fraction", "overlaps_corrected_mask", "fully_inside_corrected_mask", "mask_cleanup_candidate", "mask_cleanup_status",
+            "pce_local_audit",
             "chord_crossing_detected", "chord_crossing_max", "chord_support_adjustment_applied", "support_adjustment_applied", "replacement_increases_signal_max",
             "ss1", "pce", "edge", "eel", "resid",
             "correction_applied", "corrected", "status", "skipped_reason",

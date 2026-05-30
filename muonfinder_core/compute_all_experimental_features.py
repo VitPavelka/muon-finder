@@ -37,7 +37,6 @@ if __package__ in {None, ""}:
         write_feature_csv,
     )
     from muonfinder_core.experimental_edge_variants import compute_experimental_edge_variants
-    from muonfinder_core.experimental_raw_pce import compute_experimental_raw_pce
     from muonfinder_core.experimental_residual_pce import compute_experimental_residual_features
     from muonfinder_core.metrics import MetricComputationContext, robust_center_scale, sigmoid_support
 else:
@@ -52,36 +51,8 @@ else:
         write_feature_csv,
     )
     from .experimental_edge_variants import compute_experimental_edge_variants
-    from .experimental_raw_pce import compute_experimental_raw_pce
     from .experimental_residual_pce import compute_experimental_residual_features
     from .metrics import MetricComputationContext, robust_center_scale, sigmoid_support
-    from .morphology import dilation_1d, erosion_1d
-
-
-def _third_diff_metrics(signal: np.ndarray, peak_index: int, noise_value: float, radius: int = 3) -> tuple[float, float]:
-    x = np.asarray(signal, dtype=float)
-    peak = int(peak_index)
-    if x.ndim != 1 or x.size < 5 or not (0 <= peak < x.size):
-        return float("nan"), float("nan")
-    d3 = np.diff(x, n=3)
-    if d3.size == 0:
-        return float("nan"), float("nan")
-    left = max(0, peak - int(radius) - 1)
-    right = min(d3.size - 1, peak + int(radius) - 1)
-    if right < left:
-        return float("nan"), float("nan")
-    seg = np.abs(d3[left : right + 1])
-    scale = max(float(noise_value), 1e-12) if np.isfinite(noise_value) and noise_value > 0.0 else float("nan")
-    if not np.isfinite(scale):
-        return float("nan"), float("nan")
-    return float(np.max(seg) / scale), float(np.sum(seg) / scale)
-
-
-def _morph_gradient_1d(signal: np.ndarray, window: int = 3) -> np.ndarray:
-    x = np.asarray(signal, dtype=float).reshape(1, 1, -1)
-    dil = np.asarray(dilation_1d(x, int(window)).reshape(-1), dtype=float)
-    ero = np.asarray(erosion_1d(x, int(window)).reshape(-1), dtype=float)
-    return np.asarray(dil - ero, dtype=float)
 
 
 def _group_valid_count(rows: list[dict[str, object]], columns: list[str]) -> int:
@@ -297,7 +268,6 @@ def compute_all_experimental_features_from_config(
     missing_edge_foot = 0
     invalid_prominence = 0
     missing_noise = 0
-    raw_pce_time = 0.0
     resid_time = 0.0
     edge_time = 0.0
     total_rows = len(used_rows)
@@ -317,16 +287,8 @@ def compute_all_experimental_features_from_config(
         if not np.isfinite(noise_value) or noise_value <= 0.0:
             missing_noise += 1
 
-        raw_status = ""
-        if bool(dict(exp_cfg.get("raw_pce", {})).get("enabled", True)):
-            t_part = time.perf_counter()
-            raw_features = compute_experimental_raw_pce(raw, row, noise_value, dict(exp_cfg.get("raw_pce", {})))
-            out_row.update(raw_features)
-            raw_status = str(raw_features.get("exp_raw_pce_status", ""))
-            raw_pce_time += time.perf_counter() - t_part
-
         resid_status = ""
-        if bool(dict(exp_cfg.get("residual_pce", {})).get("enabled", True)) or bool(dict(exp_cfg.get("residual_threshold", {})).get("enabled", True)):
+        if bool(dict(exp_cfg.get("residual_pce", {})).get("enabled", False)) or bool(dict(exp_cfg.get("residual_threshold", {})).get("enabled", True)):
             t_part = time.perf_counter()
             resid_features = compute_experimental_residual_features(raw, row, noise_value, exp_cfg)
             out_row.update(resid_features)
@@ -341,16 +303,7 @@ def compute_all_experimental_features_from_config(
             edge_status = str(edge_features.get("exp_edge_variants_status", ""))
             edge_time += time.perf_counter() - t_part
 
-        peak_index = int(row.get("peak_index", -1))
-        d3raw_m, d3raw_s = _third_diff_metrics(raw, peak_index, noise_value, radius=3)
-        grad_sig = _morph_gradient_1d(raw, window=3)
-        d3grad_m, d3grad_s = _third_diff_metrics(grad_sig, peak_index, noise_value, radius=3)
-        out_row["d3rawM"] = float(d3raw_m) if np.isfinite(d3raw_m) else np.nan
-        out_row["d3rawS"] = float(d3raw_s) if np.isfinite(d3raw_s) else np.nan
-        out_row["d3gradM"] = float(d3grad_m) if np.isfinite(d3grad_m) else np.nan
-        out_row["d3gradS"] = float(d3grad_s) if np.isfinite(d3grad_s) else np.nan
-
-        if "missing_raw_signal" in {raw_status, resid_status, edge_status}:
+        if "missing_raw_signal" in {resid_status, edge_status}:
             missing_raw_signal += 1
         if edge_status == "missing_edge_foot":
             missing_edge_foot += 1
@@ -363,7 +316,7 @@ def compute_all_experimental_features_from_config(
             out_row["exp_global_status"] = "missing_edge_foot"
         elif edge_status == "invalid_prominence":
             out_row["exp_global_status"] = "invalid_prominence"
-        elif raw_status == "missing_raw_signal" or resid_status == "missing_raw_signal":
+        elif resid_status == "missing_raw_signal":
             out_row["exp_global_status"] = "missing_raw_signal"
         rows_out.append(out_row)
 
@@ -371,8 +324,6 @@ def compute_all_experimental_features_from_config(
     write_feature_csv(out_path, rows_out)
     feature_names = sorted({key for row in rows_out for key in row.keys() if key.startswith("exp_")})
     valid_rows_per_group = {
-        "raw_pce": _group_valid_count(rows_out, ["exp_raw_pce_none", "exp_raw_pce_savgol5", "exp_raw_pce_savgol7"]),
-        "residual_pce": _group_valid_count(rows_out, ["exp_resid3_pce"]),
         "residual_threshold": _group_valid_count(rows_out, ["exp_resid3_height_noise_z", "exp_resid3_above_3noise"]),
         "edge_variants": _group_valid_count(
             rows_out,
@@ -413,7 +364,6 @@ def compute_all_experimental_features_from_config(
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"experimental raw_pce time: {raw_pce_time:.1f} s")
     print(f"experimental residual time: {resid_time:.1f} s")
     print(f"experimental edge_variants time: {edge_time:.1f} s")
 
@@ -455,8 +405,6 @@ def main() -> None:
     print(f"total candidate rows loaded: {scope_stats['total_loaded_candidates']}")
     print(f"rejected by noise prefilter: {scope_stats['candidates_rejected_by_noise_filter']}")
     print(f"used for experimental features: {scope_stats['candidates_used']}")
-    print(f"valid raw_pce rows: {valid_rows_per_group['raw_pce']}")
-    print(f"valid residual_pce rows: {valid_rows_per_group['residual_pce']}")
     print(f"valid residual_threshold rows: {valid_rows_per_group['residual_threshold']}")
     print(f"valid edge_variants rows: {valid_rows_per_group['edge_variants']}")
     if int(scope_stats.get("candidates_missing_noise_status", 0)) > 0:
