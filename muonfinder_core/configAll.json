@@ -1,0 +1,187 @@
+{
+  "path_config": "path_configAll.json",
+  "data": {
+    "input_format": "auto",
+    "use_compact_coords_view": false
+  },
+  "morphology": {
+    "tophat_window": 3,
+    "noise_window": 3,
+    "morphology_windows": [3, 5, 7],
+    "baseline_window": 5,
+    "feature_erosion_window": 20
+  },
+  "candidates": {
+    "score_mode": "max",
+    "threshold_method": "quantile",
+    "threshold_quantile": 0.1,
+    "threshold_k_mad": 20.0,
+    "threshold_min_abs": null,
+    "k_mad_pixel": 8.0,
+    "min_peak": 80.0,
+    "max_width_pts": 24,
+    "pad_pts": 0,
+    "edge_k_mad": 2.0,
+    "merge_duplicate_segments": true,
+    "feature_expand_to_gradient_foot": true,
+    "feature_foot_k_mad": 2.0,
+    "feature_foot_min_run": 2,
+    "feature_window_method": "mad_run"
+  },
+  "background": {
+    "method": "bg_mad"
+  },
+  "noise": {
+    "noise_source": "morph_range",
+    "noise_height_factor": 3.0,
+    "candidate_noise_prefilter_enabled": true,
+    "candidate_noise_prefilter_mode": "morph_range_chord",
+    "edge_foot_method": "noise_quantized_component",
+    "edge_pre_level_step_noise": 1.0,
+    "edge_pre_transient_tolerance_levels": 3,
+    "edge_pre_min_stable_levels": 2,
+    "edge_neighbor_structure_factor": 3.0,
+    "edge_dense_context_min_pad_pts": 10,
+    "edge_dense_context_pad_pts": 20,
+    "edge_dense_context_max_pad_pts": 120,
+    "edge_context_expand_step_pts": 10
+  },
+  "cap": {
+    "candidate_scope": "noise-kept",
+    "signal_source": "raw",
+    "median_windows": [3, 5, 7, 9, 13, 17, 21, 31],
+    "curve_windows": [3, 5, 7, 9, 13, 17],
+    "early_windows": [3, 5, 7],
+    "mid_windows": [9, 13, 17],
+    "late_windows": [17, 21, 31],
+    "late_reference_window": 31,
+    "min_prominence": 1e-12,
+    "eps": 1e-12
+  },
+  "experimental_features": {
+    "enabled": true,
+    "auto_recompute": true,
+    "candidate_scope": "noise-kept",
+    "noise_source": "morph_range",
+    "noise_threshold_factor": 3.0,
+    "raw_pce": {
+      "enabled": true,
+      "smoothing_modes": ["none", "savgol5", "savgol7"],
+      "near_apex_radius_pts": 2
+    },
+    "residual_pce": {
+      "enabled": true,
+      "median_window": 3,
+      "near_apex_radius_pts": 2
+    },
+    "residual_threshold": {
+      "enabled": true,
+      "median_window": 3,
+      "threshold_noise_factor": 3.0
+    },
+    "edge_variants": {
+      "enabled": true,
+      "noise_level_step_factor": 1.0,
+      "noise_level_start_factor": 0.0,
+      "max_noise_levels": 50
+    },
+    "viewer_columns": [
+      "exp_edge_legacy_evidence_signed_modernnorm",
+      "exp_resid3_height_noise_z"
+    ]
+  },
+  "ss6": {
+    "enabled": true,
+    "auto_load_in_viewer": true,
+    "ss1_gate": 0.95,
+    "pce_strong_min": 0.60,
+    "pce_dead_max": -0.999,
+    "pce_gray_min": 0.10,
+    "pce_gray_max": 0.60,
+
+    "edge_spike_max": -0.65,
+    "eel_spike_max": -0.65,
+    "edge_eel_delta_min": 0.50,
+
+    "pce_dead_edge_spike_max": -0.65,
+
+    "pce_gray_delta_eel_max": -0.40,
+    "pce_gray_delta_min": 0.50,
+    "pce_gray_delta_resid_min": 8.5,
+    "pce_gray_high_pce_min": 0.60,
+    "pce_gray_high_pce_eel_max": -0.60,
+    "pce_gray_high_pce_resid_min": 6.0,
+    "pce_gray_high_resid_min": 12.0,
+    "pce_gray_soft_edge_max": -0.45,
+    "pce_gray_soft_eel_max": -0.45,
+
+    "low_pce_double_edge_edge_max": -0.60,
+    "low_pce_double_edge_eel_max": -0.60,
+    "low_pce_double_edge_resid_min": 5.5,
+    "resid_rescue_min": 8.5,
+    "resid_strong_min": 20.0,
+    "require_noise_kept": true,
+    "save_histograms": true,
+    "histogram_bins": 40,
+    "metric_names": {
+      "ss1": "spike_score_v1",
+      "pce": "pce_negpref_t098_evidence_signed",
+      "edge": "recdw_sum_0_90_raman_veto_evidence_signed",
+      "eel": "exp_edge_legacy_evidence_signed_modernnorm",
+      "resid": "exp_resid3_height_noise_z"
+    },
+    "viewer_columns": [],
+    "viewer_label_aliases": {
+      "ss6_accept": "s6",
+      "ss6_branch": "s6b",
+      "ss6_edge_eel_delta": "eed",
+      "ss6_resid": "r3",
+      "ss6_eel": "eel",
+      "ss6_edge": "edge"
+    },
+    "write_pce_metric_audit": false
+  },
+  "despike": {
+    "enabled": true,
+    "source": "ss6",
+    "morph_window": 3,
+    "despike_context_window_pad": 0,
+    "ss1_context": 0.85,
+    "pce_context": false,
+    "local_ss6_overrides": {
+      "pce_strong_min": 0.5,
+      "pce_dead_edge_spike_max": -0.5,
+      "eel_spike_max": -0.5,
+      "resid_rescue_min": 5.0
+    },
+    "noise_height_factor": 3.0,
+    "max_iterations": 1000
+  },
+  "ss4": {
+    "ss_blue_max": 0.95,
+    "ss_red_min": 0.9999,
+    "pce_red_min": 0.1,
+    "edge_red_max": -0.5,
+    "missing_policy": "review",
+    "pce_dead_zone_enabled": false,
+    "pce_dead_zone_low": -0.8,
+    "pce_dead_zone_high": -0.2
+  },
+  "ss5": {
+    "ss1_threshold": 0.95,
+    "pce_spike_min": 0.5,
+    "edge_spike_max": -0.5
+  },
+  "outputs": {
+    "save_viewer_cache": true,
+    "save_light_debug": true,
+    "save_full_debug": true
+  },
+  "viewer": {
+    "open_after_pipeline": true,
+    "show_candidate_status_summary_box": false,
+    "map_color_percentiles": [5, 95],
+    "show_map_colorbar": false
+  },
+  "decision_profile": "ss6"
+}
